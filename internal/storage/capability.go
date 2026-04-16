@@ -131,9 +131,13 @@ func FSCapability(fs *FS) host.Capability {
 //
 // Host import signatures:
 //
-//	sqlite_exec(query_ptr, query_len, params_ptr, params_len) -> error_code
+//	sqlite_exec(query_ptr, query_len, params_ptr, params_len,
+//	            res_ptr_out, res_len_out) -> error_code
 //	  query   = SQL string bytes
 //	  params  = MessagePack []any, or empty when no parameters
+//	  result  = MessagePack ExecResult {rows_affected, last_insert_id}
+//	            written to plugin memory via pulp_alloc; pointer and
+//	            length are stored at the caller-supplied out-addresses.
 //
 //	sqlite_query(query_ptr, query_len, params_ptr, params_len,
 //	             rows_ptr_out, rows_len_out) -> error_code
@@ -148,7 +152,7 @@ func SQLiteCapability(s *SQLite) host.Capability {
 		Name: "storage.sqlite",
 		Register: func(b wazero.HostModuleBuilder, p *host.Plugin) error {
 			b.NewFunctionBuilder().
-				WithFunc(func(ctx context.Context, m api.Module, qPtr, qLen, pPtr, pLen uint32) uint32 {
+				WithFunc(func(ctx context.Context, m api.Module, qPtr, qLen, pPtr, pLen, resPtrOut, resLenOut uint32) uint32 {
 					if qLen == 0 {
 						return 1
 					}
@@ -160,8 +164,37 @@ func SQLiteCapability(s *SQLite) host.Capability {
 					if code != 0 {
 						return code
 					}
-					if _, err := s.Exec(ctx, string(q), args); err != nil {
+					result, err := s.Exec(ctx, string(q), args)
+					if err != nil {
 						return 5
+					}
+					encoded, err := msgpack.Marshal(result)
+					if err != nil {
+						return 5
+					}
+					allocFn := m.ExportedFunction("pulp_alloc")
+					if allocFn == nil {
+						return 7
+					}
+					var ptr uint32
+					if len(encoded) > 0 {
+						res, err := allocFn.Call(ctx, uint64(len(encoded)))
+						if err != nil || len(res) == 0 {
+							return 7
+						}
+						ptr = uint32(res[0])
+						if ptr == 0 {
+							return 7
+						}
+						if !m.Memory().Write(ptr, encoded) {
+							return 8
+						}
+					}
+					if !m.Memory().WriteUint32Le(resPtrOut, ptr) {
+						return 8
+					}
+					if !m.Memory().WriteUint32Le(resLenOut, uint32(len(encoded))) {
+						return 8
 					}
 					return 0
 				}).

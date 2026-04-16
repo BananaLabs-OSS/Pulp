@@ -51,16 +51,25 @@ func (s *SQLite) Path() string { return s.path }
 // Close releases the connection pool.
 func (s *SQLite) Close() error { return s.db.Close() }
 
-// Exec runs a statement that is not expected to return rows. Returns
-// the number of rows affected when the driver can report it; zero
-// otherwise.
-func (s *SQLite) Exec(ctx context.Context, query string, args []any) (int64, error) {
+// ExecResult is what Exec returns: number of rows affected plus the
+// auto-increment row ID created by an INSERT (0 if not applicable).
+type ExecResult struct {
+	RowsAffected int64 `msgpack:"rows_affected"`
+	LastInsertID int64 `msgpack:"last_insert_id"`
+}
+
+// Exec runs a statement that is not expected to return rows and
+// returns both RowsAffected and LastInsertId. Callers that only care
+// about one can ignore the other.
+func (s *SQLite) Exec(ctx context.Context, query string, args []any) (ExecResult, error) {
 	res, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
-		return 0, err
+		return ExecResult{}, err
 	}
-	n, _ := res.RowsAffected()
-	return n, nil
+	var out ExecResult
+	out.RowsAffected, _ = res.RowsAffected()
+	out.LastInsertID, _ = res.LastInsertId()
+	return out, nil
 }
 
 // QueryResult is the structured return value of Query: column names in

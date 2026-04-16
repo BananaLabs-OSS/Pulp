@@ -71,11 +71,19 @@ func Load(ctx context.Context, spec *manifest.PluginSpec, registry *Registry, lo
 		startFn = "_initialize"
 	}
 
+	// WithSysWalltime / Nanotime / Nanosleep wire wazero's sys clocks
+	// to the host OS. Without these the runtime returns a fixed
+	// 2022-01-01 anchor for time.Now() inside plugins — a trap that
+	// silently corrupts anything involving real timestamps (DB rows,
+	// TTLs, JWT exp checks).
 	cfg := wazero.NewModuleConfig().
 		WithStdout(os.Stdout).
 		WithStderr(os.Stderr).
 		WithStartFunctions(startFn).
-		WithName(spec.Name)
+		WithName(spec.Name).
+		WithSysWalltime().
+		WithSysNanotime().
+		WithSysNanosleep()
 
 	mod, err := r.InstantiateModule(ctx, compiled, cfg)
 	if err != nil {
