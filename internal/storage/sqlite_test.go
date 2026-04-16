@@ -30,18 +30,21 @@ func TestSQLite_CreateTableInsertSelect(t *testing.T) {
 		t.Fatalf("insert: %v", err)
 	}
 
-	rows, err := db.Query(ctx, `SELECT id, name FROM users ORDER BY id`, nil)
+	result, err := db.Query(ctx, `SELECT id, name FROM users ORDER BY id`, nil)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
-	if len(rows) != 2 {
-		t.Fatalf("got %d rows, want 2", len(rows))
+	if len(result.Columns) != 2 || result.Columns[0] != "id" || result.Columns[1] != "name" {
+		t.Errorf("Columns = %v, want [id name]", result.Columns)
 	}
-	if name, ok := rows[0][1].(string); !ok || name != "alice" {
-		t.Errorf("row[0] name = %v, want alice", rows[0][1])
+	if len(result.Rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(result.Rows))
 	}
-	if name, ok := rows[1][1].(string); !ok || name != "bob" {
-		t.Errorf("row[1] name = %v, want bob", rows[1][1])
+	if name, ok := result.Rows[0][1].(string); !ok || name != "alice" {
+		t.Errorf("row[0] name = %v, want alice", result.Rows[0][1])
+	}
+	if name, ok := result.Rows[1][1].(string); !ok || name != "bob" {
+		t.Errorf("row[1] name = %v, want bob", result.Rows[1][1])
 	}
 }
 
@@ -67,12 +70,12 @@ func TestSQLite_Persistence(t *testing.T) {
 		t.Fatalf("open2: %v", err)
 	}
 	defer db2.Close()
-	rows, err := db2.Query(ctx, `SELECT v FROM kv WHERE k = ?`, []any{"x"})
+	result, err := db2.Query(ctx, `SELECT v FROM kv WHERE k = ?`, []any{"x"})
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
-	if len(rows) != 1 || rows[0][0].(string) != "1" {
-		t.Errorf("rows = %+v, want [[1]]", rows)
+	if len(result.Rows) != 1 || result.Rows[0][0].(string) != "1" {
+		t.Errorf("rows = %+v, want [[1]]", result.Rows)
 	}
 }
 

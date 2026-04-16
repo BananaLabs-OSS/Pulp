@@ -180,11 +180,11 @@ func SQLiteCapability(s *SQLite) host.Capability {
 					if code != 0 {
 						return code
 					}
-					rows, err := s.Query(ctx, string(q), args)
+					result, err := s.Query(ctx, string(q), args)
 					if err != nil {
 						return 5
 					}
-					encoded, err := msgpack.Marshal(rows)
+					encoded, err := msgpack.Marshal(result)
 					if err != nil {
 						return 5
 					}

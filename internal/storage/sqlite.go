@@ -24,6 +24,11 @@ type SQLite struct {
 // NewSQLite opens (creating if absent) a SQLite database at path. The
 // parent directory is created as needed. The returned handle owns the
 // connection pool — call Close to release it.
+//
+// MaxOpenConns is pinned to 1 so that BEGIN/COMMIT issued by the plugin
+// as normal Exec statements always land on the same connection. Without
+// this the pool would spread statements across connections and
+// transactions would silently no-op.
 func NewSQLite(path string, logger *slog.Logger) (*SQLite, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("create dir: %w", err)
@@ -32,6 +37,7 @@ func NewSQLite(path string, logger *slog.Logger) (*SQLite, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	db.SetMaxOpenConns(1)
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping sqlite: %w", err)
@@ -57,22 +63,29 @@ func (s *SQLite) Exec(ctx context.Context, query string, args []any) (int64, err
 	return n, nil
 }
 
-// Query runs a SELECT and returns rows as [][]any. Each row is a slice
-// of column values in declaration order — the encoder turns these into
-// MessagePack for delivery to the plugin.
-func (s *SQLite) Query(ctx context.Context, query string, args []any) ([][]any, error) {
+// QueryResult is the structured return value of Query: column names in
+// declaration order plus the matching row values.
+type QueryResult struct {
+	Columns []string `msgpack:"columns"`
+	Rows    [][]any  `msgpack:"rows"`
+}
+
+// Query runs a SELECT and returns the column names plus rows. Row
+// values are ordered to match Columns. The encoder turns the
+// QueryResult into MessagePack for delivery to the plugin.
+func (s *SQLite) Query(ctx context.Context, query string, args []any) (QueryResult, error) {
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return QueryResult{}, err
 	}
 	defer rows.Close()
 
 	cols, err := rows.Columns()
 	if err != nil {
-		return nil, err
+		return QueryResult{}, err
 	}
 
-	var result [][]any
+	result := QueryResult{Columns: cols}
 	for rows.Next() {
 		values := make([]any, len(cols))
 		scan := make([]any, len(cols))
@@ -80,9 +93,9 @@ func (s *SQLite) Query(ctx context.Context, query string, args []any) ([][]any, 
 			scan[i] = &values[i]
 		}
 		if err := rows.Scan(scan...); err != nil {
-			return nil, err
+			return QueryResult{}, err
 		}
-		result = append(result, values)
+		result.Rows = append(result.Rows, values)
 	}
 	return result, rows.Err()
 }
