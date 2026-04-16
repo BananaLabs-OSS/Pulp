@@ -14,12 +14,14 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"time"
 
 	"github.com/BananaLabs-OSS/Pulp/internal/abi"
 	"github.com/BananaLabs-OSS/Pulp/internal/host"
 	"github.com/BananaLabs-OSS/Pulp/internal/manifest"
+	"github.com/BananaLabs-OSS/Pulp/internal/storage"
 	"github.com/BananaLabs-OSS/Pulp/internal/transport"
 )
 
@@ -27,10 +29,12 @@ func main() {
 	var manifestPath string
 	var httpPort int
 	var httpCert, httpKey string
+	var storageRoot string
 	flag.StringVar(&manifestPath, "manifest", "", "path to pulp.plugin.toml")
 	flag.IntVar(&httpPort, "http-port", 8080, "HTTP inbound listener port")
 	flag.StringVar(&httpCert, "http-cert", "", "TLS certificate file (PEM); requires -http-key")
 	flag.StringVar(&httpKey, "http-key", "", "TLS key file (PEM); requires -http-cert")
+	flag.StringVar(&storageRoot, "storage-root", "./data", "root directory for plugin-scoped storage")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
@@ -105,6 +109,17 @@ func main() {
 
 	if hasCapability(spec, "transport.http.outbound") {
 		registry.Gated(transport.HTTPOutboundCapability(transport.NewFetcher(logger)))
+	}
+
+	if hasCapability(spec, "storage.fs") {
+		pluginRoot := filepath.Join(storageRoot, spec.Name)
+		fs, err := storage.NewFS(pluginRoot, logger)
+		if err != nil {
+			logger.Error("storage.fs init failed", "err", err)
+			os.Exit(1)
+		}
+		logger.Info("storage.fs ready", "root", fs.Root())
+		registry.Gated(storage.FSCapability(fs))
 	}
 
 	plugin, err := host.Load(ctx, spec, registry, logger)
