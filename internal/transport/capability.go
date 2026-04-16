@@ -76,6 +76,67 @@ func HTTPInboundCapability(s *HTTPServer) host.Capability {
 	}
 }
 
+// SSECapability returns the Capability that wires sse_register and
+// sse_emit into the "pulp" host module. Plugins that declare
+// transport.sse register paths and broadcast events on them; the host
+// serves long-poll subscribers and multiplexes the emit to all active
+// connections.
+//
+// Host import signatures:
+//
+//	sse_register(path_ptr, path_len)
+//	  path bytes = raw path string, e.g. "/events"
+//
+//	sse_emit(req_ptr, req_len)
+//	  req bytes = MessagePack SSEEmitRequest (path, id, event, data)
+//
+// Error codes: 0 ok, 1 empty input, 2 memory read failed, 3 decode
+// failed, 4 dispatch error (unknown path).
+func SSECapability(s *SSEServer) host.Capability {
+	return host.Capability{
+		Name: "transport.sse",
+		Register: func(b wazero.HostModuleBuilder, p *host.Plugin) error {
+			b.NewFunctionBuilder().
+				WithFunc(func(ctx context.Context, m api.Module, pathPtr, pathLen uint32) uint32 {
+					if pathLen == 0 {
+						return 1
+					}
+					data, ok := m.Memory().Read(pathPtr, pathLen)
+					if !ok {
+						return 2
+					}
+					if err := s.RegisterRoute(string(data)); err != nil {
+						return 4
+					}
+					return 0
+				}).
+				Export("sse_register")
+
+			b.NewFunctionBuilder().
+				WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+					if reqLen == 0 {
+						return 1
+					}
+					data, ok := m.Memory().Read(reqPtr, reqLen)
+					if !ok {
+						return 2
+					}
+					req, err := abi.DecodeSSEEmitRequest(data)
+					if err != nil {
+						return 3
+					}
+					if err := s.Emit(req); err != nil {
+						return 4
+					}
+					return 0
+				}).
+				Export("sse_emit")
+
+			return nil
+		},
+	}
+}
+
 // WSInboundCapability returns the Capability that wires ws_register,
 // ws_send, and ws_close into the "pulp" host module. Plugins that
 // declare transport.ws.inbound use these imports to accept upgrades

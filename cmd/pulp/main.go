@@ -70,10 +70,13 @@ func main() {
 
 	registry := host.NewRegistry()
 
-	needsPort := hasCapability(spec, "transport.http.inbound") || hasCapability(spec, "transport.ws.inbound")
+	needsPort := hasCapability(spec, "transport.http.inbound") ||
+		hasCapability(spec, "transport.ws.inbound") ||
+		hasCapability(spec, "transport.sse")
 
 	var httpServer *transport.HTTPServer
 	var wsServer *transport.WSServer
+	var sseServer *transport.SSEServer
 	if needsPort {
 		httpServer = transport.NewHTTPServer(fmt.Sprintf(":%d", httpPort), logger)
 		if httpCert != "" || httpKey != "" {
@@ -92,6 +95,12 @@ func main() {
 		wsServer = transport.NewWSServer(logger)
 		httpServer.AttachWebSocket(wsServer)
 		registry.Gated(transport.WSInboundCapability(wsServer))
+	}
+
+	if hasCapability(spec, "transport.sse") {
+		sseServer = transport.NewSSEServer(logger)
+		httpServer.AttachSSE(sseServer)
+		registry.Gated(transport.SSECapability(sseServer))
 	}
 
 	if hasCapability(spec, "transport.http.outbound") {
@@ -121,6 +130,9 @@ func main() {
 			_ = httpServer.Stop(shutdownCtx)
 			if wsServer != nil {
 				wsServer.Stop()
+			}
+			if sseServer != nil {
+				sseServer.Stop()
 			}
 		}()
 	}

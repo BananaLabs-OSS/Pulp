@@ -47,6 +47,7 @@ type HTTPServer struct {
 	queue  chan *inflightRequest
 	server *http.Server
 	ws     *WSServer
+	sse    *SSEServer
 
 	certPath string
 	keyPath  string
@@ -84,6 +85,13 @@ func NewHTTPServer(addr string, logger *slog.Logger) *HTTPServer {
 // Call before Start.
 func (s *HTTPServer) AttachWebSocket(ws *WSServer) {
 	s.ws = ws
+}
+
+// AttachSSE wires an SSEServer into the HTTP dispatcher. A GET to a
+// registered SSE path is served as a long-poll event stream instead of
+// routed as HTTP. Call before Start.
+func (s *HTTPServer) AttachSSE(sse *SSEServer) {
+	s.sse = sse
 }
 
 // EnableTLS configures HTTPS. certPath and keyPath are PEM files; the
@@ -212,6 +220,10 @@ func (s *HTTPServer) Queued() int { return len(s.queue) }
 func (s *HTTPServer) dispatch(w http.ResponseWriter, r *http.Request) {
 	if s.ws != nil && s.ws.HasRoute(r.URL.Path) {
 		s.ws.Upgrade(w, r)
+		return
+	}
+	if s.sse != nil && r.Method == http.MethodGet && s.sse.HasRoute(r.URL.Path) {
+		s.sse.Handle(w, r)
 		return
 	}
 
