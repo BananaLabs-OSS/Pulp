@@ -1,0 +1,15 @@
+name = "heartbeat"
+version = "0.1.0"
+wasm = "heartbeat.wasm"
+
+# No provides, no consumes — heartbeat is a standalone test plugin with no
+# siblings to link against.
+
+# No capabilities declared in v0.2 — once transport lands in a later
+# milestone, heartbeat will grow an http.inbound capability.
+
+[config]
+# Arbitrary scalar the test pokes via probe_config_marker to prove that the
+# manifest -> MessagePack -> pulp_init pipeline round-trips cleanly.
+marker = 424242
+greeting = "hello from manifest"

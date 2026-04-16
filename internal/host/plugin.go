@@ -143,7 +143,19 @@ func (p *Plugin) Shutdown(ctx context.Context) error {
 // ProbeLastCall reads the plugin's probe_last_call export if present.
 // Diagnostic only — returns ok=false if the plugin does not expose it.
 func (p *Plugin) ProbeLastCall(ctx context.Context) (uint64, bool) {
-	fn := p.module.ExportedFunction("probe_last_call")
+	return p.probeUint64(ctx, "probe_last_call")
+}
+
+// ProbeConfigMarker reads the plugin's probe_config_marker export if present.
+// Diagnostic only — used by the integration test to verify the manifest
+// [config] table round-tripped through MessagePack into the plugin.
+func (p *Plugin) ProbeConfigMarker(ctx context.Context) (int64, bool) {
+	v, ok := p.probeUint64(ctx, "probe_config_marker")
+	return int64(v), ok
+}
+
+func (p *Plugin) probeUint64(ctx context.Context, name string) (uint64, bool) {
+	fn := p.module.ExportedFunction(name)
 	if fn == nil {
 		return 0, false
 	}

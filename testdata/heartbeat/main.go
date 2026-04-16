@@ -1,30 +1,29 @@
-// Heartbeat — trivial test plugin for Pulp v0.1 validation.
+// Heartbeat — trivial test plugin for Pulp v0.2 validation.
 //
 // Implements the five exports the host calls (init/step/shutdown plus
-// alloc/free for envelope marshaling) and nothing else. No stdio, no
-// syscalls — pure WASM computation. The host's structured logger reports
-// each call. If init/step/shutdown are all called with the expected
-// cadence and return 0, v0.1 is working.
+// alloc/free for envelope marshaling) and a set of probe exports used by
+// the integration test to verify envelope decoding and config delivery.
 //
 // Build:
 //
-//	GOOS=wasip1 GOARCH=wasm go build -o heartbeat.wasm .
+//	GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o heartbeat.wasm .
 package main
 
 import (
 	"encoding/binary"
 	"unsafe"
+
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 func main() {}
 
-// lastSeen is written by pulp_step so the host can sanity-check envelope
-// decoding by calling a probe export. Not strictly needed for v0.1 but
-// makes debugging easier if the envelope math is wrong.
 var (
-	lastCall    uint64
-	lastWall    uint64
-	lastPayload uint32
+	lastCall      uint64
+	lastWall      uint64
+	lastPayload   uint32
+	configMarker  int64
+	configGreeted bool
 )
 
 //go:wasmexport pulp_alloc
@@ -44,8 +43,20 @@ func pulpFree(ptr uint32, size uint32) {
 
 //go:wasmexport pulp_init
 func pulpInit(configPtr uint32, configLen uint32) int32 {
-	_ = configPtr
-	_ = configLen
+	if configLen == 0 {
+		return 0
+	}
+	raw := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(configPtr))), configLen)
+	cfg := make(map[string]any)
+	if err := msgpack.Unmarshal(raw, &cfg); err != nil {
+		return 2
+	}
+	if v, ok := cfg["marker"].(int64); ok {
+		configMarker = v
+	}
+	if _, ok := cfg["greeting"].(string); ok {
+		configGreeted = true
+	}
 	return 0
 }
 
@@ -66,9 +77,8 @@ func pulpShutdown() int32 {
 	return 0
 }
 
-// Probe exports — the host reads these at shutdown to confirm the last step
-// envelope was decoded correctly. Not part of the required ABI; just
-// diagnostic for v0.1 validation.
+// Probe exports — read by the integration test to confirm envelope and
+// config decoding round-tripped correctly. Not part of the required ABI.
 
 //go:wasmexport probe_last_call
 func probeLastCall() uint64 { return lastCall }
@@ -78,3 +88,14 @@ func probeLastWall() uint64 { return lastWall }
 
 //go:wasmexport probe_last_payload
 func probeLastPayload() uint32 { return lastPayload }
+
+//go:wasmexport probe_config_marker
+func probeConfigMarker() int64 { return configMarker }
+
+//go:wasmexport probe_config_greeted
+func probeConfigGreeted() uint32 {
+	if configGreeted {
+		return 1
+	}
+	return 0
+}

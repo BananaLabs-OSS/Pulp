@@ -30,12 +30,13 @@ func TestHeartbeatLifecycle(t *testing.T) {
 		binary = filepath.Join("..", "..", "pulp")
 	}
 	plugin := filepath.Join("..", "..", "testdata", "heartbeat", "heartbeat.wasm")
+	manifestPath := filepath.Join("..", "..", "testdata", "heartbeat", "pulp.plugin.toml")
 
 	if err := buildHeartbeatWASM(t, plugin); err != nil {
 		t.Fatalf("build heartbeat.wasm: %v", err)
 	}
 
-	cmd := exec.Command(binary, "-plugin", plugin)
+	cmd := exec.Command(binary, "-manifest", manifestPath)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -44,8 +45,14 @@ func TestHeartbeatLifecycle(t *testing.T) {
 		t.Fatalf("start pulp: %v", err)
 	}
 
-	// Let it run a bit.
-	time.Sleep(500 * time.Millisecond)
+	// Wait until the runtime has initialized the plugin AND completed at
+	// least one step. A fixed sleep would race on slow-compiling WASM
+	// reactors (heartbeat.wasm is ~3MB with msgpack linked in).
+	if err := waitForLog(&stdout, `msg="step heartbeat"`, 5*time.Second); err != nil {
+		_ = cmd.Process.Kill()
+		t.Logf("pulp stdout so far:\n%s", stdout.String())
+		t.Fatalf("plugin never started stepping: %v", err)
+	}
 
 	if err := sendInterrupt(cmd.Process.Pid); err != nil {
 		_ = cmd.Process.Kill()
@@ -73,9 +80,11 @@ func TestHeartbeatLifecycle(t *testing.T) {
 
 	for _, want := range []string{
 		`msg="pulp boot"`,
+		`plugin=heartbeat`,
 		`msg="init complete"`,
 		`msg="step heartbeat"`,
 		`msg="signal received"`,
+		`msg="probe config marker" marker=424242`,
 		`msg="shutdown complete"`,
 		`msg="pulp exit clean"`,
 	} {
@@ -84,6 +93,26 @@ func TestHeartbeatLifecycle(t *testing.T) {
 		}
 	}
 }
+
+// waitForLog polls buf until it contains needle or the timeout elapses.
+// Returns an error if the needle never appears — lets callers distinguish
+// "process is slow to start" from "process is hung or crashed."
+func waitForLog(buf *bytes.Buffer, needle string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if strings.Contains(buf.String(), needle) {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return errTimeout
+}
+
+var errTimeout = &timeoutError{}
+
+type timeoutError struct{}
+
+func (*timeoutError) Error() string { return "timeout waiting for log line" }
 
 // buildHeartbeatWASM compiles testdata/heartbeat/main.go to a wasip1 reactor
 // module so the integration test is hermetic. Skips rebuild if the output
