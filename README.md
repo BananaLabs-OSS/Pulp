@@ -4,7 +4,7 @@ A minimal, universal application runtime. Go host, WASM plugins, Docker-shaped b
 
 ## Status
 
-**v0.3 — transport.** Loads a plugin via its `pulp.plugin.toml`, serializes the `[config]` table to MessagePack, calls `pulp_init` with the encoded config, calls `pulp_step` in a loop with the step envelope, calls `pulp_shutdown` on signal, exits cleanly. If the plugin declares a transport capability, the host stands up HTTP / HTTPS / WebSocket / SSE on a shared port and routes traffic to the plugin through the step envelope.
+**v0.4 — storage.** v0.3 stood up transport (HTTP / HTTPS / WebSocket / SSE) on a shared port. v0.4 adds a scoped filesystem and a per-plugin SQLite database. The combination is enough to host Hytale-Auth; the existing port lives in `Hytale-Auth/pulp-plugin/`.
 
 See `plans/velvet-bouncing-horizon.md` for the full design.
 
@@ -24,6 +24,7 @@ Flags:
 - `-manifest` — path to `pulp.plugin.toml` (required).
 - `-http-port` — HTTP / HTTPS / WS / SSE listener port (default `8080`). Used only when the plugin declares an inbound transport capability.
 - `-http-cert`, `-http-key` — PEM files. If both are given, the HTTP server switches to HTTPS.
+- `-storage-root` — root directory for plugin-scoped storage (default `./data`). Each plugin gets `{root}/{plugin_name}/` — scoped filesystem and SQLite DB live inside.
 
 ## Plugin contract
 
@@ -119,6 +120,32 @@ sse_emit    (req_ptr, req_len)   -> error_code  // msgpack {path, id?, event?, d
 
 All four capabilities share a single listener (`-http-port`). The dispatcher routes WS upgrades and SSE long-polls before falling back to HTTP route matching.
 
+## Storage capabilities (v0.4)
+
+Both capabilities confine the plugin to `{-storage-root}/{plugin_name}/`.
+
+### `storage.fs`
+
+Per-plugin scoped filesystem. Absolute paths, `..`, and null bytes are rejected at the host boundary.
+
+```
+fs_read  (path_ptr, path_len, data_ptr_out, data_len_out) -> error_code
+         // host allocates the result buffer via pulp_alloc and stores (ptr, len) at the out-addresses
+fs_write (path_ptr, path_len, data_ptr, data_len)          -> error_code
+fs_delete(path_ptr, path_len)                              -> error_code
+```
+
+### `storage.sqlite`
+
+Per-plugin SQLite database (`{-storage-root}/{plugin_name}/data.db`), backed by `modernc.org/sqlite` — pure Go, no CGo.
+
+```
+sqlite_exec (query_ptr, query_len, params_ptr, params_len)                             -> error_code
+sqlite_query(query_ptr, query_len, params_ptr, params_len, rows_ptr_out, rows_len_out) -> error_code
+// params = msgpack []any (empty when no parameters)
+// rows   = msgpack [][]any — outer slice is rows, inner slice is column values in declaration order
+```
+
 The `[config]` table is encoded to MessagePack (`github.com/vmihailenco/msgpack/v5`) before delivery, so plugins in any language can decode it with any MessagePack library.
 
 ## Test plugins
@@ -145,3 +172,4 @@ go test ./...
 - `github.com/BurntSushi/toml` — manifest parser.
 - `github.com/vmihailenco/msgpack/v5` — envelope and config encoding.
 - `github.com/coder/websocket` — inbound WebSocket upgrade and framing.
+- `modernc.org/sqlite` — pure-Go SQLite driver (storage.sqlite capability).
