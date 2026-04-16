@@ -46,6 +46,7 @@ type HTTPServer struct {
 
 	queue  chan *inflightRequest
 	server *http.Server
+	ws     *WSServer
 
 	certPath string
 	keyPath  string
@@ -75,6 +76,14 @@ func NewHTTPServer(addr string, logger *slog.Logger) *HTTPServer {
 		pending: map[uint64]*inflightRequest{},
 		queue:   make(chan *inflightRequest, 64),
 	}
+}
+
+// AttachWebSocket wires a WSServer into the HTTP dispatcher. When an
+// incoming request's path matches a WebSocket route registered on ws,
+// the request is delegated to ws.Upgrade instead of routed as HTTP.
+// Call before Start.
+func (s *HTTPServer) AttachWebSocket(ws *WSServer) {
+	s.ws = ws
 }
 
 // EnableTLS configures HTTPS. certPath and keyPath are PEM files; the
@@ -201,6 +210,11 @@ func (s *HTTPServer) Queued() int { return len(s.queue) }
 // dispatch matches an incoming request to a registered route, enqueues it
 // for the step loop, and blocks on the plugin's response (or a timeout).
 func (s *HTTPServer) dispatch(w http.ResponseWriter, r *http.Request) {
+	if s.ws != nil && s.ws.HasRoute(r.URL.Path) {
+		s.ws.Upgrade(w, r)
+		return
+	}
+
 	s.mu.Lock()
 	routes := s.routes
 	s.mu.Unlock()

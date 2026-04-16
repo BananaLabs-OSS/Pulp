@@ -70,8 +70,11 @@ func main() {
 
 	registry := host.NewRegistry()
 
+	needsPort := hasCapability(spec, "transport.http.inbound") || hasCapability(spec, "transport.ws.inbound")
+
 	var httpServer *transport.HTTPServer
-	if hasCapability(spec, "transport.http.inbound") {
+	var wsServer *transport.WSServer
+	if needsPort {
 		httpServer = transport.NewHTTPServer(fmt.Sprintf(":%d", httpPort), logger)
 		if httpCert != "" || httpKey != "" {
 			if err := httpServer.EnableTLS(httpCert, httpKey); err != nil {
@@ -79,7 +82,16 @@ func main() {
 				os.Exit(1)
 			}
 		}
+	}
+
+	if hasCapability(spec, "transport.http.inbound") {
 		registry.Gated(transport.HTTPInboundCapability(httpServer))
+	}
+
+	if hasCapability(spec, "transport.ws.inbound") {
+		wsServer = transport.NewWSServer(logger)
+		httpServer.AttachWebSocket(wsServer)
+		registry.Gated(transport.WSInboundCapability(wsServer))
 	}
 
 	if hasCapability(spec, "transport.http.outbound") {
@@ -107,13 +119,16 @@ func main() {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_ = httpServer.Stop(shutdownCtx)
+			if wsServer != nil {
+				wsServer.Stop()
+			}
 		}()
 	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, shutdownSignals()...)
 
-	stepLoop(ctx, plugin, httpServer, sigCh, logger)
+	stepLoop(ctx, plugin, httpServer, wsServer, sigCh, logger)
 
 	if last, ok := plugin.ProbeLastCall(context.Background()); ok {
 		logger.Info("probe last envelope", "last_call", last)
@@ -138,7 +153,7 @@ func main() {
 // step drains one pending request from its queue and delivers it as the
 // envelope payload; the plugin is expected to call http_respond during
 // that step. runtime.Gosched yields to avoid busy-spinning the CPU.
-func stepLoop(ctx context.Context, plugin *host.Plugin, httpServer *transport.HTTPServer, sigCh <-chan os.Signal, logger *slog.Logger) {
+func stepLoop(ctx context.Context, plugin *host.Plugin, httpServer *transport.HTTPServer, wsServer *transport.WSServer, sigCh <-chan os.Signal, logger *slog.Logger) {
 	var callNumber uint64
 	for {
 		select {
@@ -155,15 +170,23 @@ func stepLoop(ctx context.Context, plugin *host.Plugin, httpServer *transport.HT
 		var hasRequest bool
 		if httpServer != nil {
 			if req, ok := httpServer.PopRequest(); ok {
-				encoded, err := abi.EncodeHTTPRequest(req)
+				reqBytes, err := abi.EncodeHTTPRequest(req)
 				if err != nil {
 					logger.Error("encode http request", "id", req.ID, "err", err)
 					httpServer.Finalize(req.ID)
+				} else if ev, err := abi.EncodeStepEvent(abi.EventHTTPRequest, reqBytes); err != nil {
+					logger.Error("encode step event", "id", req.ID, "err", err)
+					httpServer.Finalize(req.ID)
 				} else {
-					payload = encoded
+					payload = ev
 					activeReqID = req.ID
 					hasRequest = true
 				}
+			}
+		}
+		if payload == nil && wsServer != nil {
+			if ev, ok := wsServer.PopEvent(); ok {
+				payload = ev
 			}
 		}
 

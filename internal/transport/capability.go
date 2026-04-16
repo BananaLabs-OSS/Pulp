@@ -76,6 +76,90 @@ func HTTPInboundCapability(s *HTTPServer) host.Capability {
 	}
 }
 
+// WSInboundCapability returns the Capability that wires ws_register,
+// ws_send, and ws_close into the "pulp" host module. Plugins that
+// declare transport.ws.inbound use these imports to accept upgrades
+// on a given path, push frames to connected clients, and close
+// connections.
+//
+// Host import signatures (all take MessagePack input, return error code):
+//
+//	ws_register(path_ptr, path_len)
+//	  path bytes = raw path string, e.g. "/chat"
+//
+//	ws_send(req_ptr, req_len)
+//	  req bytes = MessagePack WSSendRequest (conn_id, opcode, payload)
+//
+//	ws_close(req_ptr, req_len)
+//	  req bytes = MessagePack WSCloseRequest (conn_id, code, reason)
+//
+// Error codes: 0 ok, 1 empty input, 2 memory read failed, 3 decode
+// failed, 4 dispatch error (unknown conn, unsupported opcode).
+func WSInboundCapability(w *WSServer) host.Capability {
+	return host.Capability{
+		Name: "transport.ws.inbound",
+		Register: func(b wazero.HostModuleBuilder, p *host.Plugin) error {
+			b.NewFunctionBuilder().
+				WithFunc(func(ctx context.Context, m api.Module, pathPtr, pathLen uint32) uint32 {
+					if pathLen == 0 {
+						return 1
+					}
+					data, ok := m.Memory().Read(pathPtr, pathLen)
+					if !ok {
+						return 2
+					}
+					if err := w.RegisterRoute(string(data)); err != nil {
+						return 4
+					}
+					return 0
+				}).
+				Export("ws_register")
+
+			b.NewFunctionBuilder().
+				WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+					if reqLen == 0 {
+						return 1
+					}
+					data, ok := m.Memory().Read(reqPtr, reqLen)
+					if !ok {
+						return 2
+					}
+					req, err := abi.DecodeWSSendRequest(data)
+					if err != nil {
+						return 3
+					}
+					if err := w.Send(ctx, req); err != nil {
+						return 4
+					}
+					return 0
+				}).
+				Export("ws_send")
+
+			b.NewFunctionBuilder().
+				WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+					if reqLen == 0 {
+						return 1
+					}
+					data, ok := m.Memory().Read(reqPtr, reqLen)
+					if !ok {
+						return 2
+					}
+					req, err := abi.DecodeWSCloseRequest(data)
+					if err != nil {
+						return 3
+					}
+					if err := w.Close(req); err != nil {
+						return 4
+					}
+					return 0
+				}).
+				Export("ws_close")
+
+			return nil
+		},
+	}
+}
+
 // HTTPOutboundCapability returns the Capability that wires http_fetch into
 // the "pulp" host module. Plugins call http_fetch with a MessagePack
 // HTTPFetchRequest; the host performs the request synchronously, allocates
