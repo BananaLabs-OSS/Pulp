@@ -61,7 +61,12 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	plugin, err := host.Load(ctx, spec.WASMPath, logger)
+	registry := host.NewRegistry()
+	// v0.3 capabilities will be registered here as they're implemented.
+	// Until then the registry is empty and only plugins with no declared
+	// capabilities will load successfully.
+
+	plugin, err := host.Load(ctx, spec, registry, logger)
 	if err != nil {
 		logger.Error("load failed", "err", err)
 		os.Exit(1)

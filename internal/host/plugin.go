@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/BananaLabs-OSS/Pulp/internal/abi"
+	"github.com/BananaLabs-OSS/Pulp/internal/manifest"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
@@ -26,10 +27,15 @@ type Plugin struct {
 	log *slog.Logger
 }
 
-// Load reads a .wasm file from path, instantiates it, and resolves the three
-// required exports. Returns an error if the module is missing any of them.
-func Load(ctx context.Context, path string, logger *slog.Logger) (*Plugin, error) {
-	wasmBytes, err := os.ReadFile(path)
+// Load reads the plugin's WASM file, binds the host capabilities declared in
+// its manifest, instantiates the module, and resolves the three required
+// exports. Host capabilities are bound via the [Registry] before the plugin
+// module is instantiated so its imports resolve correctly.
+//
+// Passing a nil registry is valid — the plugin gets only the WASI imports
+// wazero provides by default and no Pulp host imports. Useful for tests.
+func Load(ctx context.Context, spec *manifest.PluginSpec, registry *Registry, logger *slog.Logger) (*Plugin, error) {
+	wasmBytes, err := os.ReadFile(spec.WASMPath)
 	if err != nil {
 		return nil, fmt.Errorf("read wasm: %w", err)
 	}
@@ -45,6 +51,21 @@ func Load(ctx context.Context, path string, logger *slog.Logger) (*Plugin, error
 		return nil, fmt.Errorf("compile wasm: %w", err)
 	}
 
+	p := &Plugin{
+		name:    spec.Name,
+		runtime: r,
+		log:     logger.With("plugin", spec.Name),
+	}
+
+	// Bind host capabilities BEFORE instantiating the plugin module so the
+	// "pulp" host module exists when the plugin's imports are resolved.
+	if registry != nil {
+		if err := registry.bind(ctx, r, spec, p); err != nil {
+			r.Close(ctx)
+			return nil, fmt.Errorf("bind capabilities: %w", err)
+		}
+	}
+
 	startFn := "_start"
 	if _, ok := compiled.ExportedFunctions()["_initialize"]; ok {
 		startFn = "_initialize"
@@ -54,7 +75,7 @@ func Load(ctx context.Context, path string, logger *slog.Logger) (*Plugin, error
 		WithStdout(os.Stdout).
 		WithStderr(os.Stderr).
 		WithStartFunctions(startFn).
-		WithName(path)
+		WithName(spec.Name)
 
 	mod, err := r.InstantiateModule(ctx, compiled, cfg)
 	if err != nil {
@@ -62,15 +83,10 @@ func Load(ctx context.Context, path string, logger *slog.Logger) (*Plugin, error
 		return nil, fmt.Errorf("instantiate wasm: %w", err)
 	}
 
-	p := &Plugin{
-		name:       path,
-		runtime:    r,
-		module:     mod,
-		initFn:     mod.ExportedFunction("pulp_init"),
-		stepFn:     mod.ExportedFunction("pulp_step"),
-		shutdownFn: mod.ExportedFunction("pulp_shutdown"),
-		log:        logger.With("plugin", path),
-	}
+	p.module = mod
+	p.initFn = mod.ExportedFunction("pulp_init")
+	p.stepFn = mod.ExportedFunction("pulp_step")
+	p.shutdownFn = mod.ExportedFunction("pulp_shutdown")
 
 	var missing []string
 	if p.initFn == nil {
