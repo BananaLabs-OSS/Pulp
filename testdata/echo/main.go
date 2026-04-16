@@ -8,6 +8,7 @@ package main
 
 import (
 	"encoding/binary"
+	"runtime"
 	"unsafe"
 
 	"github.com/vmihailenco/msgpack/v5"
@@ -46,18 +47,12 @@ type httpResponse struct {
 	Body    []byte            `msgpack:"body"`
 }
 
-// pinned holds plugin-allocated buffers the host reads from. The GC
-// must not reclaim a buffer while its pointer is in flight across the
-// host boundary — demo-grade, good enough for the echo test path.
-var pinned [][]byte
-
 //go:wasmexport pulp_alloc
 func pulpAlloc(size uint32) uint32 {
 	if size == 0 {
 		return 0
 	}
 	buf := make([]byte, size)
-	pinned = append(pinned, buf)
 	return uint32(uintptr(unsafe.Pointer(&buf[0])))
 }
 
@@ -110,8 +105,9 @@ func pulpStep(inputPtr uint32, inputLen uint32) int32 {
 	if err != nil {
 		return 4
 	}
-	pinned = append(pinned, respBytes)
-	if code := hostHTTPRespond(uint32(uintptr(unsafe.Pointer(&respBytes[0]))), uint32(len(respBytes))); code != 0 {
+	code := hostHTTPRespond(uint32(uintptr(unsafe.Pointer(&respBytes[0]))), uint32(len(respBytes)))
+	runtime.KeepAlive(respBytes)
+	if code != 0 {
 		return int32(300 + code)
 	}
 	return 0
@@ -119,7 +115,6 @@ func pulpStep(inputPtr uint32, inputLen uint32) int32 {
 
 //go:wasmexport pulp_shutdown
 func pulpShutdown() int32 {
-	pinned = nil
 	return 0
 }
 
@@ -132,8 +127,9 @@ func registerRoute(method, path string) uint32 {
 	if err != nil || len(data) == 0 {
 		return 99
 	}
-	pinned = append(pinned, data)
-	return hostHTTPRegister(uint32(uintptr(unsafe.Pointer(&data[0]))), uint32(len(data)))
+	code := hostHTTPRegister(uint32(uintptr(unsafe.Pointer(&data[0]))), uint32(len(data)))
+	runtime.KeepAlive(data)
+	return code
 }
 
 func handleEcho(req httpRequest) httpResponse {

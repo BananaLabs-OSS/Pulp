@@ -257,7 +257,16 @@ func stepLoop(ctx context.Context, plugin *host.Plugin, httpServer *transport.HT
 		}
 
 		callNumber++
-		runtime.Gosched()
+		if payload == nil {
+			// No event this step — idle. Sleep briefly so the loop does
+			// not burn CPU (and, more urgently, so per-step allocations
+			// in the plugin do not outrun Go-WASM's GC). 200µs caps the
+			// idle rate at ~5k steps/sec while still giving sub-ms
+			// dispatch latency on real events.
+			time.Sleep(200 * time.Microsecond)
+		} else {
+			runtime.Gosched()
+		}
 	}
 }
 
