@@ -12,16 +12,24 @@ import (
 // Every primitive — Transport, Storage, Spawn, Logging, Entropy — contributes
 // one or more Capabilities to a [Registry]. Plugins opt in by listing the
 // capability name in their manifest; the registry binds the imports at
-// load time. Capabilities the plugin does not declare have no imports
-// bound, so the plugin physically cannot call them.
+// load time. Capabilities the plugin does not declare still get their
+// host import names wired — to stub functions that return error code 99
+// ("capability not declared") — so the plugin binary always resolves its
+// imports even when Go's dead-code eliminator leaves references in.
 //
 // Register receives the wazero module builder for the "pulp" host module
 // and the plugin being loaded. It adds import functions to the builder —
 // it must NOT instantiate anything (the registry does that once for the
 // whole plugin).
+//
+// Stub is optional; when set, it is called for plugins that import the
+// capability's functions but did not declare the capability. Stub must
+// bind the same function names Register does, with the same signatures,
+// each returning error code 99.
 type Capability struct {
 	Name     string
 	Register func(builder wazero.HostModuleBuilder, plugin *Plugin) error
+	Stub     func(builder wazero.HostModuleBuilder, plugin *Plugin) error
 }
 
 // A Registry collects the Capabilities that this Pulp host knows how to
@@ -67,13 +75,23 @@ func (r *Registry) bind(ctx context.Context, runtime wazero.Runtime, spec *manif
 		}
 	}
 
+	declared := map[string]bool{}
 	for _, cap := range spec.Capabilities {
-		c, ok := r.gated[cap]
-		if !ok {
+		if _, ok := r.gated[cap]; !ok {
 			return fmt.Errorf("plugin %q declares unknown capability %q", spec.Name, cap)
 		}
-		if err := c.Register(builder, plugin); err != nil {
-			return fmt.Errorf("register capability %q: %w", cap, err)
+		declared[cap] = true
+	}
+
+	for name, c := range r.gated {
+		if declared[name] {
+			if err := c.Register(builder, plugin); err != nil {
+				return fmt.Errorf("register capability %q: %w", name, err)
+			}
+		} else if c.Stub != nil {
+			if err := c.Stub(builder, plugin); err != nil {
+				return fmt.Errorf("stub capability %q: %w", name, err)
+			}
 		}
 	}
 

@@ -91,25 +91,28 @@ func main() {
 		}
 	}
 
-	if hasCapability(spec, "transport.http.inbound") {
-		registry.Gated(transport.HTTPInboundCapability(httpServer))
-	}
-
+	// Register every known gated capability with the registry. When the
+	// plugin declares the capability, the real host imports bind; when
+	// it does not, the capability's Stub binds no-ops returning error
+	// code 99. This keeps the plugin's WASM binary loadable even when
+	// Go's DCE leaves references to unused host imports (common when
+	// plugins depend on pulpgin, which references ws.* unconditionally).
 	if hasCapability(spec, "transport.ws.inbound") {
 		wsServer = transport.NewWSServer(logger)
-		httpServer.AttachWebSocket(wsServer)
-		registry.Gated(transport.WSInboundCapability(wsServer))
+		if httpServer != nil {
+			httpServer.AttachWebSocket(wsServer)
+		}
 	}
-
 	if hasCapability(spec, "transport.sse") {
 		sseServer = transport.NewSSEServer(logger)
-		httpServer.AttachSSE(sseServer)
-		registry.Gated(transport.SSECapability(sseServer))
+		if httpServer != nil {
+			httpServer.AttachSSE(sseServer)
+		}
 	}
-
-	if hasCapability(spec, "transport.http.outbound") {
-		registry.Gated(transport.HTTPOutboundCapability(transport.NewFetcher(logger)))
-	}
+	registry.Gated(transport.HTTPInboundCapability(httpServer))
+	registry.Gated(transport.WSInboundCapability(wsServer))
+	registry.Gated(transport.SSECapability(sseServer))
+	registry.Gated(transport.HTTPOutboundCapability(transport.NewFetcher(logger)))
 
 	if hasCapability(spec, "storage.fs") {
 		pluginRoot := filepath.Join(storageRoot, spec.Name)
@@ -120,6 +123,8 @@ func main() {
 		}
 		logger.Info("storage.fs ready", "root", fs.Root())
 		registry.Gated(storage.FSCapability(fs))
+	} else {
+		registry.Gated(storage.FSCapability(nil))
 	}
 
 	var sqliteDB *storage.SQLite
@@ -133,6 +138,8 @@ func main() {
 		sqliteDB = db
 		logger.Info("storage.sqlite ready", "path", db.Path())
 		registry.Gated(storage.SQLiteCapability(db))
+	} else {
+		registry.Gated(storage.SQLiteCapability(nil))
 	}
 
 	plugin, err := host.Load(ctx, spec, registry, logger)

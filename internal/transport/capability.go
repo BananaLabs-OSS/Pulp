@@ -27,6 +27,15 @@ import (
 func HTTPInboundCapability(s *HTTPServer) host.Capability {
 	return host.Capability{
 		Name: "transport.http.inbound",
+		Stub: func(b wazero.HostModuleBuilder, _ *host.Plugin) error {
+			b.NewFunctionBuilder().
+				WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+				Export("http_register")
+			b.NewFunctionBuilder().
+				WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+				Export("http_respond")
+			return nil
+		},
 		Register: func(b wazero.HostModuleBuilder, p *host.Plugin) error {
 			b.NewFunctionBuilder().
 				WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
@@ -95,6 +104,15 @@ func HTTPInboundCapability(s *HTTPServer) host.Capability {
 func SSECapability(s *SSEServer) host.Capability {
 	return host.Capability{
 		Name: "transport.sse",
+		Stub: func(b wazero.HostModuleBuilder, _ *host.Plugin) error {
+			b.NewFunctionBuilder().
+				WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+				Export("sse_register")
+			b.NewFunctionBuilder().
+				WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+				Export("sse_emit")
+			return nil
+		},
 		Register: func(b wazero.HostModuleBuilder, p *host.Plugin) error {
 			b.NewFunctionBuilder().
 				WithFunc(func(ctx context.Context, m api.Module, pathPtr, pathLen uint32) uint32 {
@@ -159,6 +177,7 @@ func SSECapability(s *SSEServer) host.Capability {
 func WSInboundCapability(w *WSServer) host.Capability {
 	return host.Capability{
 		Name: "transport.ws.inbound",
+		Stub: wsInboundStub,
 		Register: func(b wazero.HostModuleBuilder, p *host.Plugin) error {
 			b.NewFunctionBuilder().
 				WithFunc(func(ctx context.Context, m api.Module, pathPtr, pathLen uint32) uint32 {
@@ -221,6 +240,22 @@ func WSInboundCapability(w *WSServer) host.Capability {
 	}
 }
 
+// wsInboundStub binds ws_register / ws_send / ws_close as error-returning
+// no-ops for plugins that import these functions (via pulpgin) but do not
+// declare transport.ws.inbound. Error code 99 = "capability not declared."
+func wsInboundStub(b wazero.HostModuleBuilder, _ *host.Plugin) error {
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+		Export("ws_register")
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+		Export("ws_send")
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+		Export("ws_close")
+	return nil
+}
+
 // HTTPOutboundCapability returns the Capability that wires http_fetch into
 // the "pulp" host module. Plugins call http_fetch with a MessagePack
 // HTTPFetchRequest; the host performs the request synchronously, allocates
@@ -241,6 +276,12 @@ func WSInboundCapability(w *WSServer) host.Capability {
 func HTTPOutboundCapability(f *Fetcher) host.Capability {
 	return host.Capability{
 		Name: "transport.http.outbound",
+		Stub: func(b wazero.HostModuleBuilder, _ *host.Plugin) error {
+			b.NewFunctionBuilder().
+				WithFunc(func(_ context.Context, _ api.Module, _, _, _, _ uint32) uint32 { return 99 }).
+				Export("http_fetch")
+			return nil
+		},
 		Register: func(b wazero.HostModuleBuilder, p *host.Plugin) error {
 			b.NewFunctionBuilder().
 				WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {

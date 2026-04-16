@@ -32,6 +32,18 @@ import (
 func FSCapability(fs *FS) host.Capability {
 	return host.Capability{
 		Name: "storage.fs",
+		Stub: func(b wazero.HostModuleBuilder, _ *host.Plugin) error {
+			b.NewFunctionBuilder().
+				WithFunc(func(_ context.Context, _ api.Module, _, _, _, _ uint32) uint32 { return 99 }).
+				Export("fs_read")
+			b.NewFunctionBuilder().
+				WithFunc(func(_ context.Context, _ api.Module, _, _, _, _ uint32) uint32 { return 99 }).
+				Export("fs_write")
+			b.NewFunctionBuilder().
+				WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+				Export("fs_delete")
+			return nil
+		},
 		Register: func(b wazero.HostModuleBuilder, p *host.Plugin) error {
 			b.NewFunctionBuilder().
 				WithFunc(func(ctx context.Context, m api.Module, pathPtr, pathLen, dataPtrOut, dataLenOut uint32) uint32 {
@@ -150,6 +162,15 @@ func FSCapability(fs *FS) host.Capability {
 func SQLiteCapability(s *SQLite) host.Capability {
 	return host.Capability{
 		Name: "storage.sqlite",
+		Stub: func(b wazero.HostModuleBuilder, _ *host.Plugin) error {
+			b.NewFunctionBuilder().
+				WithFunc(func(_ context.Context, _ api.Module, _, _, _, _, _, _ uint32) uint32 { return 99 }).
+				Export("sqlite_exec")
+			b.NewFunctionBuilder().
+				WithFunc(func(_ context.Context, _ api.Module, _, _, _, _, _, _ uint32) uint32 { return 99 }).
+				Export("sqlite_query")
+			return nil
+		},
 		Register: func(b wazero.HostModuleBuilder, p *host.Plugin) error {
 			b.NewFunctionBuilder().
 				WithFunc(func(ctx context.Context, m api.Module, qPtr, qLen, pPtr, pLen, resPtrOut, resLenOut uint32) uint32 {
