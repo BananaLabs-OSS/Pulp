@@ -8,6 +8,7 @@ import (
 	"github.com/BananaLabs-OSS/Pulp/internal/host"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 // FSCapability returns the Capability that wires fs_read, fs_write, and
@@ -122,6 +123,117 @@ func FSCapability(fs *FS) host.Capability {
 			return nil
 		},
 	}
+}
+
+// SQLiteCapability returns the Capability that wires sqlite_exec and
+// sqlite_query into the "pulp" host module. One database per plugin
+// lives at the host's chosen path.
+//
+// Host import signatures:
+//
+//	sqlite_exec(query_ptr, query_len, params_ptr, params_len) -> error_code
+//	  query   = SQL string bytes
+//	  params  = MessagePack []any, or empty when no parameters
+//
+//	sqlite_query(query_ptr, query_len, params_ptr, params_len,
+//	             rows_ptr_out, rows_len_out) -> error_code
+//	  rows bytes (written to plugin memory via pulp_alloc) =
+//	    MessagePack [][]any — outer slice is rows, inner slice is
+//	    column values in declaration order.
+//
+// Error codes: 0 ok, 1 empty query, 2 memory read failed, 3 params
+// decode failed, 5 sql error, 7 alloc failed, 8 memory write failed.
+func SQLiteCapability(s *SQLite) host.Capability {
+	return host.Capability{
+		Name: "storage.sqlite",
+		Register: func(b wazero.HostModuleBuilder, p *host.Plugin) error {
+			b.NewFunctionBuilder().
+				WithFunc(func(ctx context.Context, m api.Module, qPtr, qLen, pPtr, pLen uint32) uint32 {
+					if qLen == 0 {
+						return 1
+					}
+					q, ok := m.Memory().Read(qPtr, qLen)
+					if !ok {
+						return 2
+					}
+					args, code := decodeArgs(m, pPtr, pLen)
+					if code != 0 {
+						return code
+					}
+					if _, err := s.Exec(ctx, string(q), args); err != nil {
+						return 5
+					}
+					return 0
+				}).
+				Export("sqlite_exec")
+
+			b.NewFunctionBuilder().
+				WithFunc(func(ctx context.Context, m api.Module, qPtr, qLen, pPtr, pLen, rowsPtrOut, rowsLenOut uint32) uint32 {
+					if qLen == 0 {
+						return 1
+					}
+					q, ok := m.Memory().Read(qPtr, qLen)
+					if !ok {
+						return 2
+					}
+					args, code := decodeArgs(m, pPtr, pLen)
+					if code != 0 {
+						return code
+					}
+					rows, err := s.Query(ctx, string(q), args)
+					if err != nil {
+						return 5
+					}
+					encoded, err := msgpack.Marshal(rows)
+					if err != nil {
+						return 5
+					}
+					allocFn := m.ExportedFunction("pulp_alloc")
+					if allocFn == nil {
+						return 7
+					}
+					var ptr uint32
+					if len(encoded) > 0 {
+						res, err := allocFn.Call(ctx, uint64(len(encoded)))
+						if err != nil || len(res) == 0 {
+							return 7
+						}
+						ptr = uint32(res[0])
+						if ptr == 0 {
+							return 7
+						}
+						if !m.Memory().Write(ptr, encoded) {
+							return 8
+						}
+					}
+					if !m.Memory().WriteUint32Le(rowsPtrOut, ptr) {
+						return 8
+					}
+					if !m.Memory().WriteUint32Le(rowsLenOut, uint32(len(encoded))) {
+						return 8
+					}
+					return 0
+				}).
+				Export("sqlite_query")
+
+			return nil
+		},
+	}
+}
+
+func decodeArgs(m api.Module, ptr, ln uint32) ([]any, uint32) {
+	if ln == 0 {
+		return nil, 0
+	}
+	data, ok := m.Memory().Read(ptr, ln)
+	if !ok {
+		return nil, 2
+	}
+	var args []any
+	if err := msgpack.Unmarshal(data, &args); err != nil {
+		return nil, 3
+	}
+	return args, 0
 }
 
 func fsErrCode(err error) uint32 {

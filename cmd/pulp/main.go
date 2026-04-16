@@ -122,12 +122,28 @@ func main() {
 		registry.Gated(storage.FSCapability(fs))
 	}
 
+	var sqliteDB *storage.SQLite
+	if hasCapability(spec, "storage.sqlite") {
+		dbPath := filepath.Join(storageRoot, spec.Name, "data.db")
+		db, err := storage.NewSQLite(dbPath, logger)
+		if err != nil {
+			logger.Error("storage.sqlite init failed", "err", err)
+			os.Exit(1)
+		}
+		sqliteDB = db
+		logger.Info("storage.sqlite ready", "path", db.Path())
+		registry.Gated(storage.SQLiteCapability(db))
+	}
+
 	plugin, err := host.Load(ctx, spec, registry, logger)
 	if err != nil {
 		logger.Error("load failed", "err", err)
 		os.Exit(1)
 	}
 	defer plugin.Close(context.Background())
+	if sqliteDB != nil {
+		defer sqliteDB.Close()
+	}
 
 	if err := plugin.Init(ctx, configBytes); err != nil {
 		logger.Error("init failed", "err", err)
