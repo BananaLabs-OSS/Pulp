@@ -26,8 +26,11 @@ import (
 func main() {
 	var manifestPath string
 	var httpPort int
+	var httpCert, httpKey string
 	flag.StringVar(&manifestPath, "manifest", "", "path to pulp.plugin.toml")
 	flag.IntVar(&httpPort, "http-port", 8080, "HTTP inbound listener port")
+	flag.StringVar(&httpCert, "http-cert", "", "TLS certificate file (PEM); requires -http-key")
+	flag.StringVar(&httpKey, "http-key", "", "TLS key file (PEM); requires -http-cert")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
@@ -70,6 +73,12 @@ func main() {
 	var httpServer *transport.HTTPServer
 	if hasCapability(spec, "transport.http.inbound") {
 		httpServer = transport.NewHTTPServer(fmt.Sprintf(":%d", httpPort), logger)
+		if httpCert != "" || httpKey != "" {
+			if err := httpServer.EnableTLS(httpCert, httpKey); err != nil {
+				logger.Error("tls config failed", "err", err)
+				os.Exit(1)
+			}
+		}
 		registry.Gated(transport.HTTPInboundCapability(httpServer))
 	}
 

@@ -10,6 +10,7 @@ package transport
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -45,6 +46,9 @@ type HTTPServer struct {
 
 	queue  chan *inflightRequest
 	server *http.Server
+
+	certPath string
+	keyPath  string
 }
 
 type route struct {
@@ -71,6 +75,22 @@ func NewHTTPServer(addr string, logger *slog.Logger) *HTTPServer {
 		pending: map[uint64]*inflightRequest{},
 		queue:   make(chan *inflightRequest, 64),
 	}
+}
+
+// EnableTLS configures HTTPS. certPath and keyPath are PEM files; the
+// pair is validated immediately via tls.LoadX509KeyPair. Call before
+// Start. Subsequent requests to the server will require TLS.
+func (s *HTTPServer) EnableTLS(certPath, keyPath string) error {
+	if strings.TrimSpace(certPath) == "" || strings.TrimSpace(keyPath) == "" {
+		return errors.New("both certPath and keyPath are required")
+	}
+	if _, err := tls.LoadX509KeyPair(certPath, keyPath); err != nil {
+		return fmt.Errorf("load tls cert/key: %w", err)
+	}
+	s.certPath = certPath
+	s.keyPath = keyPath
+	s.logger.Info("http tls enabled", "cert", certPath)
+	return nil
 }
 
 // RegisterRoute adds method+pattern to the route table. :param segments
@@ -102,12 +122,19 @@ func (s *HTTPServer) Start(ctx context.Context) error {
 		Addr:    s.addr,
 		Handler: mux,
 	}
+	useTLS := s.certPath != "" && s.keyPath != ""
 	go func() {
-		if err := s.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		var err error
+		if useTLS {
+			err = s.server.ListenAndServeTLS(s.certPath, s.keyPath)
+		} else {
+			err = s.server.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.logger.Error("http listen failed", "err", err)
 		}
 	}()
-	s.logger.Info("http server started", "addr", s.addr)
+	s.logger.Info("http server started", "addr", s.addr, "tls", useTLS)
 	return nil
 }
 
