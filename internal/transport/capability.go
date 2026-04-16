@@ -75,3 +75,78 @@ func HTTPInboundCapability(s *HTTPServer) host.Capability {
 		},
 	}
 }
+
+// HTTPOutboundCapability returns the Capability that wires http_fetch into
+// the "pulp" host module. Plugins call http_fetch with a MessagePack
+// HTTPFetchRequest; the host performs the request synchronously, allocates
+// a response buffer inside the plugin's linear memory via pulp_alloc,
+// writes the MessagePack HTTPResponse there, and stores (ptr, len) at the
+// caller-supplied out-addresses.
+//
+// The plugin is responsible for calling pulp_free(resp_ptr, resp_len)
+// once it has decoded the response.
+//
+// Host import signature:
+//
+//	http_fetch(req_ptr, req_len, resp_ptr_out, resp_len_out) -> error_code
+//
+// Error codes: 0 ok, 1 empty input, 2 memory read failed, 3 decode failed,
+// 4 fetch failed, 5 encode failed, 6 plugin missing pulp_alloc, 7 alloc
+// failed, 8 memory write failed.
+func HTTPOutboundCapability(f *Fetcher) host.Capability {
+	return host.Capability{
+		Name: "transport.http.outbound",
+		Register: func(b wazero.HostModuleBuilder, p *host.Plugin) error {
+			b.NewFunctionBuilder().
+				WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+					if reqLen == 0 {
+						return 1
+					}
+					data, ok := m.Memory().Read(reqPtr, reqLen)
+					if !ok {
+						return 2
+					}
+					req, err := abi.DecodeHTTPFetchRequest(data)
+					if err != nil {
+						return 3
+					}
+
+					resp, err := f.Do(ctx, req)
+					if err != nil {
+						return 4
+					}
+
+					respBytes, err := abi.EncodeHTTPResponse(resp)
+					if err != nil {
+						return 5
+					}
+
+					allocFn := m.ExportedFunction("pulp_alloc")
+					if allocFn == nil {
+						return 6
+					}
+					results, err := allocFn.Call(ctx, uint64(len(respBytes)))
+					if err != nil || len(results) == 0 {
+						return 7
+					}
+					respPtr := uint32(results[0])
+					if respPtr == 0 {
+						return 7
+					}
+
+					if !m.Memory().Write(respPtr, respBytes) {
+						return 8
+					}
+					if !m.Memory().WriteUint32Le(respPtrOut, respPtr) {
+						return 8
+					}
+					if !m.Memory().WriteUint32Le(respLenOut, uint32(len(respBytes))) {
+						return 8
+					}
+					return 0
+				}).
+				Export("http_fetch")
+			return nil
+		},
+	}
+}

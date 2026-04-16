@@ -15,13 +15,38 @@ type HTTPRequest struct {
 	Body    []byte            `msgpack:"body"`
 }
 
-// HTTPResponse is produced by the plugin and passed to http_respond. ID
-// must match the request being answered; Status defaults to 200 if zero.
+// HTTPResponse is produced by the plugin and passed to http_respond, or
+// returned to the plugin by the host as the result of http_fetch. ID is
+// meaningful for inbound responses (matches HTTPRequest.ID); for outbound
+// fetch results it is zero.
 type HTTPResponse struct {
 	ID      uint64            `msgpack:"id"`
 	Status  uint32            `msgpack:"status"`
 	Headers map[string]string `msgpack:"headers"`
 	Body    []byte            `msgpack:"body"`
+}
+
+// HTTPFetchRequest is sent by the plugin to http_fetch to perform an
+// outbound HTTP call. URL must be absolute; Method defaults to GET when
+// blank. Headers and Body are optional.
+type HTTPFetchRequest struct {
+	Method  string            `msgpack:"method"`
+	URL     string            `msgpack:"url"`
+	Headers map[string]string `msgpack:"headers"`
+	Body    []byte            `msgpack:"body"`
+}
+
+// DecodeHTTPFetchRequest parses MessagePack bytes produced by the plugin.
+func DecodeHTTPFetchRequest(data []byte) (HTTPFetchRequest, error) {
+	var r HTTPFetchRequest
+	err := msgpack.Unmarshal(data, &r)
+	return r, err
+}
+
+// EncodeHTTPResponse marshals resp to MessagePack for delivery to the
+// plugin as an outbound fetch result.
+func EncodeHTTPResponse(resp HTTPResponse) ([]byte, error) {
+	return msgpack.Marshal(resp)
 }
 
 // EncodeHTTPRequest marshals req to MessagePack for delivery to the plugin.

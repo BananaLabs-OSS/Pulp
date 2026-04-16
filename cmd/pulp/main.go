@@ -73,6 +73,10 @@ func main() {
 		registry.Gated(transport.HTTPInboundCapability(httpServer))
 	}
 
+	if hasCapability(spec, "transport.http.outbound") {
+		registry.Gated(transport.HTTPOutboundCapability(transport.NewFetcher(logger)))
+	}
+
 	plugin, err := host.Load(ctx, spec, registry, logger)
 	if err != nil {
 		logger.Error("load failed", "err", err)
