@@ -1,0 +1,4 @@
+name = "ext-demo"
+version = "0.1.0"
+wasm = "ext-demo.wasm"
+capabilities = ["storage.s3", "payment.stripe"]
