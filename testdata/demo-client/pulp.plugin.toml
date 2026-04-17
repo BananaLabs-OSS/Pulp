@@ -1,0 +1,10 @@
+name = "demo-client"
+version = "0.1.0"
+wasm = "demo-client.wasm"
+
+# Declares the capability provided by Pulp/ext/demo. Requires a
+# Pulp build (e.g. cmd/pulp-demo) that blank-imports that extension.
+capabilities = ["demo.greet"]
+
+[config]
+name = "Nicholas"

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/BananaLabs-OSS/Pulp/run"
 )
 
 func osEnviron() []string { return os.Environ() }
@@ -41,7 +43,7 @@ func TestHeartbeatLifecycle(t *testing.T) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := startWithNewProcessGroup(cmd); err != nil {
+	if err := run.StartWithNewProcessGroup(cmd); err != nil {
 		t.Fatalf("start pulp: %v", err)
 	}
 
@@ -54,9 +56,9 @@ func TestHeartbeatLifecycle(t *testing.T) {
 		t.Fatalf("plugin never started stepping: %v", err)
 	}
 
-	if err := sendInterrupt(cmd.Process.Pid); err != nil {
+	if err := run.SendInterrupt(cmd.Process.Pid); err != nil {
 		_ = cmd.Process.Kill()
-		t.Fatalf("sendInterrupt: %v", err)
+		t.Fatalf("run.SendInterrupt: %v", err)
 	}
 
 	done := make(chan error, 1)

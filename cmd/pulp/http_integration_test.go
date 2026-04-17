@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/BananaLabs-OSS/Pulp/run"
 )
 
 // TestEchoPluginHTTP spawns the pulp binary against the echo plugin,
@@ -47,11 +49,11 @@ func TestEchoPluginHTTP(t *testing.T) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := startWithNewProcessGroup(cmd); err != nil {
+	if err := run.StartWithNewProcessGroup(cmd); err != nil {
 		t.Fatalf("start pulp: %v", err)
 	}
 	defer func() {
-		_ = sendInterrupt(cmd.Process.Pid)
+		_ = run.SendInterrupt(cmd.Process.Pid)
 		_ = cmd.Wait()
 	}()
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 
+	"github.com/BananaLabs-OSS/Pulp/ext"
 	"github.com/BananaLabs-OSS/Pulp/internal/host"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -32,7 +33,7 @@ import (
 func FSCapability(fs *FS) host.Capability {
 	return host.Capability{
 		Name: "storage.fs",
-		Stub: func(b wazero.HostModuleBuilder, _ *host.Plugin) error {
+		Stub: func(b wazero.HostModuleBuilder, _ ext.Plugin) error {
 			b.NewFunctionBuilder().
 				WithFunc(func(_ context.Context, _ api.Module, _, _, _, _ uint32) uint32 { return 99 }).
 				Export("fs_read")
@@ -44,7 +45,7 @@ func FSCapability(fs *FS) host.Capability {
 				Export("fs_delete")
 			return nil
 		},
-		Register: func(b wazero.HostModuleBuilder, p *host.Plugin) error {
+		Register: func(b wazero.HostModuleBuilder, p ext.Plugin) error {
 			b.NewFunctionBuilder().
 				WithFunc(func(ctx context.Context, m api.Module, pathPtr, pathLen, dataPtrOut, dataLenOut uint32) uint32 {
 					if pathLen == 0 {
@@ -162,7 +163,7 @@ func FSCapability(fs *FS) host.Capability {
 func SQLiteCapability(s *SQLite) host.Capability {
 	return host.Capability{
 		Name: "storage.sqlite",
-		Stub: func(b wazero.HostModuleBuilder, _ *host.Plugin) error {
+		Stub: func(b wazero.HostModuleBuilder, _ ext.Plugin) error {
 			b.NewFunctionBuilder().
 				WithFunc(func(_ context.Context, _ api.Module, _, _, _, _, _, _ uint32) uint32 { return 99 }).
 				Export("sqlite_exec")
@@ -171,7 +172,7 @@ func SQLiteCapability(s *SQLite) host.Capability {
 				Export("sqlite_query")
 			return nil
 		},
-		Register: func(b wazero.HostModuleBuilder, p *host.Plugin) error {
+		Register: func(b wazero.HostModuleBuilder, p ext.Plugin) error {
 			b.NewFunctionBuilder().
 				WithFunc(func(ctx context.Context, m api.Module, qPtr, qLen, pPtr, pLen, resPtrOut, resLenOut uint32) uint32 {
 					if qLen == 0 {

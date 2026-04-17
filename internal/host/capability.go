@@ -4,33 +4,20 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/BananaLabs-OSS/Pulp/ext"
 	"github.com/BananaLabs-OSS/Pulp/internal/manifest"
 	"github.com/tetratelabs/wazero"
 )
 
-// A Capability is a named bundle of host imports that a plugin may use.
-// Every primitive — Transport, Storage, Spawn, Logging, Entropy — contributes
-// one or more Capabilities to a [Registry]. Plugins opt in by listing the
-// capability name in their manifest; the registry binds the imports at
-// load time. Capabilities the plugin does not declare still get their
-// host import names wired — to stub functions that return error code 99
-// ("capability not declared") — so the plugin binary always resolves its
-// imports even when Go's dead-code eliminator leaves references in.
-//
-// Register receives the wazero module builder for the "pulp" host module
-// and the plugin being loaded. It adds import functions to the builder —
-// it must NOT instantiate anything (the registry does that once for the
-// whole plugin).
-//
-// Stub is optional; when set, it is called for plugins that import the
-// capability's functions but did not declare the capability. Stub must
-// bind the same function names Register does, with the same signatures,
-// each returning error code 99.
-type Capability struct {
-	Name     string
-	Register func(builder wazero.HostModuleBuilder, plugin *Plugin) error
-	Stub     func(builder wazero.HostModuleBuilder, plugin *Plugin) error
-}
+// Capability is an alias of ext.Capability — the public extension
+// type is canonical; this alias lets internal callers keep the
+// short name without importing the ext path everywhere.
+type Capability = ext.Capability
+
+// Name returns the plugin's manifest name. Defined to satisfy the
+// ext.Plugin interface extensions receive when their Register or
+// Stub functions run.
+func (p *Plugin) Name() string { return p.name }
 
 // A Registry collects the Capabilities that this Pulp host knows how to
 // provide. Some capabilities are always bound regardless of the manifest
@@ -43,10 +30,15 @@ type Registry struct {
 	gated  map[string]Capability
 }
 
-// NewRegistry returns an empty Registry. Call Always or Gated to add
-// capabilities before passing it to [Load].
+// NewRegistry returns a Registry prepopulated with every extension
+// that registered via ext.Register. Callers add built-in capabilities
+// on top via Always / Gated before passing it to [Load].
 func NewRegistry() *Registry {
-	return &Registry{gated: map[string]Capability{}}
+	r := &Registry{gated: map[string]Capability{}}
+	for _, cap := range ext.All() {
+		r.gated[cap.Name] = cap
+	}
+	return r
 }
 
 // Always marks the capability as bound for every plugin, no declaration

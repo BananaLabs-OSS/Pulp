@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/BananaLabs-OSS/Pulp/ext"
 	"github.com/BananaLabs-OSS/Pulp/internal/manifest"
 	"github.com/tetratelabs/wazero"
 )
@@ -15,14 +16,14 @@ func TestRegistry_BindsAlwaysAndDeclaredCapabilities(t *testing.T) {
 	r := NewRegistry()
 	r.Always(Capability{
 		Name: "log",
-		Register: func(b wazero.HostModuleBuilder, _ *Plugin) error {
+		Register: func(b wazero.HostModuleBuilder, _ ext.Plugin) error {
 			boundAlways = true
 			return nil
 		},
 	})
 	r.Gated(Capability{
 		Name: "transport.http.inbound",
-		Register: func(b wazero.HostModuleBuilder, _ *Plugin) error {
+		Register: func(b wazero.HostModuleBuilder, _ ext.Plugin) error {
 			boundGated = true
 			return nil
 		},
@@ -76,7 +77,7 @@ func TestRegistry_SkipsUndeclaredGatedCapabilities(t *testing.T) {
 	r := NewRegistry()
 	r.Gated(Capability{
 		Name: "spawn.docker",
-		Register: func(b wazero.HostModuleBuilder, _ *Plugin) error {
+		Register: func(b wazero.HostModuleBuilder, _ ext.Plugin) error {
 			bound = true
 			return nil
 		},

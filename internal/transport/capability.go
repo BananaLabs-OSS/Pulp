@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 
+	"github.com/BananaLabs-OSS/Pulp/ext"
 	"github.com/BananaLabs-OSS/Pulp/internal/abi"
 	"github.com/BananaLabs-OSS/Pulp/internal/host"
 	"github.com/tetratelabs/wazero"
@@ -27,7 +28,7 @@ import (
 func HTTPInboundCapability(s *HTTPServer) host.Capability {
 	return host.Capability{
 		Name: "transport.http.inbound",
-		Stub: func(b wazero.HostModuleBuilder, _ *host.Plugin) error {
+		Stub: func(b wazero.HostModuleBuilder, _ ext.Plugin) error {
 			b.NewFunctionBuilder().
 				WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
 				Export("http_register")
@@ -36,7 +37,7 @@ func HTTPInboundCapability(s *HTTPServer) host.Capability {
 				Export("http_respond")
 			return nil
 		},
-		Register: func(b wazero.HostModuleBuilder, p *host.Plugin) error {
+		Register: func(b wazero.HostModuleBuilder, p ext.Plugin) error {
 			b.NewFunctionBuilder().
 				WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
 					if reqLen == 0 {
@@ -104,7 +105,7 @@ func HTTPInboundCapability(s *HTTPServer) host.Capability {
 func SSECapability(s *SSEServer) host.Capability {
 	return host.Capability{
 		Name: "transport.sse",
-		Stub: func(b wazero.HostModuleBuilder, _ *host.Plugin) error {
+		Stub: func(b wazero.HostModuleBuilder, _ ext.Plugin) error {
 			b.NewFunctionBuilder().
 				WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
 				Export("sse_register")
@@ -113,7 +114,7 @@ func SSECapability(s *SSEServer) host.Capability {
 				Export("sse_emit")
 			return nil
 		},
-		Register: func(b wazero.HostModuleBuilder, p *host.Plugin) error {
+		Register: func(b wazero.HostModuleBuilder, p ext.Plugin) error {
 			b.NewFunctionBuilder().
 				WithFunc(func(ctx context.Context, m api.Module, pathPtr, pathLen uint32) uint32 {
 					if pathLen == 0 {
@@ -178,7 +179,7 @@ func WSInboundCapability(w *WSServer) host.Capability {
 	return host.Capability{
 		Name: "transport.ws.inbound",
 		Stub: wsInboundStub,
-		Register: func(b wazero.HostModuleBuilder, p *host.Plugin) error {
+		Register: func(b wazero.HostModuleBuilder, p ext.Plugin) error {
 			b.NewFunctionBuilder().
 				WithFunc(func(ctx context.Context, m api.Module, pathPtr, pathLen uint32) uint32 {
 					if pathLen == 0 {
@@ -243,7 +244,7 @@ func WSInboundCapability(w *WSServer) host.Capability {
 // wsInboundStub binds ws_register / ws_send / ws_close as error-returning
 // no-ops for plugins that import these functions (via pulpgin) but do not
 // declare transport.ws.inbound. Error code 99 = "capability not declared."
-func wsInboundStub(b wazero.HostModuleBuilder, _ *host.Plugin) error {
+func wsInboundStub(b wazero.HostModuleBuilder, _ ext.Plugin) error {
 	b.NewFunctionBuilder().
 		WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
 		Export("ws_register")
@@ -276,13 +277,13 @@ func wsInboundStub(b wazero.HostModuleBuilder, _ *host.Plugin) error {
 func HTTPOutboundCapability(f *Fetcher) host.Capability {
 	return host.Capability{
 		Name: "transport.http.outbound",
-		Stub: func(b wazero.HostModuleBuilder, _ *host.Plugin) error {
+		Stub: func(b wazero.HostModuleBuilder, _ ext.Plugin) error {
 			b.NewFunctionBuilder().
 				WithFunc(func(_ context.Context, _ api.Module, _, _, _, _ uint32) uint32 { return 99 }).
 				Export("http_fetch")
 			return nil
 		},
-		Register: func(b wazero.HostModuleBuilder, p *host.Plugin) error {
+		Register: func(b wazero.HostModuleBuilder, p ext.Plugin) error {
 			b.NewFunctionBuilder().
 				WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 					if reqLen == 0 {
