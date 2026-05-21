@@ -2,7 +2,7 @@ package abi
 
 import "github.com/vmihailenco/msgpack/v5"
 
-// SSEEmitRequest is what the plugin passes to sse_emit. Path selects the
+// SSEEmitRequest is what the cell passes to sse_emit. Path selects the
 // SSE route to broadcast on; Data is the event payload. ID and Event are
 // optional SSE fields — ID sets "id:", Event sets "event:" before data.
 type SSEEmitRequest struct {

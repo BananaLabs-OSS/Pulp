@@ -6,7 +6,7 @@
 // Run:
 //
 //	go build -o pulp-demo ./cmd/pulp-demo
-//	./pulp-demo -manifest path/to/plugin.toml
+//	./pulp-demo -manifest path/to/cell.toml
 //
 // This binary has everything the default cmd/pulp binary does PLUS
 // the demo.greet capability provided by Pulp/ext/demo.

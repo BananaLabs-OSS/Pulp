@@ -14,17 +14,17 @@ import (
 // short name without importing the ext path everywhere.
 type Capability = ext.Capability
 
-// Name returns the plugin's manifest name. Defined to satisfy the
-// ext.Plugin interface extensions receive when their Register or
+// Name returns the cell's manifest name. Defined to satisfy the
+// ext.Cell interface extensions receive when their Register or
 // Stub functions run.
-func (p *Plugin) Name() string { return p.name }
+func (p *Cell) Name() string { return p.name }
 
 // A Registry collects the Capabilities that this Pulp host knows how to
 // provide. Some capabilities are always bound regardless of the manifest
 // (logging, entropy); others are only bound when declared explicitly
 // (transport.http.inbound, storage.sqlite, spawn.docker).
 //
-// The registry is created at host startup and reused across plugin loads.
+// The registry is created at host startup and reused across cell loads.
 type Registry struct {
 	always []Capability
 	gated  map[string]Capability
@@ -41,28 +41,28 @@ func NewRegistry() *Registry {
 	return r
 }
 
-// Always marks the capability as bound for every plugin, no declaration
+// Always marks the capability as bound for every cell, no declaration
 // required. Use for universal imports like logging.
 func (r *Registry) Always(c Capability) {
 	r.always = append(r.always, c)
 }
 
-// Gated marks the capability as bound only when the plugin's manifest
+// Gated marks the capability as bound only when the cell's manifest
 // lists it under `capabilities`. Use for anything that touches the OS
 // or the network.
 func (r *Registry) Gated(c Capability) {
 	r.gated[c.Name] = c
 }
 
-// bind wires the imports required by the plugin's manifest into a fresh
+// bind wires the imports required by the cell's manifest into a fresh
 // "pulp" host module and instantiates it against the supplied runtime.
-// It must be called before instantiating the plugin's own WASM module so
+// It must be called before instantiating the cell's own WASM module so
 // the imports exist when the module resolves its imports.
-func (r *Registry) bind(ctx context.Context, runtime wazero.Runtime, spec *manifest.PluginSpec, plugin *Plugin) error {
+func (r *Registry) bind(ctx context.Context, runtime wazero.Runtime, spec *manifest.CellSpec, cell *Cell) error {
 	builder := runtime.NewHostModuleBuilder("pulp")
 
 	for _, c := range r.always {
-		if err := c.Register(builder, plugin); err != nil {
+		if err := c.Register(builder, cell); err != nil {
 			return fmt.Errorf("register always-on capability %q: %w", c.Name, err)
 		}
 	}
@@ -70,18 +70,18 @@ func (r *Registry) bind(ctx context.Context, runtime wazero.Runtime, spec *manif
 	declared := map[string]bool{}
 	for _, cap := range spec.Capabilities {
 		if _, ok := r.gated[cap]; !ok {
-			return fmt.Errorf("plugin %q declares unknown capability %q", spec.Name, cap)
+			return fmt.Errorf("cell %q declares unknown capability %q", spec.Name, cap)
 		}
 		declared[cap] = true
 	}
 
 	for name, c := range r.gated {
 		if declared[name] {
-			if err := c.Register(builder, plugin); err != nil {
+			if err := c.Register(builder, cell); err != nil {
 				return fmt.Errorf("register capability %q: %w", name, err)
 			}
 		} else if c.Stub != nil {
-			if err := c.Stub(builder, plugin); err != nil {
+			if err := c.Stub(builder, cell); err != nil {
 				return fmt.Errorf("stub capability %q: %w", name, err)
 			}
 		}

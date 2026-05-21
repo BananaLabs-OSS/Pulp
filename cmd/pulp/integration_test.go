@@ -16,7 +16,7 @@ import (
 func osEnviron() []string { return os.Environ() }
 
 // TestHeartbeatLifecycle spawns the compiled pulp binary against the
-// heartbeat test plugin, lets it run for a bit, sends an interrupt, and
+// heartbeat test cell, lets it run for a bit, sends an interrupt, and
 // verifies that the full lifecycle logged correctly.
 //
 // This is the end-to-end v0.1 verification. If this test passes, the
@@ -31,10 +31,10 @@ func TestHeartbeatLifecycle(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		binary = filepath.Join("..", "..", "pulp")
 	}
-	plugin := filepath.Join("..", "..", "testdata", "heartbeat", "heartbeat.wasm")
-	manifestPath := filepath.Join("..", "..", "testdata", "heartbeat", "pulp.plugin.toml")
+	cell := filepath.Join("..", "..", "testdata", "heartbeat", "heartbeat.wasm")
+	manifestPath := filepath.Join("..", "..", "testdata", "heartbeat", "pulp.cell.toml")
 
-	if err := buildHeartbeatWASM(t, plugin); err != nil {
+	if err := buildHeartbeatWASM(t, cell); err != nil {
 		t.Fatalf("build heartbeat.wasm: %v", err)
 	}
 
@@ -47,13 +47,13 @@ func TestHeartbeatLifecycle(t *testing.T) {
 		t.Fatalf("start pulp: %v", err)
 	}
 
-	// Wait until the runtime has initialized the plugin AND completed at
+	// Wait until the runtime has initialized the cell AND completed at
 	// least one step. A fixed sleep would race on slow-compiling WASM
 	// reactors (heartbeat.wasm is ~3MB with msgpack linked in).
 	if err := waitForLog(&stdout, `msg="step heartbeat"`, 5*time.Second); err != nil {
 		_ = cmd.Process.Kill()
 		t.Logf("pulp stdout so far:\n%s", stdout.String())
-		t.Fatalf("plugin never started stepping: %v", err)
+		t.Fatalf("cell never started stepping: %v", err)
 	}
 
 	if err := run.SendInterrupt(cmd.Process.Pid); err != nil {
@@ -82,7 +82,7 @@ func TestHeartbeatLifecycle(t *testing.T) {
 
 	for _, want := range []string{
 		`msg="pulp boot"`,
-		`plugin=heartbeat`,
+		`cell=heartbeat`,
 		`msg="init complete"`,
 		`msg="step heartbeat"`,
 		`msg="signal received"`,

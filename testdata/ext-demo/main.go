@@ -1,12 +1,12 @@
-// ext-demo — minimal plugin that declares storage.s3 + payment.stripe
+// ext-demo — minimal cell that declares storage.s3 + payment.stripe
 // capabilities. Proves the deployment binary successfully links both
-// extensions and the plugin can instantiate against them.
+// extensions and the cell can instantiate against them.
 //
 // We do NOT actually call the host imports here (that would require
-// real AWS / Stripe credentials). The test is: does the plugin load
+// real AWS / Stripe credentials). The test is: does the cell load
 // under a Pulp binary that links both extensions? Under a Pulp binary
 // that links NEITHER, the host should stub the imports with error 99
-// wrappers and the plugin still loads; under a Pulp binary that links
+// wrappers and the cell still loads; under a Pulp binary that links
 // ONE but declares BOTH, the undeclared one gets stubbed too.
 package main
 

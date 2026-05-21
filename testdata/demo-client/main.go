@@ -1,4 +1,4 @@
-// demo-client is a minimal WASM plugin that exercises a compile-time
+// demo-client is a minimal WASM cell that exercises a compile-time
 // extension: it calls demo_greet during pulp_init. Boot this under a
 // Pulp binary that blank-imports github.com/BananaLabs-OSS/Pulp/ext/demo
 // (e.g. ./cmd/pulp-demo) and you should see a greeting on stdout.

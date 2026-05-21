@@ -16,14 +16,14 @@ func TestRegistry_BindsAlwaysAndDeclaredCapabilities(t *testing.T) {
 	r := NewRegistry()
 	r.Always(Capability{
 		Name: "log",
-		Register: func(b wazero.HostModuleBuilder, _ ext.Plugin) error {
+		Register: func(b wazero.HostModuleBuilder, _ ext.Cell) error {
 			boundAlways = true
 			return nil
 		},
 	})
 	r.Gated(Capability{
 		Name: "transport.http.inbound",
-		Register: func(b wazero.HostModuleBuilder, _ ext.Plugin) error {
+		Register: func(b wazero.HostModuleBuilder, _ ext.Cell) error {
 			boundGated = true
 			return nil
 		},
@@ -33,13 +33,13 @@ func TestRegistry_BindsAlwaysAndDeclaredCapabilities(t *testing.T) {
 	runtime := wazero.NewRuntime(ctx)
 	t.Cleanup(func() { runtime.Close(ctx) })
 
-	spec := &manifest.PluginSpec{
+	spec := &manifest.CellSpec{
 		Name:         "test",
 		Version:      "0.0.0",
 		Capabilities: []string{"transport.http.inbound"},
 	}
 
-	if err := r.bind(ctx, runtime, spec, &Plugin{}); err != nil {
+	if err := r.bind(ctx, runtime, spec, &Cell{}); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 	if !boundAlways {
@@ -57,13 +57,13 @@ func TestRegistry_FailsOnUnknownCapability(t *testing.T) {
 	runtime := wazero.NewRuntime(ctx)
 	t.Cleanup(func() { runtime.Close(ctx) })
 
-	spec := &manifest.PluginSpec{
+	spec := &manifest.CellSpec{
 		Name:         "test",
 		Version:      "0.0.0",
 		Capabilities: []string{"storage.postgres"},
 	}
 
-	err := r.bind(ctx, runtime, spec, &Plugin{})
+	err := r.bind(ctx, runtime, spec, &Cell{})
 	if err == nil {
 		t.Fatal("expected error for unknown capability")
 	}
@@ -77,7 +77,7 @@ func TestRegistry_SkipsUndeclaredGatedCapabilities(t *testing.T) {
 	r := NewRegistry()
 	r.Gated(Capability{
 		Name: "spawn.docker",
-		Register: func(b wazero.HostModuleBuilder, _ ext.Plugin) error {
+		Register: func(b wazero.HostModuleBuilder, _ ext.Cell) error {
 			bound = true
 			return nil
 		},
@@ -87,13 +87,13 @@ func TestRegistry_SkipsUndeclaredGatedCapabilities(t *testing.T) {
 	runtime := wazero.NewRuntime(ctx)
 	t.Cleanup(func() { runtime.Close(ctx) })
 
-	spec := &manifest.PluginSpec{
+	spec := &manifest.CellSpec{
 		Name:    "test",
 		Version: "0.0.0",
-		// Capabilities empty — plugin did not declare spawn.docker.
+		// Capabilities empty — cell did not declare spawn.docker.
 	}
 
-	if err := r.bind(ctx, runtime, spec, &Plugin{}); err != nil {
+	if err := r.bind(ctx, runtime, spec, &Cell{}); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 	if bound {

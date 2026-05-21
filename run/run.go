@@ -1,290 +1,562 @@
-// Package run is the Pulp runtime entry point, extracted from
-// cmd/pulp/main.go so that deployment binaries can blank-import
-// extensions and still use the standard bootstrap flow:
+// Package run is the Pulp runtime entry point. Deployment binaries
+// blank-import extensions and call run.Main():
 //
 //	package main
 //
 //	import (
-//		_ "github.com/BananaLabs-OSS/Pulp-ext-s3"
-//		_ "github.com/BananaLabs-OSS/Pulp-ext-stripe"
+//		_ "github.com/BananaLabs-OSS/Pulp-ext-http"
+//		_ "github.com/BananaLabs-OSS/Pulp-ext-docker"
 //
 //		"github.com/BananaLabs-OSS/Pulp/run"
 //	)
 //
 //	func main() { run.Main() }
 //
-// Extensions that registered via ext.Register are automatically
-// picked up by host.NewRegistry — the deployment main.go does not
-// need to enumerate them.
+// Extensions registered via ext.Register are automatically picked up.
+// The runtime accepts one or more manifests via repeated -manifest
+// flags, starts one step-loop goroutine per cell, and one pollster
+// goroutine per extension-with-Poll. Events flow from pollsters into
+// per-cell event channels tagged by StepEvent.CellID; empty
+// CellID broadcasts to every cell that declares the producing
+// extension's capability.
 package run
 
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"runtime"
+	"sync"
 	"time"
 
-	"github.com/BananaLabs-OSS/Pulp/internal/abi"
+	"github.com/BananaLabs-OSS/Pulp/abi"
+	"github.com/BananaLabs-OSS/Pulp/ext"
 	"github.com/BananaLabs-OSS/Pulp/internal/host"
 	"github.com/BananaLabs-OSS/Pulp/internal/manifest"
-	"github.com/BananaLabs-OSS/Pulp/internal/storage"
-	"github.com/BananaLabs-OSS/Pulp/internal/transport"
+	"github.com/BananaLabs-OSS/Pulp/internal/safe"
 )
 
-// Main is the Pulp binary's entry point. It parses flags, loads the
-// manifest, wires built-in capabilities (plus anything registered via
-// ext.Register), instantiates the plugin, and runs the step loop until
-// interrupted. Calls os.Exit on fatal errors.
+// eventChanSize is the per-cell event channel buffer. Pollsters drop
+// events (with a warn log) when a cell's channel fills up.
+const eventChanSize = 64
+
+// cellRuntime is the per-cell runtime state: the loaded WASM
+// cell, its event channel, its goroutine's context, and the set of
+// capabilities it declared. The step loop consumes from events, calls
+// cell.Step(), and calls Finalize on the producing extension.
+type cellRuntime struct {
+	spec       *manifest.CellSpec
+	cell     *host.Cell
+	events     chan routedEvent
+	ctx        context.Context
+	cancel     context.CancelFunc
+	declared   map[string]bool // capabilities this cell declared
+	readyCh    chan struct{}   // closed after Init returns 0
+	callNumber uint64
+
+	// failed is set when the cell's Setup, Load, or Init returned an
+	// error. Failed cells do not run their step loop; dependents of a
+	// failed cell inherit the failed state.
+	failed bool
+}
+
+// routedEvent wraps an ext.StepEvent with a back-reference to the
+// capability that produced it, so the step goroutine can call the
+// right Finalize after processing.
+type routedEvent struct {
+	ev   ext.StepEvent
+	caps []ext.Capability // extensions to call Finalize on (usually one)
+}
+
 func Main() {
-	var manifestPath string
-	var httpPort int
-	var httpCert, httpKey string
+	var manifestPaths sliceFlag
 	var storageRoot string
-	flag.StringVar(&manifestPath, "manifest", "", "path to pulp.plugin.toml")
-	flag.IntVar(&httpPort, "http-port", 8080, "HTTP inbound listener port")
-	flag.StringVar(&httpCert, "http-cert", "", "TLS certificate file (PEM); requires -http-key")
-	flag.StringVar(&httpKey, "http-key", "", "TLS key file (PEM); requires -http-cert")
-	flag.StringVar(&storageRoot, "storage-root", "./data", "root directory for plugin-scoped storage")
+	var httpPort string
+	flag.Var(&manifestPaths, "manifest", "path to pulp.cell.toml (repeatable; also accepts comma-separated values)")
+	flag.StringVar(&storageRoot, "storage-root", "./data", "root directory for cell-scoped storage")
+	flag.StringVar(&httpPort, "http-port", "", "override for the HTTP_PORT env var consumed by ext-http")
 	flag.Parse()
+
+	// The -http-port flag is a convenience shim: it forwards to the
+	// HTTP_PORT env var that ext-http reads during Setup. Explicit env
+	// vars win over the flag.
+	if httpPort != "" {
+		if _, ok := os.LookupEnv("HTTP_PORT"); !ok {
+			_ = os.Setenv("HTTP_PORT", httpPort)
+		}
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 	slog.SetDefault(logger)
 
-	if manifestPath == "" {
-		logger.Error("missing required flag -manifest <path-to-pulp.plugin.toml>")
+	if len(manifestPaths) == 0 {
+		logger.Error("missing required flag -manifest <path-to-pulp.cell.toml>")
 		os.Exit(2)
 	}
 
-	spec, err := manifest.Load(manifestPath)
+	set, err := manifest.LoadAll([]string(manifestPaths))
 	if err != nil {
 		logger.Error("manifest load failed", "err", err)
 		os.Exit(1)
 	}
 
-	logger.Info("pulp boot",
-		"plugin", spec.Name,
-		"version", spec.Version,
-		"manifest", spec.ManifestPath,
-		"wasm", spec.WASMPath,
-		"capabilities", spec.Capabilities,
-		"provides", spec.Provides,
-		"consumes", spec.Consumes,
-	)
-
-	configBytes, err := manifest.EncodeConfig(spec.Config)
-	if err != nil {
-		logger.Error("config encode failed", "err", err)
-		os.Exit(1)
+	for _, spec := range set.Cells {
+		logger.Info("pulp boot",
+			"cell", spec.Name,
+			"version", spec.Version,
+			"manifest", spec.ManifestPath,
+			"wasm", spec.WASMPath,
+			"capabilities", spec.Capabilities,
+			"provides", spec.Provides,
+			"consumes", spec.Consumes,
+		)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	registry := host.NewRegistry()
+	// ------------------------------------------------------------------
+	// Capability Setup (once, not once-per-cell)
+	// ------------------------------------------------------------------
 
-	needsPort := hasCapability(spec, "transport.http.inbound") ||
-		hasCapability(spec, "transport.ws.inbound") ||
-		hasCapability(spec, "transport.sse")
+	// Union of capabilities declared across all cells — each gets its
+	// Setup called at most once regardless of how many cells declared
+	// it. The registry is shared across cell Loads.
+	allCaps := ext.All()
+	capByName := map[string]ext.Capability{}
+	for _, c := range allCaps {
+		capByName[c.Name] = c
+	}
 
-	var httpServer *transport.HTTPServer
-	var wsServer *transport.WSServer
-	var sseServer *transport.SSEServer
-	if needsPort {
-		httpServer = transport.NewHTTPServer(fmt.Sprintf(":%d", httpPort), logger)
-		if httpCert != "" || httpKey != "" {
-			if err := httpServer.EnableTLS(httpCert, httpKey); err != nil {
-				logger.Error("tls config failed", "err", err)
+	// capToCells: given a capability name, which cells declared it?
+	// Used by the fanout router to broadcast events with empty CellID.
+	capToCells := map[string][]string{}
+	for _, spec := range set.Cells {
+		for _, capName := range spec.Capabilities {
+			capToCells[capName] = append(capToCells[capName], spec.Name)
+		}
+	}
+
+	declaredUnion := map[string]bool{}
+	for _, spec := range set.Cells {
+		for _, capName := range spec.Capabilities {
+			declaredUnion[capName] = true
+		}
+	}
+
+	// Setup each declared capability once. A Setup failure aborts the
+	// whole host — the capability is shared, so no cell can rely on
+	// the extension working.
+	setupEnv := ext.SetupEnv{
+		// CellName is left empty at Setup time — Setup is now a
+		// one-time shared initialization, not per-cell. Extensions
+		// that need per-cell state should maintain it in a map keyed
+		// by the cell identity they see at Register time.
+		StorageRoot: storageRoot,
+		Logger:      logger,
+	}
+	for _, c := range allCaps {
+		if declaredUnion[c.Name] {
+			if err := safe.CallSetup(c, setupEnv, logger); err != nil {
+				logger.Error("capability setup failed", "capability", c.Name, "err", err)
 				os.Exit(1)
 			}
+			if c.Setup != nil {
+				logger.Info("capability ready", "name", c.Name)
+			}
 		}
 	}
 
-	if hasCapability(spec, "transport.ws.inbound") {
-		wsServer = transport.NewWSServer(logger)
-		if httpServer != nil {
-			httpServer.AttachWebSocket(wsServer)
+	// ------------------------------------------------------------------
+	// Build per-cell runtimes in topological order
+	// ------------------------------------------------------------------
+
+	runtimes := map[string]*cellRuntime{}
+	for _, spec := range set.Order {
+		pctx, pcancel := context.WithCancel(ctx)
+		declared := map[string]bool{}
+		for _, c := range spec.Capabilities {
+			declared[c] = true
+		}
+		runtimes[spec.Name] = &cellRuntime{
+			spec:     spec,
+			events:   make(chan routedEvent, eventChanSize),
+			ctx:      pctx,
+			cancel:   pcancel,
+			declared: declared,
+			readyCh:  make(chan struct{}),
 		}
 	}
-	if hasCapability(spec, "transport.sse") {
-		sseServer = transport.NewSSEServer(logger)
-		if httpServer != nil {
-			httpServer.AttachSSE(sseServer)
+
+	// ------------------------------------------------------------------
+	// Per-cell Load + Init with dependency barriers
+	// ------------------------------------------------------------------
+
+	registry := host.NewRegistry()
+	for _, c := range allCaps {
+		registry.Gated(c)
+	}
+
+	// Sibling-call capability is always bound — every cell can call
+	// providers in other cells as long as its manifest declares them
+	// via consumes or depends_on. Runtime permission check happens in
+	// the pulp_call host function body.
+	siblingReg := newSiblingRegistry(runtimes)
+	registry.Always(siblingCapability(siblingReg))
+
+	// Validate sibling links up front so a missing provider fails boot
+	// instead of producing runtime errors when the call happens.
+	if missing := validateSiblingLinks(runtimes); len(missing) > 0 {
+		for _, m := range missing {
+			logger.Error("sibling link validation", "issue", m)
 		}
-	}
-	registry.Gated(transport.HTTPInboundCapability(httpServer))
-	registry.Gated(transport.WSInboundCapability(wsServer))
-	registry.Gated(transport.SSECapability(sseServer))
-	registry.Gated(transport.HTTPOutboundCapability(transport.NewFetcher(logger)))
-
-	if hasCapability(spec, "storage.fs") {
-		pluginRoot := filepath.Join(storageRoot, spec.Name)
-		fs, err := storage.NewFS(pluginRoot, logger)
-		if err != nil {
-			logger.Error("storage.fs init failed", "err", err)
-			os.Exit(1)
-		}
-		logger.Info("storage.fs ready", "root", fs.Root())
-		registry.Gated(storage.FSCapability(fs))
-	} else {
-		registry.Gated(storage.FSCapability(nil))
-	}
-
-	var sqliteDB *storage.SQLite
-	if hasCapability(spec, "storage.sqlite") {
-		dbPath := filepath.Join(storageRoot, spec.Name, "data.db")
-		db, err := storage.NewSQLite(dbPath, logger)
-		if err != nil {
-			logger.Error("storage.sqlite init failed", "err", err)
-			os.Exit(1)
-		}
-		sqliteDB = db
-		logger.Info("storage.sqlite ready", "path", db.Path())
-		registry.Gated(storage.SQLiteCapability(db))
-	} else {
-		registry.Gated(storage.SQLiteCapability(nil))
-	}
-
-	plugin, err := host.Load(ctx, spec, registry, logger)
-	if err != nil {
-		logger.Error("load failed", "err", err)
-		os.Exit(1)
-	}
-	defer plugin.Close(context.Background())
-	if sqliteDB != nil {
-		defer sqliteDB.Close()
-	}
-
-	if err := plugin.Init(ctx, configBytes); err != nil {
-		logger.Error("init failed", "err", err)
 		os.Exit(1)
 	}
 
-	if httpServer != nil {
-		if err := httpServer.Start(ctx); err != nil {
-			logger.Error("http start failed", "err", err)
-			os.Exit(1)
-		}
-		defer func() {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = httpServer.Stop(shutdownCtx)
-			if wsServer != nil {
-				wsServer.Stop()
+	// Kick off an init goroutine per cell; each waits on its deps'
+	// readyCh before Loading. Cells whose deps fail inherit the failed
+	// state.
+	var initWG sync.WaitGroup
+	for _, spec := range set.Order {
+		initWG.Add(1)
+		go func(spec *manifest.CellSpec) {
+			defer initWG.Done()
+			rt := runtimes[spec.Name]
+
+			for _, dep := range spec.DependsOn {
+				depRT := runtimes[dep]
+				select {
+				case <-depRT.readyCh:
+					if depRT.failed {
+						logger.Error("cell init aborted — dependency failed",
+							"cell", spec.Name, "failed_dep", dep)
+						rt.failed = true
+						close(rt.readyCh)
+						return
+					}
+				case <-rt.ctx.Done():
+					rt.failed = true
+					close(rt.readyCh)
+					return
+				}
 			}
-			if sseServer != nil {
-				sseServer.Stop()
+
+			configBytes, err := manifest.EncodeConfig(spec.Config)
+			if err != nil {
+				logger.Error("config encode failed", "cell", spec.Name, "err", err)
+				rt.failed = true
+				close(rt.readyCh)
+				return
 			}
-		}()
+
+			cell, err := host.Load(rt.ctx, spec, registry, logger)
+			if err != nil {
+				logger.Error("load failed", "cell", spec.Name, "err", err)
+				rt.failed = true
+				close(rt.readyCh)
+				return
+			}
+			rt.cell = cell
+
+			if err := cell.Init(rt.ctx, configBytes); err != nil {
+				logger.Error("init failed", "cell", spec.Name, "err", err)
+				rt.failed = true
+				close(rt.readyCh)
+				return
+			}
+			logger.Info("cell ready",
+				"cell", spec.Name,
+				"version", spec.Version,
+				"capabilities", spec.Capabilities,
+				"depends_on", spec.DependsOn,
+			)
+			close(rt.readyCh)
+		}(spec)
 	}
+
+	// Wait for all cells to finish initializing (successfully or not).
+	initWG.Wait()
+
+	// If EVERY cell failed, there's nothing to run — exit.
+	anyReady := false
+	for _, rt := range runtimes {
+		if !rt.failed {
+			anyReady = true
+			break
+		}
+	}
+	if !anyReady {
+		logger.Error("all cells failed to start")
+		os.Exit(1)
+	}
+
+	// ------------------------------------------------------------------
+	// Start per-extension pollsters + per-cell step goroutines
+	// ------------------------------------------------------------------
+
+	// Pollsters run for the host lifetime; each one polls a single
+	// extension that has a non-nil Poll function. Events are tagged
+	// with CellID by the extension (or left empty for broadcast).
+	stopPoll := make(chan struct{})
+	var pollWG sync.WaitGroup
+	for _, c := range allCaps {
+		if c.Poll == nil || !declaredUnion[c.Name] {
+			continue
+		}
+		pollWG.Add(1)
+		go runPollster(c, stopPoll, &pollWG, runtimes, capToCells, logger)
+	}
+
+	// Step goroutines — one per cell that initialized successfully.
+	var stepWG sync.WaitGroup
+	for _, rt := range runtimes {
+		if rt.failed {
+			continue
+		}
+		stepWG.Add(1)
+		go runStepLoop(rt, capByName, &stepWG, logger)
+	}
+
+	// ------------------------------------------------------------------
+	// Start the control socket — enables graceful per-cell shutdown
+	// and remote status. Optional; if the socket fails to bind the host
+	// keeps running without it.
+	// ------------------------------------------------------------------
+
+	ops := &runtimeOps{runtimes: runtimes, allCaps: allCaps, declaredUnion: declaredUnion, logger: logger}
+	ctlServer := startControlServer(ops, logger)
+	defer ctlServer.stop()
+
+	// ------------------------------------------------------------------
+	// Wait for signal, then shut everything down
+	// ------------------------------------------------------------------
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, ShutdownSignals()...)
 
-	stepLoop(ctx, plugin, httpServer, wsServer, sigCh, logger)
-
-	if last, ok := plugin.ProbeLastCall(context.Background()); ok {
-		logger.Info("probe last envelope", "last_call", last)
-	}
-	if marker, ok := plugin.ProbeConfigMarker(context.Background()); ok {
-		logger.Info("probe config marker", "marker", marker)
+	select {
+	case sig := <-sigCh:
+		logger.Info("signal received", "signal", sig.String())
+	case <-ops.allShutdown():
+		logger.Info("all cells shut down via control socket; exiting")
 	}
 
+	// Cancel the allShutdown poller — regardless of which branch above
+	// won, the watchdog goroutine is no longer needed and would otherwise
+	// spin until process teardown.
+	ops.stopWatchdog()
+
+	// Stop pollsters first so no new events are queued.
+	close(stopPoll)
+	pollWG.Wait()
+
+	// Cancel each cell's context so step goroutines exit.
+	for _, rt := range runtimes {
+		rt.cancel()
+	}
+	stepWG.Wait()
+
+	// Drain any events still queued in per-cell channels and Finalize
+	// them so extensions don't leak per-event slot state. This mirrors
+	// what runtimeOps.shutdownCell does on the control-socket path —
+	// here we cover the signal / allShutdown path too.
+	for _, rt := range runtimes {
+		for drained := true; drained; {
+			drained = false
+			select {
+			case re := <-rt.events:
+				for _, c := range re.caps {
+					safe.CallFinalize(c, re.ev.ID, logger)
+				}
+				drained = true
+			default:
+			}
+		}
+	}
+
+	// Per-cell Shutdown + probe logging. Cells already stopped by the
+	// control socket's shutdownCell path are skipped — they've already
+	// gone through Shutdown + Close + TeardownCell. Querying their cell
+	// here would race with runtimeOps.shutdownCell clearing rt.cell.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
-	if err := plugin.Shutdown(shutdownCtx); err != nil {
-		logger.Error("shutdown failed", "err", err)
-		os.Exit(1)
+
+	for name, rt := range runtimes {
+		if ops.isStopped(name) {
+			continue
+		}
+		if rt.cell == nil {
+			continue
+		}
+		if last, ok := rt.cell.ProbeLastCall(shutdownCtx); ok {
+			logger.Info("probe last envelope", "last_call", last)
+		}
+		if marker, ok := rt.cell.ProbeConfigMarker(shutdownCtx); ok {
+			logger.Info("probe config marker", "marker", marker)
+		}
+		if err := rt.cell.Shutdown(shutdownCtx); err != nil {
+			logger.Error("shutdown failed", "cell", rt.spec.Name, "err", err)
+		}
+		rt.cell.Close(context.Background())
+	}
+
+	// Capability Teardown — called once per capability, not per cell.
+	for _, c := range allCaps {
+		if declaredUnion[c.Name] {
+			safe.CallTeardown(shutdownCtx, c, logger)
+		}
 	}
 
 	logger.Info("pulp exit clean")
 }
 
-// stepLoop calls pulp_step repeatedly until a signal arrives on sigCh.
-// Plugin owns its own cadence — it reads wall_time from the envelope and
-// decides whether to process or skip.
-func stepLoop(ctx context.Context, plugin *host.Plugin, httpServer *transport.HTTPServer, wsServer *transport.WSServer, sigCh <-chan os.Signal, logger *slog.Logger) {
-	var callNumber uint64
+// runPollster polls one extension in a loop, publishing each returned
+// event to the appropriate cell's event channel. Events with a
+// non-empty CellID go to that cell; events with an empty CellID
+// broadcast to every cell declaring the extension's capability.
+func runPollster(
+	c ext.Capability,
+	stop <-chan struct{},
+	wg *sync.WaitGroup,
+	runtimes map[string]*cellRuntime,
+	capToCells map[string][]string,
+	logger *slog.Logger,
+) {
+	defer wg.Done()
+	broadcastTargets := capToCells[c.Name]
+
 	for {
 		select {
-		case sig := <-sigCh:
-			logger.Info("signal received", "signal", sig.String())
-			return
-		case <-ctx.Done():
+		case <-stop:
 			return
 		default:
 		}
 
-		var payload []byte
-		var activeReqID uint64
-		var hasRequest bool
-		if httpServer != nil {
-			if req, ok := httpServer.PopRequest(); ok {
-				reqBytes, err := abi.EncodeHTTPRequest(req)
-				if err != nil {
-					logger.Error("encode http request", "id", req.ID, "err", err)
-					httpServer.Finalize(req.ID)
-				} else if ev, err := abi.EncodeStepEvent(abi.EventHTTPRequest, reqBytes); err != nil {
-					logger.Error("encode step event", "id", req.ID, "err", err)
-					httpServer.Finalize(req.ID)
-				} else {
-					payload = ev
-					activeReqID = req.ID
-					hasRequest = true
-				}
-			}
-		}
-		if payload == nil && wsServer != nil {
-			if ev, ok := wsServer.PopEvent(); ok {
-				payload = ev
-			}
-		}
-
-		env := abi.StepEnvelope{
-			CallNumber: callNumber,
-			WallTime:   uint64(time.Now().UnixNano()),
-			Payload:    payload,
-		}
-
-		handle, err := plugin.Step(ctx, env)
-		if err != nil {
-			logger.Error("step failed", "call_number", callNumber, "err", err)
-		}
-
-		if hasRequest {
-			httpServer.Finalize(activeReqID)
-		}
-
-		if handle != 0 {
-			logger.Debug("step output", "call_number", callNumber, "handle", handle)
-		}
-
-		if callNumber%10000 == 0 {
-			logger.Info("step heartbeat", "call_number", callNumber)
-		}
-
-		callNumber++
-		if payload == nil {
-			// Idle — sleep briefly so the loop does not burn CPU and
-			// per-step plugin allocations do not outrun Go-WASM's GC.
+		ev, ok := safe.CallPoll(c, logger)
+		if !ok {
+			// Nothing available; idle briefly to avoid pegging the CPU.
 			time.Sleep(200 * time.Microsecond)
-		} else {
-			runtime.Gosched()
+			continue
+		}
+
+		routed := routedEvent{ev: ev, caps: []ext.Capability{c}}
+
+		if ev.CellID != "" {
+			rt, found := runtimes[ev.CellID]
+			if !found || rt.failed {
+				// Cell is unknown or failed-to-start; drop the event
+				// and Finalize so the extension doesn't leak the slot.
+				safe.CallFinalize(c, ev.ID, logger)
+				continue
+			}
+			deliver(rt, routed, c, logger)
+			continue
+		}
+
+		// Broadcast: deliver to every cell declaring c.Name.
+		// Finalize is called once (after the FIRST successful delivery)
+		// since the extension's per-event slot is shared across
+		// recipients. Subsequent recipients just get the event.
+		// This matches the pre-multi-cell semantics where one event
+		// went to one cell.
+		delivered := false
+		for _, name := range broadcastTargets {
+			rt := runtimes[name]
+			if rt == nil || rt.failed {
+				continue
+			}
+			deliver(rt, routed, c, logger)
+			delivered = true
+		}
+		if !delivered {
+			safe.CallFinalize(c, ev.ID, logger)
 		}
 	}
 }
 
-func hasCapability(spec *manifest.PluginSpec, name string) bool {
-	for _, c := range spec.Capabilities {
-		if c == name {
-			return true
+// deliver sends the routed event to rt.events. If the channel is full,
+// drop with a warn log (drop-newest preserves FIFO ordering of older
+// queued events).
+func deliver(rt *cellRuntime, r routedEvent, c ext.Capability, logger *slog.Logger) {
+	select {
+	case rt.events <- r:
+	default:
+		logger.Warn("cell event channel full; dropping event",
+			"cell", rt.spec.Name,
+			"kind", r.ev.Kind,
+		)
+		safe.CallFinalize(c, r.ev.ID, logger)
+	}
+}
+
+// runStepLoop is the per-cell step loop. It reads events from the
+// cell's channel, encodes them, calls cell.Step, and calls Finalize.
+// When the cell's context is cancelled, it exits immediately without
+// draining; the caller (run.Main or runtimeOps.shutdownCell) is
+// responsible for draining remaining events and Finalize-ing them so
+// extensions don't leak per-event slot state.
+func runStepLoop(rt *cellRuntime, capByName map[string]ext.Capability, wg *sync.WaitGroup, logger *slog.Logger) {
+	defer wg.Done()
+
+	for {
+		select {
+		case <-rt.ctx.Done():
+			return
+		case re := <-rt.events:
+			stepEv, err := abi.EncodeStepEvent(re.ev.Kind, re.ev.Payload)
+			if err != nil {
+				logger.Error("encode step event",
+					"cell", rt.spec.Name, "kind", re.ev.Kind, "err", err)
+				for _, c := range re.caps {
+					safe.CallFinalize(c, re.ev.ID, logger)
+				}
+				continue
+			}
+			env := abi.StepEnvelope{
+				CallNumber: rt.callNumber,
+				WallTime:   uint64(time.Now().UnixNano()),
+				Payload:    stepEv,
+			}
+			if _, err := rt.cell.Step(rt.ctx, env); err != nil {
+				logger.Error("step failed",
+					"cell", rt.spec.Name,
+					"call_number", rt.callNumber,
+					"err", err)
+			}
+			for _, c := range re.caps {
+				safe.CallFinalize(c, re.ev.ID, logger)
+			}
+			if rt.callNumber%10000 == 0 {
+				logger.Info("step heartbeat",
+					"cell", rt.spec.Name, "call_number", rt.callNumber)
+			}
+			rt.callNumber++
+		default:
+			// No event pending — submit an empty step envelope so the
+			// cell still advances wall-time and can run its own idle
+			// logic (ticks, timeouts). Matches pre-multi-cell
+			// behavior where the step loop always called Step, even
+			// with nil payload.
+			env := abi.StepEnvelope{
+				CallNumber: rt.callNumber,
+				WallTime:   uint64(time.Now().UnixNano()),
+				Payload:    nil,
+			}
+			if _, err := rt.cell.Step(rt.ctx, env); err != nil {
+				logger.Error("step failed (idle)",
+					"cell", rt.spec.Name,
+					"call_number", rt.callNumber,
+					"err", err)
+			}
+			if rt.callNumber%10000 == 0 {
+				logger.Info("step heartbeat",
+					"cell", rt.spec.Name, "call_number", rt.callNumber)
+			}
+			rt.callNumber++
+			time.Sleep(200 * time.Microsecond)
 		}
 	}
-	return false
 }

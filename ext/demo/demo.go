@@ -1,7 +1,7 @@
 // Package demo is an example compile-time Pulp extension. A deployment
 // that imports this package gets a "demo.greet" capability exposing a
 // single host import — demo_greet(name_ptr, name_len) — that writes a
-// greeting to plugin stdout. Useful as a template for real extensions
+// greeting to cell stdout. Useful as a template for real extensions
 // (Pulp-ext-s3, Pulp-ext-stripe, etc.) and as an E2E smoke test for
 // the ext.Register mechanism.
 //
@@ -9,7 +9,7 @@
 //
 //	import _ "github.com/BananaLabs-OSS/Pulp/ext/demo"
 //
-// Plugins declare capability "demo.greet" in their manifest.
+// Cells declare capability "demo.greet" in their manifest.
 package demo
 
 import (
@@ -29,7 +29,7 @@ func init() {
 	})
 }
 
-func bindActive(b wazero.HostModuleBuilder, p ext.Plugin) error {
+func bindActive(b wazero.HostModuleBuilder, p ext.Cell) error {
 	b.NewFunctionBuilder().
 		WithFunc(func(_ context.Context, m api.Module, namePtr, nameLen uint32) uint32 {
 			if nameLen == 0 {
@@ -39,14 +39,14 @@ func bindActive(b wazero.HostModuleBuilder, p ext.Plugin) error {
 			if !ok {
 				return 2
 			}
-			fmt.Printf("[demo.greet] plugin=%s hello, %s!\n", p.Name(), string(data))
+			fmt.Printf("[demo.greet] cell=%s hello, %s!\n", p.Name(), string(data))
 			return 0
 		}).
 		Export("demo_greet")
 	return nil
 }
 
-func bindStub(b wazero.HostModuleBuilder, _ ext.Plugin) error {
+func bindStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 	b.NewFunctionBuilder().
 		WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
 		Export("demo_greet")

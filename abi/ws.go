@@ -2,14 +2,14 @@ package abi
 
 import "github.com/vmihailenco/msgpack/v5"
 
-// WebSocket frame opcodes delivered to and accepted from plugins.
+// WebSocket frame opcodes delivered to and accepted from cells.
 const (
 	WSOpCodeText   uint8 = 1
 	WSOpCodeBinary uint8 = 2
 )
 
 // WSOpen is the ws.open event — one per accepted connection. ConnID is
-// the host-assigned connection identifier plugins pass back to ws_send
+// the host-assigned connection identifier cells pass back to ws_send
 // and ws_close.
 type WSOpen struct {
 	ConnID  uint64            `msgpack:"conn_id"`
@@ -26,14 +26,14 @@ type WSFrame struct {
 }
 
 // WSClose is the ws.close event — one per disconnect, whether initiated
-// by the client, the plugin, or the host.
+// by the client, the cell, or the host.
 type WSClose struct {
 	ConnID uint64 `msgpack:"conn_id"`
 	Code   uint16 `msgpack:"code"`
 	Reason string `msgpack:"reason"`
 }
 
-// WSSendRequest is what the plugin passes to ws_send: which connection,
+// WSSendRequest is what the cell passes to ws_send: which connection,
 // what opcode, the payload bytes.
 type WSSendRequest struct {
 	ConnID  uint64 `msgpack:"conn_id"`
@@ -41,7 +41,7 @@ type WSSendRequest struct {
 	Payload []byte `msgpack:"payload"`
 }
 
-// WSCloseRequest is what the plugin passes to ws_close.
+// WSCloseRequest is what the cell passes to ws_close.
 type WSCloseRequest struct {
 	ConnID uint64 `msgpack:"conn_id"`
 	Code   uint16 `msgpack:"code"`

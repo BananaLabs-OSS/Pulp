@@ -2,7 +2,7 @@ name = "heartbeat"
 version = "0.1.0"
 wasm = "heartbeat.wasm"
 
-# No provides, no consumes — heartbeat is a standalone test plugin with no
+# No provides, no consumes — heartbeat is a standalone test cell with no
 # siblings to link against.
 
 # No capabilities declared in v0.2 — once transport lands in a later

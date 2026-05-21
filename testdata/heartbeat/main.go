@@ -1,4 +1,4 @@
-// Heartbeat — trivial test plugin for Pulp v0.2 validation.
+// Heartbeat — trivial test cell for Pulp v0.2 validation.
 //
 // Implements the five exports the host calls (init/step/shutdown plus
 // alloc/free for envelope marshaling) and a set of probe exports used by

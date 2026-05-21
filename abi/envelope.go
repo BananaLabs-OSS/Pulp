@@ -9,7 +9,7 @@ import "encoding/binary"
 //	call_number  uint64  — how many times step has been called
 //	wall_time    uint64  — unix nanoseconds when Go called step
 //	payload_len  uint32  — length of the following payload bytes
-//	payload      []byte  — trigger data, plugin-defined
+//	payload      []byte  — trigger data, cell-defined
 type StepEnvelope struct {
 	CallNumber uint64
 	WallTime   uint64

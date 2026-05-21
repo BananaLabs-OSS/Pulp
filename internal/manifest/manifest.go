@@ -1,12 +1,12 @@
-// Package manifest reads and validates pulp.plugin.toml files.
+// Package manifest reads and validates pulp.cell.toml files.
 //
-// A manifest declares everything the host needs to know about a plugin
-// before instantiating it: identity, what functions the plugin provides
+// A manifest declares everything the host needs to know about a cell
+// before instantiating it: identity, what functions the cell provides
 // to siblings, what it consumes from siblings, which host primitives
 // ("capabilities") it touches, and its free-form [config] table.
 //
-// The parser does NOT resolve cross-plugin dependencies or touch WASM.
-// It produces a [PluginSpec] that downstream code (loader, dependency
+// The parser does NOT resolve cross-cell dependencies or touch WASM.
+// It produces a [CellSpec] that downstream code (loader, dependency
 // resolver, capability binder) consumes.
 package manifest
 
@@ -20,12 +20,31 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// PluginSpec is the parsed, validated, normalized form of a pulp.plugin.toml.
+// CurrentSchemaVersion is the manifest schema the host knows how to parse.
+// Manifests that declare a higher schema_version are rejected.
+const CurrentSchemaVersion = 1
+
+// RestartNever / RestartOnCrash / RestartAlways are the accepted values of
+// the manifest's restart field. The supervisor is not yet implemented;
+// the field is parsed and validated now so manifests written today survive
+// the v2 supervisor drop without rewrites.
+const (
+	RestartNever   = "never"
+	RestartOnCrash = "on_crash"
+	RestartAlways  = "always"
+)
+
+// CellSpec is the parsed, validated, normalized form of a pulp.cell.toml.
 //
 // It contains everything the host needs to decide how to instantiate the
-// plugin. Config is returned as the raw TOML table so it can be encoded to
+// cell. Config is returned as the raw TOML table so it can be encoded to
 // whatever wire format the host chooses — MessagePack in v0.2.
-type PluginSpec struct {
+type CellSpec struct {
+	// SchemaVersion is the manifest schema this cell was written against.
+	// Defaults to CurrentSchemaVersion when absent. Manifests declaring a
+	// higher version than the host supports are rejected.
+	SchemaVersion int
+
 	// Identity.
 	Name    string
 	Version string
@@ -34,12 +53,17 @@ type PluginSpec struct {
 	Provides []string
 	Consumes []string
 
+	// DependsOn lists cell names (not capabilities) that must finish Init
+	// before this cell starts. The host refuses to boot on cycles or
+	// references to cell names absent from the manifest set.
+	DependsOn []string
+
 	// Capability declarations. Normalized to lowercase. The host binds only
 	// imports that match declared capabilities; everything else fails loudly.
 	Capabilities []string
 
 	// SharedMemoryGroups — opt-in zero-copy regions between cooperating
-	// plugins. Absent from v0.2 linking but parsed so manifests are
+	// cells. Absent from v0.2 linking but parsed so manifests are
 	// forward-compatible.
 	SharedMemoryGroups []string
 
@@ -47,7 +71,12 @@ type PluginSpec struct {
 	DedicatedThread bool
 	Snapshotable    bool
 
-	// Free-form plugin config. The TOML [config] table as a generic map —
+	// Restart is the post-exit policy: "never" (default), "on_crash", or
+	// "always". Parsed + validated now; the supervisor that honors it ships
+	// in a later Pulp version.
+	Restart string
+
+	// Free-form cell config. The TOML [config] table as a generic map —
 	// the host encodes it to MessagePack before handing it to pulp_init.
 	// Absent or empty table => nil map.
 	Config map[string]any
@@ -56,9 +85,9 @@ type PluginSpec struct {
 	// Used to resolve relative WASM paths.
 	ManifestPath string
 
-	// WASMPath is the absolute path to the plugin's .wasm file. Resolved
+	// WASMPath is the absolute path to the cell's .wasm file. Resolved
 	// from the manifest's `wasm =` field (relative paths are relative to
-	// the manifest). If the field is absent, defaults to plugin.wasm next
+	// the manifest). If the field is absent, defaults to cell.wasm next
 	// to the manifest.
 	WASMPath string
 }
@@ -66,6 +95,8 @@ type PluginSpec struct {
 // raw mirrors the TOML schema exactly. It's the only struct BurntSushi/toml
 // unmarshals into. Normalization happens afterward in Load.
 type raw struct {
+	SchemaVersion int `toml:"schema_version"`
+
 	Name    string `toml:"name"`
 	Version string `toml:"version"`
 
@@ -73,12 +104,14 @@ type raw struct {
 
 	Provides     []string `toml:"provides"`
 	Consumes     []string `toml:"consumes"`
+	DependsOn    []string `toml:"depends_on"`
 	Capabilities []string `toml:"capabilities"`
 
 	SharedMemoryGroups []string `toml:"shared_memory_groups"`
 
-	DedicatedThread bool `toml:"dedicated_thread"`
-	Snapshotable    bool `toml:"snapshotable"`
+	DedicatedThread bool   `toml:"dedicated_thread"`
+	Snapshotable    bool   `toml:"snapshotable"`
+	Restart         string `toml:"restart"`
 
 	// Reserved for federation (v0.4+). Parsed so v0.1/v0.2 manifests that
 	// declare them work unchanged when federation lands.
@@ -89,12 +122,12 @@ type raw struct {
 	Config map[string]any `toml:"config"`
 }
 
-// Load reads, parses, and validates a pulp.plugin.toml at path. Returns a
-// [PluginSpec] ready for the host to instantiate.
+// Load reads, parses, and validates a pulp.cell.toml at path. Returns a
+// [CellSpec] ready for the host to instantiate.
 //
 // Unknown top-level keys are treated as errors — catches typos at boot
 // rather than silently ignoring mis-spelled capabilities or provides.
-func Load(path string) (*PluginSpec, error) {
+func Load(path string) (*CellSpec, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("manifest path: %w", err)
@@ -128,7 +161,7 @@ func Load(path string) (*PluginSpec, error) {
 
 // normalize validates required fields, lowercases capabilities, dedupes
 // string slices, and resolves paths.
-func normalize(r *raw, manifestPath string) (*PluginSpec, error) {
+func normalize(r *raw, manifestPath string) (*CellSpec, error) {
 	if strings.TrimSpace(r.Name) == "" {
 		return nil, errors.New("name is required")
 	}
@@ -136,24 +169,48 @@ func normalize(r *raw, manifestPath string) (*PluginSpec, error) {
 		return nil, errors.New("version is required")
 	}
 
+	schemaVersion := r.SchemaVersion
+	if schemaVersion == 0 {
+		schemaVersion = CurrentSchemaVersion
+	}
+	if schemaVersion > CurrentSchemaVersion {
+		return nil, fmt.Errorf("schema_version %d is newer than host supports (max %d)", schemaVersion, CurrentSchemaVersion)
+	}
+	if schemaVersion < 1 {
+		return nil, fmt.Errorf("schema_version must be >= 1 (got %d)", schemaVersion)
+	}
+
+	restart := strings.TrimSpace(r.Restart)
+	if restart == "" {
+		restart = RestartNever
+	}
+	switch restart {
+	case RestartNever, RestartOnCrash, RestartAlways:
+	default:
+		return nil, fmt.Errorf("restart %q is not one of %q, %q, %q", restart, RestartNever, RestartOnCrash, RestartAlways)
+	}
+
 	dir := filepath.Dir(manifestPath)
 	wasmPath := r.WASM
 	if wasmPath == "" {
-		wasmPath = "plugin.wasm"
+		wasmPath = "cell.wasm"
 	}
 	if !filepath.IsAbs(wasmPath) {
 		wasmPath = filepath.Join(dir, wasmPath)
 	}
 
-	return &PluginSpec{
+	return &CellSpec{
+		SchemaVersion:      schemaVersion,
 		Name:               strings.TrimSpace(r.Name),
 		Version:            strings.TrimSpace(r.Version),
 		Provides:           dedupe(r.Provides),
 		Consumes:           dedupe(r.Consumes),
+		DependsOn:          dedupe(r.DependsOn),
 		Capabilities:       dedupe(lowerAll(r.Capabilities)),
 		SharedMemoryGroups: dedupe(r.SharedMemoryGroups),
 		DedicatedThread:    r.DedicatedThread,
 		Snapshotable:       r.Snapshotable,
+		Restart:            restart,
 		Config:             r.Config,
 		ManifestPath:       manifestPath,
 		WASMPath:           wasmPath,

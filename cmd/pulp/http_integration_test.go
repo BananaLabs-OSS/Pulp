@@ -17,20 +17,20 @@ import (
 	"github.com/BananaLabs-OSS/Pulp/run"
 )
 
-// TestEchoPluginHTTP spawns the pulp binary against the echo plugin,
+// TestEchoCellHTTP spawns the pulp binary against the echo cell,
 // sends HTTP requests to both echo routes, and asserts the responses
-// round-trip through the full host / plugin / host path.
-func TestEchoPluginHTTP(t *testing.T) {
+// round-trip through the full host / cell / host path.
+func TestEchoCellHTTP(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skip in short mode")
 	}
 
-	binary := filepath.Join("..", "..", "pulp.exe")
+	binary := filepath.Join("..", "..", "pulp-http-test.exe")
 	if runtime.GOOS != "windows" {
-		binary = filepath.Join("..", "..", "pulp")
+		binary = filepath.Join("..", "..", "pulp-http-test")
 	}
 	wasmPath := filepath.Join("..", "..", "testdata", "echo", "echo.wasm")
-	manifestPath := filepath.Join("..", "..", "testdata", "echo", "pulp.plugin.toml")
+	manifestPath := filepath.Join("..", "..", "testdata", "echo", "pulp.cell.toml")
 
 	if err := ensurePulpBinary(binary); err != nil {
 		t.Fatalf("ensure pulp binary: %v", err)
@@ -61,6 +61,15 @@ func TestEchoPluginHTTP(t *testing.T) {
 		_ = cmd.Process.Kill()
 		t.Logf("pulp stdout:\n%s", stdout.String())
 		t.Fatalf("http server never started: %v", err)
+	}
+	// Wait until the echo cell has finished Init (and therefore
+	// registered its routes) before firing requests. Otherwise the
+	// server is up but returns 404 because the cell hasn't hooked
+	// its paths yet.
+	if err := waitForLog(&stdout, `msg="cell ready" cell=echo`, 5*time.Second); err != nil {
+		_ = cmd.Process.Kill()
+		t.Logf("pulp stdout:\n%s", stdout.String())
+		t.Fatalf("echo cell never finished init: %v", err)
 	}
 
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
@@ -131,12 +140,14 @@ func buildEchoWASM(t *testing.T, out string) error {
 	return nil
 }
 
-// ensurePulpBinary always rebuilds the cmd/pulp binary so the integration
-// test runs against current source, not whatever happened to be lying
-// around from a prior manual build.
+// ensurePulpBinary always rebuilds the cmd/pulp-http-test binary so the
+// integration test runs against current source, not whatever happened
+// to be lying around. The HTTP test needs a binary with Pulp-ext-http
+// linked in — cmd/pulp itself ships with no extensions on purpose, so
+// we use cmd/pulp-http-test which blank-imports ext-http.
 func ensurePulpBinary(path string) error {
 	repoRoot := filepath.Join("..", "..")
-	cmd := exec.Command("go", "build", "-o", filepath.Base(path), "./cmd/pulp")
+	cmd := exec.Command("go", "build", "-o", filepath.Base(path), "./cmd/pulp-http-test")
 	cmd.Dir = repoRoot
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return &buildErr{output: string(output), err: err}

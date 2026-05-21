@@ -1,10 +1,10 @@
 # Pulp
 
-A minimal, universal application runtime. Go host, WASM plugins, Docker-shaped boundary.
+A minimal, universal application runtime. Go host, WASM cells, Docker-shaped boundary.
 
 ## Status
 
-**v0.4 — storage.** v0.3 stood up transport (HTTP / HTTPS / WebSocket / SSE) on a shared port. v0.4 adds a scoped filesystem and a per-plugin SQLite database. The combination is enough to host Hytale-Auth; the existing port lives in `Hytale-Auth/pulp-plugin/`.
+**v0.4 — storage.** v0.3 stood up transport (HTTP / HTTPS / WebSocket / SSE) on a shared port. v0.4 adds a scoped filesystem and a per-cell SQLite database. The combination is enough to host Hytale-Auth; the existing port lives in `Hytale-Auth/pulp-cell/`.
 
 See `plans/velvet-bouncing-horizon.md` for the full design.
 
@@ -12,28 +12,28 @@ See `plans/velvet-bouncing-horizon.md` for the full design.
 
 ```sh
 go build -o pulp ./cmd/pulp
-./pulp -manifest path/to/pulp.plugin.toml
-./pulp -manifest path/to/pulp.plugin.toml -http-port 9090
-./pulp -manifest path/to/pulp.plugin.toml -http-cert cert.pem -http-key key.pem
+./pulp -manifest path/to/pulp.cell.toml
+./pulp -manifest path/to/pulp.cell.toml -http-port 9090
+./pulp -manifest path/to/pulp.cell.toml -http-cert cert.pem -http-key key.pem
 ```
 
 Send `SIGINT` (Ctrl+C) or `SIGTERM` to shut down. On Windows, `Ctrl+Break` works (the runtime listens for `SIGBREAK` too).
 
 Flags:
 
-- `-manifest` — path to `pulp.plugin.toml` (required).
-- `-http-port` — HTTP / HTTPS / WS / SSE listener port (default `8080`). Used only when the plugin declares an inbound transport capability.
+- `-manifest` — path to `pulp.cell.toml` (required).
+- `-http-port` — HTTP / HTTPS / WS / SSE listener port (default `8080`). Used only when the cell declares an inbound transport capability.
 - `-http-cert`, `-http-key` — PEM files. If both are given, the HTTP server switches to HTTPS.
-- `-storage-root` — root directory for plugin-scoped storage (default `./data`). Each plugin gets `{root}/{plugin_name}/` — scoped filesystem and SQLite DB live inside.
+- `-storage-root` — root directory for cell-scoped storage (default `./data`). Each cell gets `{root}/{cell_name}/` — scoped filesystem and SQLite DB live inside.
 
-## Plugin contract
+## Cell contract
 
-A valid plugin ships with a `pulp.plugin.toml` next to a WASM module. The TOML declares identity, dependencies, capabilities, and a free-form `[config]` table:
+A valid cell ships with a `pulp.cell.toml` next to a WASM module. The TOML declares identity, dependencies, capabilities, and a free-form `[config]` table:
 
 ```toml
 name = "echo"
 version = "0.1.0"
-wasm = "echo.wasm"                # defaults to plugin.wasm if omitted
+wasm = "echo.wasm"                # defaults to cell.wasm if omitted
 
 provides = []
 consumes = []
@@ -49,7 +49,7 @@ snapshotable = false
 The WASM module must export:
 
 ```
-pulp_alloc(size u32) -> u32                      // returns a pointer into the plugin's linear memory
+pulp_alloc(size u32) -> u32                      // returns a pointer into the cell's linear memory
 pulp_free(ptr u32, size u32)                     // (optional) frees what pulp_alloc returned
 pulp_init(cfg_ptr u32, cfg_len u32) -> i32       // receives MessagePack-encoded [config] bytes
 pulp_step(in_ptr u32, in_len u32)  -> i32        // returns an arena handle, 0 = no output
@@ -76,11 +76,11 @@ StepEvent {
 
 ## Transport capabilities (v0.3)
 
-Plugins opt into transport by listing capabilities in the manifest and calling the matching host imports (from the `pulp` import module).
+Cells opt into transport by listing capabilities in the manifest and calling the matching host imports (from the `pulp` import module).
 
 ### `transport.http.inbound`
 
-Plugin calls `http_register` during `pulp_init` to declare routes; incoming requests arrive as `StepEvent{kind:"http.request"}`; plugin replies with `http_respond`.
+Cell calls `http_register` during `pulp_init` to declare routes; incoming requests arrive as `StepEvent{kind:"http.request"}`; cell replies with `http_respond`.
 
 ```
 http_register(req_ptr, req_len) -> error_code     // req = msgpack {method, path}
@@ -91,7 +91,7 @@ Path patterns support `:param` segments (e.g. `/echo/:msg`).
 
 ### `transport.http.outbound`
 
-Plugin calls `http_fetch` to make an outbound HTTP request. The host performs the call synchronously and writes a MessagePack `HTTPResponse` into the plugin's linear memory via `pulp_alloc`.
+Cell calls `http_fetch` to make an outbound HTTP request. The host performs the call synchronously and writes a MessagePack `HTTPResponse` into the cell's linear memory via `pulp_alloc`.
 
 ```
 http_fetch(req_ptr, req_len, resp_ptr_out, resp_len_out) -> error_code
@@ -101,7 +101,7 @@ http_fetch(req_ptr, req_len, resp_ptr_out, resp_len_out) -> error_code
 
 ### `transport.ws.inbound`
 
-Plugin registers a WebSocket path; the host upgrades matching HTTP requests. Connection events (`ws.open`, `ws.frame`, `ws.close`) are delivered through `StepEvent`. Plugin sends frames via `ws_send` and closes via `ws_close`.
+Cell registers a WebSocket path; the host upgrades matching HTTP requests. Connection events (`ws.open`, `ws.frame`, `ws.close`) are delivered through `StepEvent`. Cell sends frames via `ws_send` and closes via `ws_close`.
 
 ```
 ws_register(path_ptr, path_len)         -> error_code
@@ -111,7 +111,7 @@ ws_close   (req_ptr, req_len)           -> error_code  // msgpack {conn_id, code
 
 ### `transport.sse`
 
-Plugin registers an SSE path; clients that GET the path receive a long-poll event stream. Plugin pushes events to every subscriber on that path via `sse_emit`. A 15-second keepalive comment is written automatically.
+Cell registers an SSE path; clients that GET the path receive a long-poll event stream. Cell pushes events to every subscriber on that path via `sse_emit`. A 15-second keepalive comment is written automatically.
 
 ```
 sse_register(path_ptr, path_len) -> error_code
@@ -122,11 +122,11 @@ All four capabilities share a single listener (`-http-port`). The dispatcher rou
 
 ## Storage capabilities (v0.4)
 
-Both capabilities confine the plugin to `{-storage-root}/{plugin_name}/`.
+Both capabilities confine the cell to `{-storage-root}/{cell_name}/`.
 
 ### `storage.fs`
 
-Per-plugin scoped filesystem. Absolute paths, `..`, and null bytes are rejected at the host boundary.
+Per-cell scoped filesystem. Absolute paths, `..`, and null bytes are rejected at the host boundary.
 
 ```
 fs_read  (path_ptr, path_len, data_ptr_out, data_len_out) -> error_code
@@ -137,7 +137,7 @@ fs_delete(path_ptr, path_len)                              -> error_code
 
 ### `storage.sqlite`
 
-Per-plugin SQLite database (`{-storage-root}/{plugin_name}/data.db`), backed by `modernc.org/sqlite` — pure Go, no CGo.
+Per-cell SQLite database (`{-storage-root}/{cell_name}/data.db`), backed by `modernc.org/sqlite` — pure Go, no CGo.
 
 ```
 sqlite_exec (query_ptr, query_len, params_ptr, params_len)                             -> error_code
@@ -146,12 +146,12 @@ sqlite_query(query_ptr, query_len, params_ptr, params_len, rows_ptr_out, rows_le
 // rows   = msgpack [][]any — outer slice is rows, inner slice is column values in declaration order
 ```
 
-The `[config]` table is encoded to MessagePack (`github.com/vmihailenco/msgpack/v5`) before delivery, so plugins in any language can decode it with any MessagePack library.
+The `[config]` table is encoded to MessagePack (`github.com/vmihailenco/msgpack/v5`) before delivery, so cells in any language can decode it with any MessagePack library.
 
-## Test plugins
+## Test cells
 
-- `testdata/heartbeat/` — minimal plugin for lifecycle / envelope / config verification.
-- `testdata/echo/` — HTTP demo plugin. Declares `transport.http.inbound`, registers `GET /echo/:msg` and `POST /echo`.
+- `testdata/heartbeat/` — minimal cell for lifecycle / envelope / config verification.
+- `testdata/echo/` — HTTP demo cell. Declares `transport.http.inbound`, registers `GET /echo/:msg` and `POST /echo`.
 
 Build either manually:
 

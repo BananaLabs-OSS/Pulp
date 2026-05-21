@@ -12,7 +12,7 @@ import (
 func writeManifest(t *testing.T, body string) string {
 	t.Helper()
 	dir := t.TempDir()
-	path := filepath.Join(dir, "pulp.plugin.toml")
+	path := filepath.Join(dir, "pulp.cell.toml")
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -37,7 +37,7 @@ version = "0.1.0"
 	if spec.Config != nil {
 		t.Fatalf("absent config should be nil: %+v", spec.Config)
 	}
-	if !strings.HasSuffix(spec.WASMPath, "plugin.wasm") {
+	if !strings.HasSuffix(spec.WASMPath, "cell.wasm") {
 		t.Fatalf("default wasm path wrong: %s", spec.WASMPath)
 	}
 }

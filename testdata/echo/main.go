@@ -1,4 +1,4 @@
-// Echo — demo plugin for Pulp v0.3 HTTP inbound. Registers GET /echo/:msg
+// Echo — demo cell for Pulp v0.3 HTTP inbound. Registers GET /echo/:msg
 // and POST /echo at init time, then echoes the request back on step.
 //
 // Build:
@@ -22,8 +22,8 @@ func hostHTTPRegister(ptr, ln uint32) uint32
 //go:wasmimport pulp http_respond
 func hostHTTPRespond(ptr, ln uint32) uint32
 
-// Local copies of the host's ABI structs. When the Fiber plugin SDK lands
-// these will live in a shared package the plugin imports instead.
+// Local copies of the host's ABI structs. When the Fiber cell SDK lands
+// these will live in a shared package the cell imports instead.
 
 type stepEvent struct {
 	Kind    string             `msgpack:"kind"`

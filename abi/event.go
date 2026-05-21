@@ -2,7 +2,7 @@ package abi
 
 import "github.com/vmihailenco/msgpack/v5"
 
-// Event kinds delivered to the plugin as the step envelope payload.
+// Event kinds delivered to the cell as the step envelope payload.
 const (
 	EventHTTPRequest = "http.request"
 	EventWSOpen      = "ws.open"
@@ -13,7 +13,7 @@ const (
 // StepEvent is the outer MessagePack envelope wrapping any event the host
 // delivers to pulp_step. Kind selects which concrete struct Payload
 // decodes to. An empty envelope payload (envelope.Payload == nil) means
-// "no event this step" — the plugin should treat it as a tick and return.
+// "no event this step" — the cell should treat it as a tick and return.
 type StepEvent struct {
 	Kind    string             `msgpack:"kind"`
 	Payload msgpack.RawMessage `msgpack:"payload"`
