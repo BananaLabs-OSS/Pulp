@@ -498,14 +498,41 @@ func deliver(rt *cellRuntime, r routedEvent, c ext.Capability, logger *slog.Logg
 // draining; the caller (run.Main or runtimeOps.shutdownCell) is
 // responsible for draining remaining events and Finalize-ing them so
 // extensions don't leak per-event slot state.
+//
+// Idle pacing: when no event arrives we still call Step with a nil
+// payload so the cell's own tickers / timeouts can advance. Between
+// idle steps we back off using an adaptive timer rather than a fixed
+// busy-wait. Starting at 200µs (same as the previous behavior, low
+// latency once an event lands) we double the sleep up to 10ms when
+// the cell has been quiet for over a second, so a fleet of idle cells
+// no longer burns a measurable slice of one core each. As soon as
+// real work arrives the timer is reset, restoring the original
+// snappy pickup latency.
 func runStepLoop(rt *cellRuntime, capByName map[string]ext.Capability, wg *sync.WaitGroup, logger *slog.Logger) {
 	defer wg.Done()
+
+	const (
+		idleMin     = 200 * time.Microsecond
+		idleMax     = 10 * time.Millisecond
+		idleRampAge = time.Second
+	)
+	idleSleep := idleMin
+	idleSince := time.Time{}
+	idleTimer := time.NewTimer(idleMin)
+	if !idleTimer.Stop() {
+		<-idleTimer.C
+	}
+	defer idleTimer.Stop()
 
 	for {
 		select {
 		case <-rt.ctx.Done():
 			return
 		case re := <-rt.events:
+			// Real event — reset idle pacing so the next idle gap
+			// starts back at the snappy 200µs floor.
+			idleSleep = idleMin
+			idleSince = time.Time{}
 			stepEv, err := abi.EncodeStepEvent(re.ev.Kind, re.ev.Payload)
 			if err != nil {
 				logger.Error("encode step event",
@@ -556,7 +583,50 @@ func runStepLoop(rt *cellRuntime, capByName map[string]ext.Capability, wg *sync.
 					"cell", rt.spec.Name, "call_number", rt.callNumber)
 			}
 			rt.callNumber++
-			time.Sleep(200 * time.Microsecond)
+
+			// Idle back-off — wake early on a real event OR on cancel.
+			// After idleRampAge of pure-idle we double idleSleep each
+			// iteration up to idleMax so a truly quiet cell costs
+			// microseconds of CPU per second instead of milliseconds.
+			now := time.Now()
+			if idleSince.IsZero() {
+				idleSince = now
+			}
+			if now.Sub(idleSince) > idleRampAge && idleSleep < idleMax {
+				idleSleep *= 2
+				if idleSleep > idleMax {
+					idleSleep = idleMax
+				}
+			}
+			idleTimer.Reset(idleSleep)
+			select {
+			case <-rt.ctx.Done():
+				if !idleTimer.Stop() {
+					<-idleTimer.C
+				}
+				return
+			case re := <-rt.events:
+				if !idleTimer.Stop() {
+					<-idleTimer.C
+				}
+				// Push the event back so the outer loop picks it up
+				// uniformly. The cell's events channel is buffered, so
+				// this send will only block if the channel filled
+				// between the recv and the resend — in which case the
+				// outer broadcast already handled drop semantics, so
+				// we drop here too and Finalize.
+				select {
+				case rt.events <- re:
+				default:
+					for _, c := range re.caps {
+						safe.CallFinalize(c, re.ev.ID, logger)
+					}
+				}
+				idleSleep = idleMin
+				idleSince = time.Time{}
+			case <-idleTimer.C:
+				// Tick — keep idling.
+			}
 		}
 	}
 }
