@@ -86,17 +86,20 @@ type Cell struct {
 	mu sync.Mutex
 
 	// callTimeout bounds a single WASM entry point (Init/Step/Call/
-	// Shutdown). With WithCloseOnContextDone set on the runtime, exceeding
-	// it traps the call instead of pinning a core + mu indefinitely.
+	// Shutdown) on the HOST side only: it cancels the call's context but
+	// does NOT trap a runaway wasm loop (we deliberately do not set
+	// WithCloseOnContextDone — see Load). Bounding a runaway loop needs an
+	// out-of-band supervisor; this just propagates host-side cancellation.
 	callTimeout time.Duration
 
 	log *slog.Logger
 }
 
 // callContext derives a deadline-bounded context for a single WASM call.
-// The returned cancel must be called once the call returns. Because the
-// runtime is built WithCloseOnContextDone, a runaway call traps when this
-// deadline elapses rather than blocking forever.
+// The returned cancel must be called once the call returns. NOTE: this
+// bounds only the HOST-side context — the runtime is deliberately NOT built
+// WithCloseOnContextDone (see Load), so an elapsed deadline cancels the
+// context but does not interrupt a runaway wasm loop.
 func (p *Cell) callContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	if p.callTimeout <= 0 {
 		return context.WithCancel(ctx)
