@@ -55,6 +55,19 @@ import (
 	// The harness wires the inbound capability's real Setup (starts an HTTP
 	// listener) + Poll/Finalize (feeds requests into the cell's step loop).
 	_ "github.com/BananaLabs-OSS/Pulp-ext-http"
+
+	// The light-cell ext set. Each registers its capability into ext.All()
+	// via init(); StartCellHTTP runs Setup for whichever a cell DECLARES,
+	// backed by a temp StorageRoot, so no external service is required:
+	//   storage.sqlite -> per-cell data.db under the temp root (Hand, Bunch)
+	//   storage.fs     -> per-cell scoped dir under the temp root (Hytale-Auth)
+	//   entropy.read   -> crypto/rand bridge (Hand, Bunch)
+	//   network.udp    -> in-process UDP manager; default UDP_BIND_ALLOW
+	//                     ("0.0.0.0,::") admits Peel's wildcard inbound bind
+	_ "github.com/BananaLabs-OSS/Pulp-ext-entropy"
+	_ "github.com/BananaLabs-OSS/Pulp-ext-fs"
+	_ "github.com/BananaLabs-OSS/Pulp-ext-sqlite"
+	_ "github.com/BananaLabs-OSS/Pulp-ext-udp"
 )
 
 // CellHarnessConfig describes the cell to build, load, and drive.
@@ -73,6 +86,14 @@ type CellHarnessConfig struct {
 	// pulp_init exactly as run.Main does via manifest.EncodeConfig. This is
 	// where you set service_token, urls, etc. to exercise a specific path.
 	Config map[string]any
+	// CapabilityOverrides replace (by Name) capabilities the harness would
+	// otherwise pull from ext.All(). Use this to swap a real ext that needs
+	// an external backend (e.g. transport.http.outbound hitting a live API)
+	// for a deterministic in-memory stub — mirroring how production swaps
+	// caps, but local to THIS harness instance (no global ext registry
+	// mutation, so sibling tests keep the real cap). An override is applied
+	// to the Registry AND its Setup (if any) is run alongside the others.
+	CapabilityOverrides []ext.Capability
 }
 
 // CellHarness is a running cell with a real HTTP listener in front of it.
@@ -85,6 +106,10 @@ type CellHarness struct {
 	pumpWG  sync.WaitGroup
 	t       *testing.T
 	httpCap ext.Capability
+	// teardownCaps are the declared capabilities (resolved, override-aware)
+	// whose Teardown must run on stop — e.g. storage.sqlite closing its
+	// per-cell *sql.DB so Windows can remove the TempDir-backed db file.
+	teardownCaps []ext.Capability
 }
 
 // BuildCell compiles the cell at sourceDir to a wasip1/wasm module and
@@ -129,19 +154,6 @@ func freePort(t *testing.T) int {
 	return port
 }
 
-// httpInboundCapability returns the registered transport.http.inbound
-// capability from ext.All() (populated by the blank import above).
-func httpInboundCapability(t *testing.T) ext.Capability {
-	t.Helper()
-	for _, c := range ext.All() {
-		if c.Name == "transport.http.inbound" {
-			return c
-		}
-	}
-	t.Fatal("transport.http.inbound capability not registered (missing ext-http import?)")
-	return ext.Capability{}
-}
-
 // StartCellHTTP builds the cell, starts the real HTTP transport on an
 // ephemeral port, loads + Inits the cell in the Pulp host, and starts a pump
 // goroutine that drives inbound HTTP requests through the cell's step loop.
@@ -160,13 +172,40 @@ func StartCellHTTP(t *testing.T, cfg CellHarnessConfig) *CellHarness {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	httpCap := httpInboundCapability(t)
-	if httpCap.Setup != nil {
-		if err := httpCap.Setup(ext.SetupEnv{
-			StorageRoot: t.TempDir(),
-			Logger:      logger,
-		}); err != nil {
-			t.Fatalf("http capability setup: %v", err)
+	// Resolve the capability set the harness will wire: start from
+	// ext.All() (populated by blank imports) then apply any per-harness
+	// overrides by name. This is the same map-by-name resolution the real
+	// host Registry does, kept local so overriding outbound HTTP for one
+	// cell can't leak into another test's run.
+	caps := map[string]ext.Capability{}
+	for _, c := range ext.All() {
+		caps[c.Name] = c
+	}
+	for _, c := range cfg.CapabilityOverrides {
+		caps[c.Name] = c
+	}
+
+	httpCap := caps["transport.http.inbound"]
+	if httpCap.Name == "" {
+		t.Fatal("transport.http.inbound capability not registered (missing ext-http import?)")
+	}
+
+	// Setup every capability the cell DECLARES that has a Setup hook,
+	// against one shared StorageRoot — exactly run.Main's one-time
+	// per-declared-capability Setup (run/run.go:150-171). storage.sqlite /
+	// storage.fs capture this root and create their per-cell subdir lazily
+	// at Register time; transport.http.inbound starts the listener.
+	storageRoot := t.TempDir()
+	declared := map[string]bool{}
+	for _, name := range cfg.Capabilities {
+		declared[name] = true
+	}
+	for name, c := range caps {
+		if !declared[name] || c.Setup == nil {
+			continue
+		}
+		if err := c.Setup(ext.SetupEnv{StorageRoot: storageRoot, Logger: logger}); err != nil {
+			t.Fatalf("capability %q setup: %v", name, err)
 		}
 	}
 
@@ -182,7 +221,7 @@ func StartCellHTTP(t *testing.T, cfg CellHarnessConfig) *CellHarness {
 	}
 
 	registry := NewRegistry()
-	for _, c := range ext.All() {
+	for _, c := range caps {
 		registry.Gated(c)
 	}
 
@@ -203,13 +242,21 @@ func StartCellHTTP(t *testing.T, cfg CellHarnessConfig) *CellHarness {
 		t.Fatalf("init cell: %v", err)
 	}
 
+	var teardownCaps []ext.Capability
+	for name, c := range caps {
+		if declared[name] && c.Teardown != nil {
+			teardownCaps = append(teardownCaps, c)
+		}
+	}
+
 	h := &CellHarness{
-		URL:     fmt.Sprintf("http://127.0.0.1:%d", port),
-		cell:    cell,
-		client:  &http.Client{Timeout: 5 * time.Second},
-		cancel:  cancel,
-		t:       t,
-		httpCap: httpCap,
+		URL:          fmt.Sprintf("http://127.0.0.1:%d", port),
+		cell:         cell,
+		client:       &http.Client{Timeout: 5 * time.Second},
+		cancel:       cancel,
+		t:            t,
+		httpCap:      httpCap,
+		teardownCaps: teardownCaps,
 	}
 
 	// Pump: poll the http capability for inbound requests, step them into
@@ -270,12 +317,15 @@ func (h *CellHarness) step(ctx context.Context, callNum uint64, kind string, pay
 func (h *CellHarness) stop() {
 	h.cancel()
 	h.pumpWG.Wait()
-	if h.httpCap.Teardown != nil {
-		_ = h.httpCap.Teardown(context.Background())
-	}
 	if h.cell != nil {
 		_ = h.cell.Shutdown(context.Background())
 		_ = h.cell.Close(context.Background())
+	}
+	// Teardown every declared capability that has a hook (closes DBs /
+	// listeners). Done after the cell is shut so no in-flight step touches
+	// a closed resource. httpCap is included via teardownCaps.
+	for _, c := range h.teardownCaps {
+		_ = c.Teardown(context.Background())
 	}
 }
 
