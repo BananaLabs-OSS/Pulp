@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/BananaLabs-OSS/Pulp/abi"
 	"github.com/BananaLabs-OSS/Pulp/internal/manifest"
@@ -14,6 +15,54 @@ import (
 	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
+
+// Resource-limit defaults applied to every cell unless the manifest
+// overrides them. They bound a single cell so a buggy or hostile cell
+// cannot OOM the host or wedge all co-located cells with an infinite loop.
+const (
+	// DefaultMaxMemoryPages caps a cell's WASM linear memory. wazero's bare
+	// default is the wasm maximum (65536 pages = 4 GiB), which lets one cell
+	// grow until the host process is OOM-killed. 4096 pages = 256 MiB is a
+	// generous per-cell budget that still leaves headroom for co-located
+	// cells; override per-cell via manifest `max_memory_pages`.
+	DefaultMaxMemoryPages uint32 = 4096
+
+	// DefaultCallTimeout bounds a single pulp_init / pulp_step / pulp_on_call
+	// invocation. Combined with WithCloseOnContextDone, a cell that loops
+	// forever inside a call traps and returns at the deadline instead of
+	// pinning a core and the cell mutex; override via `call_timeout_ms`.
+	DefaultCallTimeout = 30 * time.Second
+
+	// reentrantCallGrace bounds how long Call waits for the cell mutex before
+	// declaring a (likely re-entrant / loopback) busy condition. A legitimate
+	// concurrent step releases the mutex in microseconds; a re-entrant
+	// A->B->A loopback never will, so we fail fast instead of deadlocking.
+	reentrantCallGrace = 250 * time.Millisecond
+)
+
+// Limits are the per-cell resource bounds applied at instantiation and on
+// every WASM call. A nil *Limits (or a zero field) falls back to the
+// Default* values above.
+type Limits struct {
+	// MaxMemoryPages caps linear memory in 64 KiB pages. 0 => default.
+	MaxMemoryPages uint32
+	// CallTimeout bounds a single WASM entry point. 0 => default.
+	CallTimeout time.Duration
+}
+
+func (l *Limits) maxMemoryPages() uint32 {
+	if l != nil && l.MaxMemoryPages != 0 {
+		return l.MaxMemoryPages
+	}
+	return DefaultMaxMemoryPages
+}
+
+func (l *Limits) callTimeout() time.Duration {
+	if l != nil && l.CallTimeout != 0 {
+		return l.CallTimeout
+	}
+	return DefaultCallTimeout
+}
 
 // Cell is a single loaded WASM module with the three required Pulp exports.
 type Cell struct {
@@ -36,7 +85,54 @@ type Cell struct {
 	// conditions and re-entrant trap corruption.
 	mu sync.Mutex
 
+	// callTimeout bounds a single WASM entry point (Init/Step/Call/
+	// Shutdown). With WithCloseOnContextDone set on the runtime, exceeding
+	// it traps the call instead of pinning a core + mu indefinitely.
+	callTimeout time.Duration
+
 	log *slog.Logger
+}
+
+// callContext derives a deadline-bounded context for a single WASM call.
+// The returned cancel must be called once the call returns. Because the
+// runtime is built WithCloseOnContextDone, a runaway call traps when this
+// deadline elapses rather than blocking forever.
+func (p *Cell) callContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if p.callTimeout <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, p.callTimeout)
+}
+
+// lockForCall acquires p.mu for a sibling Call without blocking forever.
+// It returns true once the mutex is held. It returns false if the mutex is
+// still held after reentrantCallGrace (or ctx is cancelled) — the signature
+// of a re-entrant / loopback call that would otherwise deadlock the host.
+//
+// We poll TryLock rather than block on Lock so a true A->B->A loopback
+// (same goroutine, mutex never released) fails fast instead of hanging,
+// while brief legitimate contention from another cell's concurrent step
+// (released in microseconds) still succeeds.
+func (p *Cell) lockForCall(ctx context.Context) bool {
+	if p.mu.TryLock() {
+		return true
+	}
+	deadline := time.NewTimer(reentrantCallGrace)
+	defer deadline.Stop()
+	tick := time.NewTicker(200 * time.Microsecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-deadline.C:
+			return false
+		case <-tick.C:
+			if p.mu.TryLock() {
+				return true
+			}
+		}
+	}
 }
 
 // Load reads the cell's WASM file, binds the host capabilities declared in
@@ -46,13 +142,22 @@ type Cell struct {
 //
 // Passing a nil registry is valid — the cell gets only the WASI imports
 // wazero provides by default and no Pulp host imports. Useful for tests.
-func Load(ctx context.Context, spec *manifest.CellSpec, registry *Registry, logger *slog.Logger) (*Cell, error) {
+//
+// limits bounds the cell's memory and per-call time; a nil *Limits applies
+// the Default* values. The runtime is built WithCloseOnContextDone so the
+// per-call deadline can actually interrupt a runaway cell, and
+// WithMemoryLimitPages so a cell cannot grow memory until it OOM-kills the
+// host and every co-located cell.
+func Load(ctx context.Context, spec *manifest.CellSpec, registry *Registry, limits *Limits, logger *slog.Logger) (*Cell, error) {
 	wasmBytes, err := os.ReadFile(spec.WASMPath)
 	if err != nil {
 		return nil, fmt.Errorf("read wasm: %w", err)
 	}
 
-	r := wazero.NewRuntime(ctx)
+	rtCfg := wazero.NewRuntimeConfig().
+		WithCloseOnContextDone(true).
+		WithMemoryLimitPages(limits.maxMemoryPages())
+	r := wazero.NewRuntimeWithConfig(ctx, rtCfg)
 	wasi_snapshot_preview1.MustInstantiate(ctx, r)
 
 	// Compile first so we can inspect exports and decide which start function
@@ -64,9 +169,10 @@ func Load(ctx context.Context, spec *manifest.CellSpec, registry *Registry, logg
 	}
 
 	p := &Cell{
-		name:    spec.Name,
-		runtime: r,
-		log:     logger.With("cell", spec.Name),
+		name:        spec.Name,
+		runtime:     r,
+		callTimeout: limits.callTimeout(),
+		log:         logger.With("cell", spec.Name),
 	}
 
 	// Bind host capabilities BEFORE instantiating the cell module so the
@@ -147,13 +253,16 @@ func (p *Cell) Init(ctx context.Context, config []byte) error {
 		return errors.New("cell is closed or not initialized")
 	}
 
-	ptr, err := p.writeBytes(ctx, config)
+	callCtx, cancel := p.callContext(ctx)
+	defer cancel()
+
+	ptr, err := p.writeBytes(callCtx, config)
 	if err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
-	defer p.free(ctx, ptr, uint32(len(config)))
+	defer p.free(callCtx, ptr, uint32(len(config)))
 
-	results, err := p.initFn.Call(ctx, uint64(ptr), uint64(len(config)))
+	results, err := p.initFn.Call(callCtx, uint64(ptr), uint64(len(config)))
 	if err != nil {
 		return fmt.Errorf("pulp_init trap: %w", err)
 	}
@@ -174,14 +283,17 @@ func (p *Cell) Step(ctx context.Context, env abi.StepEnvelope) (outputHandle int
 		return 0, errors.New("cell is closed")
 	}
 
+	callCtx, cancel := p.callContext(ctx)
+	defer cancel()
+
 	input := env.Encode()
-	ptr, err := p.writeBytes(ctx, input)
+	ptr, err := p.writeBytes(callCtx, input)
 	if err != nil {
 		return 0, fmt.Errorf("write envelope: %w", err)
 	}
-	defer p.free(ctx, ptr, uint32(len(input)))
+	defer p.free(callCtx, ptr, uint32(len(input)))
 
-	results, err := p.stepFn.Call(ctx, uint64(ptr), uint64(len(input)))
+	results, err := p.stepFn.Call(callCtx, uint64(ptr), uint64(len(input)))
 	if err != nil {
 		return 0, fmt.Errorf("pulp_step trap: %w", err)
 	}
@@ -189,9 +301,16 @@ func (p *Cell) Step(ctx context.Context, env abi.StepEnvelope) (outputHandle int
 }
 
 // Call invokes the cell's pulp_on_call export. Used by the sibling
-// call path: when cell B calls pulp_call on cell A, the host
-// routes it here, serialized against A's own step loop by the module
-// mutex.
+// call path: when cell B calls pulp_call on cell A, the host routes it
+// here, serialized against A's own step loop by the module mutex.
+//
+// Re-entrant cycles are rejected, not deadlocked: if A's step calls into
+// B and B calls back into A (A->B->A), or a cell targets itself, the
+// re-entry lands here while the same goroutine already holds A's mutex. A
+// plain Lock() would hang the host forever; instead Call acquires via
+// lockForCall and returns ErrReentrantCall when the mutex stays held past
+// reentrantCallGrace. Synchronous sibling-call cycles are therefore
+// forbidden at runtime and surface as a clear error.
 //
 // The cell receives (funcName, args) and writes a msgpack-encoded
 // response via pulp_alloc. Returns the raw response bytes (copied out
@@ -205,38 +324,57 @@ func (p *Cell) HasProvider() bool {
 	return p.onCallFn != nil
 }
 
+// ErrReentrantCall is returned by Call when the target cell is already
+// executing WASM and does not release its mutex within reentrantCallGrace.
+// This is the A->B->A (or self-targeted) sibling loopback: the calling
+// goroutine is already inside this cell's step/call holding p.mu, so a
+// blocking Lock would deadlock permanently. We fail fast with this error so
+// the cell author sees a clear "cycle" signal instead of a hung host.
+var ErrReentrantCall = errors.New("re-entrant / loopback sibling call rejected (cell already executing)")
+
 func (p *Cell) Call(ctx context.Context, funcName string, args []byte) ([]byte, error) {
-	p.mu.Lock()
+	// Do NOT block indefinitely on p.mu: a sibling call cycle (A->B->A) or
+	// a self-targeted call re-enters this method on the same goroutine that
+	// already holds p.mu, which a plain Lock() would deadlock on forever.
+	// TryLock with a short grace window distinguishes brief legitimate
+	// contention (another cell's step, released in microseconds) from a
+	// true loopback (never released) and fails fast on the latter.
+	if !p.lockForCall(ctx) {
+		return nil, ErrReentrantCall
+	}
 	defer p.mu.Unlock()
 
 	if p.onCallFn == nil {
 		return nil, fmt.Errorf("cell %q does not export pulp_on_call (or is closed)", p.name)
 	}
 
+	callCtx, cancel := p.callContext(ctx)
+	defer cancel()
+
 	nameBytes := []byte(funcName)
-	namePtr, err := p.writeBytes(ctx, nameBytes)
+	namePtr, err := p.writeBytes(callCtx, nameBytes)
 	if err != nil {
 		return nil, fmt.Errorf("write name: %w", err)
 	}
-	defer p.free(ctx, namePtr, uint32(len(nameBytes)))
+	defer p.free(callCtx, namePtr, uint32(len(nameBytes)))
 
 	var argsPtr uint32
 	if len(args) > 0 {
-		argsPtr, err = p.writeBytes(ctx, args)
+		argsPtr, err = p.writeBytes(callCtx, args)
 		if err != nil {
 			return nil, fmt.Errorf("write args: %w", err)
 		}
-		defer p.free(ctx, argsPtr, uint32(len(args)))
+		defer p.free(callCtx, argsPtr, uint32(len(args)))
 	}
 
 	// Allocate 8 bytes for (respPtr, respLen) out-params.
-	outPtr, err := p.alloc(ctx, 8)
+	outPtr, err := p.alloc(callCtx, 8)
 	if err != nil {
 		return nil, fmt.Errorf("alloc out-params: %w", err)
 	}
-	defer p.free(ctx, outPtr, 8)
+	defer p.free(callCtx, outPtr, 8)
 
-	results, err := p.onCallFn.Call(ctx,
+	results, err := p.onCallFn.Call(callCtx,
 		uint64(namePtr), uint64(len(nameBytes)),
 		uint64(argsPtr), uint64(len(args)),
 		uint64(outPtr), uint64(outPtr+4),
@@ -283,7 +421,11 @@ func (p *Cell) Shutdown(ctx context.Context) error {
 		// Close already tore the module down; nothing left to shut down.
 		return nil
 	}
-	results, err := p.shutdownFn.Call(ctx)
+
+	callCtx, cancel := p.callContext(ctx)
+	defer cancel()
+
+	results, err := p.shutdownFn.Call(callCtx)
 	if err != nil {
 		return fmt.Errorf("pulp_shutdown trap: %w", err)
 	}

@@ -252,7 +252,11 @@ func Main() {
 				return
 			}
 
-			cell, err := host.Load(rt.ctx, spec, registry, logger)
+			limits := &host.Limits{
+				MaxMemoryPages: spec.MaxMemoryPages,
+				CallTimeout:    time.Duration(spec.CallTimeoutMS) * time.Millisecond,
+			}
+			cell, err := host.Load(rt.ctx, spec, registry, limits, logger)
 			if err != nil {
 				logger.Error("load failed", "cell", spec.Name, "err", err)
 				rt.failed = true

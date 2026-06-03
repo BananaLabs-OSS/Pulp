@@ -71,6 +71,19 @@ type CellSpec struct {
 	DedicatedThread bool
 	Snapshotable    bool
 
+	// MaxMemoryPages caps the cell's WASM linear memory, in 64 KiB pages.
+	// 0 means "use the host default" (see host.DefaultMaxMemoryPages). The
+	// host enforces this at instantiation so a runaway cell cannot grow
+	// memory until it OOM-kills the host and every co-located cell.
+	MaxMemoryPages uint32
+
+	// CallTimeoutMS bounds a single pulp_init / pulp_step / pulp_on_call
+	// invocation, in milliseconds. 0 means "use the host default" (see
+	// host.DefaultCallTimeout). When the deadline elapses the wasm call is
+	// interrupted (WithCloseOnContextDone) and returns a trap instead of
+	// pinning a core and the cell mutex forever.
+	CallTimeoutMS uint32
+
 	// Restart is the post-exit policy: "never" (default), "on_crash", or
 	// "always". Parsed + validated now; the supervisor that honors it ships
 	// in a later Pulp version.
@@ -112,6 +125,9 @@ type raw struct {
 	DedicatedThread bool   `toml:"dedicated_thread"`
 	Snapshotable    bool   `toml:"snapshotable"`
 	Restart         string `toml:"restart"`
+
+	MaxMemoryPages uint32 `toml:"max_memory_pages"`
+	CallTimeoutMS  uint32 `toml:"call_timeout_ms"`
 
 	// Reserved for federation (v0.4+). Parsed so v0.1/v0.2 manifests that
 	// declare them work unchanged when federation lands.
@@ -210,6 +226,8 @@ func normalize(r *raw, manifestPath string) (*CellSpec, error) {
 		SharedMemoryGroups: dedupe(r.SharedMemoryGroups),
 		DedicatedThread:    r.DedicatedThread,
 		Snapshotable:       r.Snapshotable,
+		MaxMemoryPages:     r.MaxMemoryPages,
+		CallTimeoutMS:      r.CallTimeoutMS,
 		Restart:            restart,
 		Config:             r.Config,
 		ManifestPath:       manifestPath,
