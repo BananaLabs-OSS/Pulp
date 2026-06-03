@@ -143,11 +143,20 @@ func (p *Cell) lockForCall(ctx context.Context) bool {
 // Passing a nil registry is valid — the cell gets only the WASI imports
 // wazero provides by default and no Pulp host imports. Useful for tests.
 //
-// limits bounds the cell's memory and per-call time; a nil *Limits applies
-// the Default* values. The runtime is built WithCloseOnContextDone so the
-// per-call deadline can actually interrupt a runaway cell, and
-// WithMemoryLimitPages so a cell cannot grow memory until it OOM-kills the
-// host and every co-located cell.
+// limits bounds the cell's memory; a nil *Limits applies the Default* values.
+// WithMemoryLimitPages caps the cell so it cannot grow memory until it
+// OOM-kills the host and every co-located cell.
+//
+// NOTE: we deliberately do NOT set wazero's WithCloseOnContextDone here. That
+// flag closes the whole MODULE when a call's context is Done — fine for a
+// one-shot run, but fatal for a long-lived REACTOR cell that we call
+// repeatedly (Init→Step→…): the first per-call context's deferred cancel()
+// tears the module down, so the next pulp_alloc traps with "module closed
+// with exit_code(0)" — total cell death at first use. (Verified: enabling it
+// regressed real-cell instantiation; the cell harness traps, plain instantiate
+// works.) Bounding a runaway *wasm loop* therefore needs a supervisor that
+// kills+restarts the cell out-of-band, not a per-call context close — deferred.
+// The per-call callContext below still propagates host-side cancellation.
 func Load(ctx context.Context, spec *manifest.CellSpec, registry *Registry, limits *Limits, logger *slog.Logger) (*Cell, error) {
 	wasmBytes, err := os.ReadFile(spec.WASMPath)
 	if err != nil {
@@ -155,7 +164,6 @@ func Load(ctx context.Context, spec *manifest.CellSpec, registry *Registry, limi
 	}
 
 	rtCfg := wazero.NewRuntimeConfig().
-		WithCloseOnContextDone(true).
 		WithMemoryLimitPages(limits.maxMemoryPages())
 	r := wazero.NewRuntimeWithConfig(ctx, rtCfg)
 	wasi_snapshot_preview1.MustInstantiate(ctx, r)
