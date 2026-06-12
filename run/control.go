@@ -29,6 +29,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -72,6 +73,7 @@ type controlServer struct {
 	wg     sync.WaitGroup
 	mu     sync.Mutex
 	closed bool
+	conns  map[net.Conn]struct{} // active connections; closed on stop()
 }
 
 // startControlServer binds the control socket and spawns its accept
@@ -99,7 +101,7 @@ func startControlServer(ops controlOps, logger *slog.Logger) *controlServer {
 	// 0600 perms — only the owning user. Best-effort on Windows.
 	_ = os.Chmod(addr, 0o600)
 
-	s := &controlServer{ops: ops, logger: logger, ln: ln, addr: addr}
+	s := &controlServer{ops: ops, logger: logger, ln: ln, addr: addr, conns: map[net.Conn]struct{}{}}
 	s.wg.Add(1)
 	go s.acceptLoop()
 	logger.Info("control socket listening", "addr", addr)
@@ -128,10 +130,21 @@ func (s *controlServer) stop() {
 		return
 	}
 	s.closed = true
+	// Snapshot and clear active connections before releasing the lock.
+	// Closing them unblocks any handle() goroutine blocked on a read,
+	// so wg.Wait() below does not hang waiting for an idle client.
+	victims := make([]net.Conn, 0, len(s.conns))
+	for c := range s.conns {
+		victims = append(victims, c)
+	}
+	s.conns = map[net.Conn]struct{}{}
 	s.mu.Unlock()
 
 	_ = s.ln.Close()
 	_ = os.Remove(s.addr)
+	for _, c := range victims {
+		_ = c.Close()
+	}
 	s.wg.Wait()
 }
 
@@ -161,6 +174,21 @@ func (s *controlServer) acceptLoop() {
 func (s *controlServer) handle(conn net.Conn) {
 	defer s.wg.Done()
 	defer conn.Close()
+
+	// Track the connection so stop() can close it and unblock this goroutine.
+	s.mu.Lock()
+	if s.conns != nil {
+		s.conns[conn] = struct{}{}
+	}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.conns, conn)
+		s.mu.Unlock()
+	}()
+
+	// Bound the read so an idle client cannot wedge SIGTERM.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
 	req, err := readFrame(conn)
 	if err != nil {
