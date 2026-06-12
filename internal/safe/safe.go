@@ -16,6 +16,7 @@ import (
 	"runtime/debug"
 
 	"github.com/BananaLabs-OSS/Pulp/ext"
+	"github.com/tetratelabs/wazero/api"
 )
 
 // ErrExtensionPanic is returned wrapped when a recovered panic is
@@ -113,32 +114,10 @@ func CallFinalize(cap ext.Capability, id uint64, logger *slog.Logger) {
 	cap.Finalize(id)
 }
 
-// HostFunc wraps a host-function body in panic recovery. Returns a
-// function with the same signature. Use when registering host imports
-// with wazero:
-//
-//	builder.NewFunctionBuilder().WithFunc(
-//	    safe.HostFunc("my_extension", "my_func", myFuncBody, logger),
-//	).Export("my_func")
-//
-// The wrapped function returns the same values the original would, or
-// zero values on panic. Callers that need a specific error-code convention
-// should branch on a sentinel rather than relying on zero values.
-//
-// The name arg is the extension identity for logging; fname is the host
-// function name (e.g., "udp_listen"). Both appear in the log record.
-func HostFunc[F any](name, fname string, fn F, logger *slog.Logger) F {
-	// Generic pass-through for arbitrary function signatures: we can't
-	// wrap defer/recover around an unknown signature generically without
-	// reflection. Host functions already have predictable shapes; see
-	// HostFunc0..HostFunc4 for common ones.
-	return fn
-}
-
 // The wazero host-function signatures in the current extension set are
-// variations on (ctx, mod, args...). Provide typed wrappers for the most
-// common shapes; extensions that need a more exotic signature can call
-// RecoverHost directly from inside their closure.
+// variations on (ctx, mod, args...) uint32. Typed wrappers below cover
+// the two most common shapes. Extensions with exotic signatures call
+// RecoverHost directly inside their closure.
 
 // RecoverHost is the raw building block. Call from inside a host function
 // body:
@@ -159,5 +138,43 @@ func RecoverHost(name, fname string, logger *slog.Logger) {
 			"panic", r,
 			"stack", string(debug.Stack()),
 		)
+	}
+}
+
+// HostFunc2 wraps a (ctx, mod, uint32, uint32) → uint32 host function in
+// panic recovery. Returns 4 (host operation failed) on panic.
+func HostFunc2(name, fname string, fn func(context.Context, api.Module, uint32, uint32) uint32, logger *slog.Logger) func(context.Context, api.Module, uint32, uint32) uint32 {
+	return func(ctx context.Context, mod api.Module, a, b uint32) (ret uint32) {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("host function panicked",
+					"extension", name,
+					"func", fname,
+					"panic", r,
+					"stack", string(debug.Stack()),
+				)
+				ret = 4
+			}
+		}()
+		return fn(ctx, mod, a, b)
+	}
+}
+
+// HostFunc4 wraps a (ctx, mod, uint32×4) → uint32 host function in
+// panic recovery. Returns 4 (host operation failed) on panic.
+func HostFunc4(name, fname string, fn func(context.Context, api.Module, uint32, uint32, uint32, uint32) uint32, logger *slog.Logger) func(context.Context, api.Module, uint32, uint32, uint32, uint32) uint32 {
+	return func(ctx context.Context, mod api.Module, a, b, c, d uint32) (ret uint32) {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("host function panicked",
+					"extension", name,
+					"func", fname,
+					"panic", r,
+					"stack", string(debug.Stack()),
+				)
+				ret = 4
+			}
+		}()
+		return fn(ctx, mod, a, b, c, d)
 	}
 }
