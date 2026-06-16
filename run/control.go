@@ -14,6 +14,7 @@
 //	{"op":"status"}                  →  {"cells":[{"name","state","steps"},...]}
 //	{"op":"shutdown","cell":"foo"} →  {"ok":true}  or  {"error":"..."}
 //	{"op":"shutdown_all"}            →  {"ok":true}
+//	{"op":"reload","cell":"foo"}   →  {"ok":true}  or  {"error":"..."}  (live hot-swap)
 //
 // The server is best-effort — a missing socket path, binding failure,
 // or a client crashing mid-request never affects the main host loop.
@@ -63,6 +64,7 @@ type controlOps interface {
 	status() []ctlStatus
 	shutdownCell(name string) error
 	shutdownAll() error
+	reloadCell(name string) error
 }
 
 type controlServer struct {
@@ -217,6 +219,16 @@ func (s *controlServer) handle(conn net.Conn) {
 		writeResp(conn, ctlResponse{OK: true})
 	case "shutdown_all":
 		if err := s.ops.shutdownAll(); err != nil {
+			writeResp(conn, ctlResponse{Error: err.Error()})
+			return
+		}
+		writeResp(conn, ctlResponse{OK: true})
+	case "reload":
+		if r.Cell == "" {
+			writeResp(conn, ctlResponse{Error: "cell name required"})
+			return
+		}
+		if err := s.ops.reloadCell(r.Cell); err != nil {
 			writeResp(conn, ctlResponse{Error: err.Error()})
 			return
 		}

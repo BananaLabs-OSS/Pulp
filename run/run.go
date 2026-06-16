@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/BananaLabs-OSS/Pulp/abi"
@@ -53,12 +54,18 @@ type cellRuntime struct {
 	cancel     context.CancelFunc
 	declared   map[string]bool // capabilities this cell declared
 	readyCh    chan struct{}   // closed after Init returns 0
-	callNumber uint64
+	callNumber atomic.Uint64   // atomic: written by the step loop, read by ctl status
+
+	// stepDone is closed when this cell's step goroutine exits. Recreated
+	// each time a step loop is launched (initial start + every reload) so a
+	// reload can join the old loop before starting the new one.
+	stepDone chan struct{}
 
 	// failed is set when the cell's Setup, Load, or Init returned an
 	// error. Failed cells do not run their step loop; dependents of a
-	// failed cell inherit the failed state.
-	failed bool
+	// failed cell inherit the failed state. Atomic: written during startup,
+	// read by ctl status concurrently.
+	failed atomic.Bool
 }
 
 // routedEvent wraps an ext.StepEvent with a back-reference to the
@@ -70,6 +77,14 @@ type routedEvent struct {
 }
 
 func Main() {
+	// `<exe> ctl <op> [cell]` is the control-socket CLIENT, not the host.
+	// Dispatched before flag parsing so a cell can run `<exe> ctl reload <name>`
+	// (via spawn.process) to hot-swap itself. Works for any deployment binary
+	// that calls run.Main (pulp, projx-host, …).
+	if len(os.Args) > 1 && os.Args[1] == "ctl" {
+		os.Exit(RunCtl(os.Args[2:]))
+	}
+
 	var manifestPaths sliceFlag
 	var storageRoot string
 	var httpPort string
@@ -188,6 +203,7 @@ func Main() {
 			cancel:   pcancel,
 			declared: declared,
 			readyCh:  make(chan struct{}),
+			stepDone: make(chan struct{}),
 		}
 	}
 
@@ -230,15 +246,15 @@ func Main() {
 				depRT := runtimes[dep]
 				select {
 				case <-depRT.readyCh:
-					if depRT.failed {
+					if depRT.failed.Load() {
 						logger.Error("cell init aborted — dependency failed",
 							"cell", spec.Name, "failed_dep", dep)
-						rt.failed = true
+						rt.failed.Store(true)
 						close(rt.readyCh)
 						return
 					}
 				case <-rt.ctx.Done():
-					rt.failed = true
+					rt.failed.Store(true)
 					close(rt.readyCh)
 					return
 				}
@@ -247,7 +263,7 @@ func Main() {
 			configBytes, err := manifest.EncodeConfig(spec.Config)
 			if err != nil {
 				logger.Error("config encode failed", "cell", spec.Name, "err", err)
-				rt.failed = true
+				rt.failed.Store(true)
 				close(rt.readyCh)
 				return
 			}
@@ -259,7 +275,7 @@ func Main() {
 			cell, err := host.Load(rt.ctx, spec, registry, limits, logger)
 			if err != nil {
 				logger.Error("load failed", "cell", spec.Name, "err", err)
-				rt.failed = true
+				rt.failed.Store(true)
 				close(rt.readyCh)
 				return
 			}
@@ -267,7 +283,7 @@ func Main() {
 
 			if err := cell.Init(rt.ctx, configBytes); err != nil {
 				logger.Error("init failed", "cell", spec.Name, "err", err)
-				rt.failed = true
+				rt.failed.Store(true)
 				close(rt.readyCh)
 				return
 			}
@@ -287,7 +303,7 @@ func Main() {
 	// If EVERY cell failed, there's nothing to run — exit.
 	anyReady := false
 	for _, rt := range runtimes {
-		if !rt.failed {
+		if !rt.failed.Load() {
 			anyReady = true
 			break
 		}
@@ -314,23 +330,34 @@ func Main() {
 		go runPollster(c, stopPoll, &pollWG, runtimes, capToCells, logger)
 	}
 
+	// runtimeOps owns step-loop launching so the control socket's reload op
+	// can relaunch a cell through the same path. Built before the step loops
+	// start; reload needs the registry, the capability lookup, and the parent
+	// context to re-Load + re-Init a cell from disk while the host stays up.
+	ops := &runtimeOps{
+		runtimes:      runtimes,
+		allCaps:       allCaps,
+		declaredUnion: declaredUnion,
+		logger:        logger,
+		registry:      registry,
+		capByName:     capByName,
+		parentCtx:     ctx,
+	}
+
 	// Step goroutines — one per cell that initialized successfully.
-	var stepWG sync.WaitGroup
 	for _, rt := range runtimes {
-		if rt.failed {
+		if rt.failed.Load() {
 			continue
 		}
-		stepWG.Add(1)
-		go runStepLoop(rt, capByName, &stepWG, logger)
+		ops.launchStep(rt)
 	}
 
 	// ------------------------------------------------------------------
-	// Start the control socket — enables graceful per-cell shutdown
-	// and remote status. Optional; if the socket fails to bind the host
-	// keeps running without it.
+	// Start the control socket — enables graceful per-cell shutdown,
+	// live reload, and remote status. Optional; if the socket fails to
+	// bind the host keeps running without it.
 	// ------------------------------------------------------------------
 
-	ops := &runtimeOps{runtimes: runtimes, allCaps: allCaps, declaredUnion: declaredUnion, logger: logger}
 	ctlServer := startControlServer(ops, logger)
 	defer ctlServer.stop()
 
@@ -361,7 +388,7 @@ func Main() {
 	for _, rt := range runtimes {
 		rt.cancel()
 	}
-	stepWG.Wait()
+	ops.stepWG.Wait()
 
 	// Drain any events still queued in per-cell channels and Finalize
 	// them so extensions don't leak per-event slot state. This mirrors
@@ -450,7 +477,7 @@ func runPollster(
 
 		if ev.CellID != "" {
 			rt, found := runtimes[ev.CellID]
-			if !found || rt.failed {
+			if !found || rt.failed.Load() {
 				// Cell is unknown or failed-to-start; drop the event
 				// and Finalize so the extension doesn't leak the slot.
 				safe.CallFinalize(c, ev.ID, logger)
@@ -469,7 +496,7 @@ func runPollster(
 		delivered := false
 		for _, name := range broadcastTargets {
 			rt := runtimes[name]
-			if rt == nil || rt.failed {
+			if rt == nil || rt.failed.Load() {
 				continue
 			}
 			deliver(rt, routed, c, logger)
@@ -512,9 +539,7 @@ func deliver(rt *cellRuntime, r routedEvent, c ext.Capability, logger *slog.Logg
 // no longer burns a measurable slice of one core each. As soon as
 // real work arrives the timer is reset, restoring the original
 // snappy pickup latency.
-func runStepLoop(rt *cellRuntime, capByName map[string]ext.Capability, wg *sync.WaitGroup, logger *slog.Logger) {
-	defer wg.Done()
-
+func stepLoop(rt *cellRuntime, capByName map[string]ext.Capability, logger *slog.Logger) {
 	const (
 		idleMin     = 200 * time.Microsecond
 		idleMax     = 10 * time.Millisecond
@@ -546,47 +571,49 @@ func runStepLoop(rt *cellRuntime, capByName map[string]ext.Capability, wg *sync.
 				}
 				continue
 			}
+			n := rt.callNumber.Load()
 			env := abi.StepEnvelope{
-				CallNumber: rt.callNumber,
+				CallNumber: n,
 				WallTime:   uint64(time.Now().UnixNano()),
 				Payload:    stepEv,
 			}
 			if _, err := rt.cell.Step(rt.ctx, env); err != nil {
 				logger.Error("step failed",
 					"cell", rt.spec.Name,
-					"call_number", rt.callNumber,
+					"call_number", n,
 					"err", err)
 			}
 			for _, c := range re.caps {
 				safe.CallFinalize(c, re.ev.ID, logger)
 			}
-			if rt.callNumber%10000 == 0 {
+			if n%10000 == 0 {
 				logger.Info("step heartbeat",
-					"cell", rt.spec.Name, "call_number", rt.callNumber)
+					"cell", rt.spec.Name, "call_number", n)
 			}
-			rt.callNumber++
+			rt.callNumber.Add(1)
 		default:
 			// No event pending — submit an empty step envelope so the
 			// cell still advances wall-time and can run its own idle
 			// logic (ticks, timeouts). Matches pre-multi-cell
 			// behavior where the step loop always called Step, even
 			// with nil payload.
+			n := rt.callNumber.Load()
 			env := abi.StepEnvelope{
-				CallNumber: rt.callNumber,
+				CallNumber: n,
 				WallTime:   uint64(time.Now().UnixNano()),
 				Payload:    nil,
 			}
 			if _, err := rt.cell.Step(rt.ctx, env); err != nil {
 				logger.Error("step failed (idle)",
 					"cell", rt.spec.Name,
-					"call_number", rt.callNumber,
+					"call_number", n,
 					"err", err)
 			}
-			if rt.callNumber%10000 == 0 {
+			if n%10000 == 0 {
 				logger.Info("step heartbeat",
-					"cell", rt.spec.Name, "call_number", rt.callNumber)
+					"cell", rt.spec.Name, "call_number", n)
 			}
-			rt.callNumber++
+			rt.callNumber.Add(1)
 
 			// Idle back-off — wake early on a real event OR on cancel.
 			// After idleRampAge of pure-idle we double idleSleep each

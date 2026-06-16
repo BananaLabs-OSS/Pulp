@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/BananaLabs-OSS/Pulp/ext"
+	"github.com/BananaLabs-OSS/Pulp/internal/host"
+	"github.com/BananaLabs-OSS/Pulp/internal/manifest"
 	"github.com/BananaLabs-OSS/Pulp/internal/safe"
 )
 
@@ -21,6 +23,14 @@ type runtimeOps struct {
 	allCaps       []ext.Capability
 	declaredUnion map[string]bool
 	logger        *slog.Logger
+
+	// Reload needs these to re-Load + re-Init a cell from disk and relaunch
+	// its step loop while the host keeps running.
+	registry  *host.Registry
+	capByName map[string]ext.Capability
+	parentCtx context.Context
+	stepWG    sync.WaitGroup // joins every step goroutine (initial + reloaded)
+	reloadMu  sync.Mutex     // serializes reloads so two never race one cell
 
 	mu      sync.Mutex
 	stopped map[string]bool // cell names that have already been shut down
@@ -39,7 +49,7 @@ func (o *runtimeOps) status() []ctlStatus {
 	for name, rt := range o.runtimes {
 		state := "ready"
 		switch {
-		case rt.failed:
+		case rt.failed.Load():
 			state = "failed"
 		case o.stopped[name]:
 			state = "stopped"
@@ -47,7 +57,7 @@ func (o *runtimeOps) status() []ctlStatus {
 		out = append(out, ctlStatus{
 			Name:  name,
 			State: state,
-			Steps: rt.callNumber,
+			Steps: rt.callNumber.Load(),
 		})
 	}
 	return out
@@ -171,7 +181,7 @@ func (o *runtimeOps) allShutdown() <-chan struct{} {
 			total := 0
 			stoppedCount := 0
 			for name, rt := range o.runtimes {
-				if rt.failed {
+				if rt.failed.Load() {
 					continue
 				}
 				total++
@@ -197,6 +207,123 @@ func (o *runtimeOps) isStopped(name string) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.stopped[name]
+}
+
+// launchStep starts a fresh step goroutine for rt. It allocates a new
+// stepDone channel (closed when the loop exits) so a later reload can join
+// the old loop before starting a new one, and registers the goroutine with
+// stepWG so run.Main's shutdown waits for it. Used for both the initial
+// start and every reload.
+func (o *runtimeOps) launchStep(rt *cellRuntime) {
+	rt.stepDone = make(chan struct{})
+	o.stepWG.Add(1)
+	go func() {
+		defer o.stepWG.Done()
+		defer close(rt.stepDone)
+		stepLoop(rt, o.capByName, o.logger)
+	}()
+}
+
+// reloadCell hot-swaps a cell IN PLACE: it stops the running cell, drops its
+// per-cell host state, then re-reads the WASM from disk (picking up a fresh
+// build), re-Inits, and relaunches its step loop — all while the host process
+// and every other cell keep running. This is the live-reload primitive: build
+// a new cell.wasm, then `pulp ctl reload <cell>` to swap it in with no
+// downtime and no restart.
+//
+// Reloads are serialized by reloadMu so two concurrent control connections
+// can't tear the same cell down twice.
+func (o *runtimeOps) reloadCell(name string) error {
+	o.reloadMu.Lock()
+	defer o.reloadMu.Unlock()
+
+	o.mu.Lock()
+	rt, ok := o.runtimes[name]
+	if !ok {
+		o.mu.Unlock()
+		return fmt.Errorf("unknown cell: %q", name)
+	}
+	if o.stopped[name] {
+		o.mu.Unlock()
+		return fmt.Errorf("cell %q is stopped; cannot reload", name)
+	}
+	o.mu.Unlock()
+
+	o.logger.Info("control: reloading cell", "cell", name)
+
+	// 1. Stop the running cell: cancel its context and JOIN its step loop so
+	// no goroutine is driving the old module when we tear it down.
+	rt.cancel()
+	if rt.stepDone != nil {
+		<-rt.stepDone
+	}
+
+	// 2. Shutdown + Close the old module (fresh ctx — rt.ctx is cancelled).
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if rt.cell != nil {
+		if err := rt.cell.Shutdown(shutdownCtx); err != nil {
+			o.logger.Warn("control: reload shutdown failed", "cell", name, "err", err)
+		}
+		rt.cell.Close(context.Background())
+		rt.cell = nil
+	}
+
+	// 3. Drop per-cell host state (routes, sockets, DB handles) so the fresh
+	// Init re-registers cleanly instead of colliding with the old cell's.
+	for _, c := range o.allCaps {
+		if !rt.declared[c.Name] || c.TeardownCell == nil {
+			continue
+		}
+		if err := c.TeardownCell(shutdownCtx, name); err != nil {
+			o.logger.Warn("control: reload teardown_cell failed",
+				"cell", name, "capability", c.Name, "err", err)
+		}
+	}
+
+	// 4. Drain any events still queued for the old cell.
+	for drained := true; drained; {
+		drained = false
+		select {
+		case re := <-rt.events:
+			for _, c := range re.caps {
+				safe.CallFinalize(c, re.ev.ID, o.logger)
+			}
+			drained = true
+		default:
+		}
+	}
+
+	// 5. Fresh context + reload the WASM from disk.
+	rt.ctx, rt.cancel = context.WithCancel(o.parentCtx)
+	spec := rt.spec
+	configBytes, err := manifest.EncodeConfig(spec.Config)
+	if err != nil {
+		rt.failed.Store(true)
+		return fmt.Errorf("reload %q: config encode: %w", name, err)
+	}
+	limits := &host.Limits{
+		MaxMemoryPages: spec.MaxMemoryPages,
+		CallTimeout:    time.Duration(spec.CallTimeoutMS) * time.Millisecond,
+	}
+	cell, err := host.Load(rt.ctx, spec, o.registry, limits, o.logger)
+	if err != nil {
+		rt.failed.Store(true)
+		return fmt.Errorf("reload %q: load: %w", name, err)
+	}
+	if err := cell.Init(rt.ctx, configBytes); err != nil {
+		cell.Close(context.Background())
+		rt.failed.Store(true)
+		return fmt.Errorf("reload %q: init: %w", name, err)
+	}
+	rt.cell = cell
+	rt.failed.Store(false)
+	rt.callNumber.Store(0)
+
+	// 6. Relaunch the step loop on the new module.
+	o.launchStep(rt)
+	o.logger.Info("control: cell reloaded", "cell", name, "version", spec.Version)
+	return nil
 }
 
 // stopWatchdog cancels the allShutdown poller goroutine. Idempotent.

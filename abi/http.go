@@ -101,6 +101,35 @@ func DecodeHTTPFetchStreamHeader(data []byte) (HTTPFetchStreamHeader, error) {
 	return h, err
 }
 
+// HTTPRespondStream is sent by the cell to http_respond_stream to answer an
+// inbound request by SPLICING an open outbound fetch stream straight to the
+// client — without buffering the body in the cell. ID is the inbound request
+// id (matches HTTPRequest.ID); StreamID is an open http_fetch_begin handle
+// whose body the host copies (with flush) to the client. The host TAKES the
+// stream (it is removed from the fetch-stream table — the cell must not also
+// read/close it). Status/Headers/Cookies are written to the client before the
+// body copy begins. Used for SSE / chunked / long-lived upstream responses,
+// which the one-shot http_respond + 30s inbound timeout cannot carry.
+type HTTPRespondStream struct {
+	ID       uint64            `msgpack:"id"`
+	StreamID uint64            `msgpack:"stream_id"`
+	Status   uint32            `msgpack:"status"`
+	Headers  map[string]string `msgpack:"headers"`
+	Cookies  []string          `msgpack:"cookies,omitempty"`
+}
+
+// EncodeHTTPRespondStream marshals m for the http_respond_stream call.
+func EncodeHTTPRespondStream(m HTTPRespondStream) ([]byte, error) {
+	return msgpack.Marshal(m)
+}
+
+// DecodeHTTPRespondStream parses MessagePack bytes produced by the cell.
+func DecodeHTTPRespondStream(data []byte) (HTTPRespondStream, error) {
+	var m HTTPRespondStream
+	err := msgpack.Unmarshal(data, &m)
+	return m, err
+}
+
 // HTTPFetchChunk is the response of http_fetch_read. Bytes is the data
 // (possibly empty if the underlying reader returned 0 bytes without
 // error — cell should retry). EOF is true after the final chunk; the

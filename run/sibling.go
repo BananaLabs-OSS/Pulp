@@ -156,7 +156,7 @@ func (r *siblingRegistry) callDirect(ctx context.Context, caller, target, funcNa
 	if !ok {
 		return nil, fmt.Errorf("unknown target cell %q", target)
 	}
-	if targetRT.failed || targetRT.cell == nil {
+	if targetRT.failed.Load() || targetRT.cell == nil {
 		return nil, fmt.Errorf("target cell %q is not running", target)
 	}
 	_ = caller
