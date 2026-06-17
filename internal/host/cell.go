@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -160,6 +161,35 @@ func (p *Cell) lockForCall(ctx context.Context) bool {
 // works.) Bounding a runaway *wasm loop* therefore needs a supervisor that
 // kills+restarts the cell out-of-band, not a per-call context close — deferred.
 // The per-call callContext below still propagates host-side cancellation.
+// wazero compilation cache shared by every cell in this host process. Created once,
+// lazily; a failure (unwritable cache dir) leaves it nil and compilation falls back to
+// the in-memory path (correct, just not persisted). Override the location with
+// PULP_WAZERO_CACHE; default is <user cache>/pulp/wazero (temp dir as a last resort).
+var (
+	wazeroCacheOnce sync.Once
+	wazeroCache     wazero.CompilationCache
+)
+
+func sharedWazeroCache() wazero.CompilationCache {
+	wazeroCacheOnce.Do(func() {
+		dir := os.Getenv("PULP_WAZERO_CACHE")
+		if dir == "" {
+			if d, err := os.UserCacheDir(); err == nil && d != "" {
+				dir = filepath.Join(d, "pulp", "wazero")
+			} else {
+				dir = filepath.Join(os.TempDir(), "pulp-wazero-cache")
+			}
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return
+		}
+		if c, err := wazero.NewCompilationCacheWithDir(dir); err == nil {
+			wazeroCache = c
+		}
+	})
+	return wazeroCache
+}
+
 func Load(ctx context.Context, spec *manifest.CellSpec, registry *Registry, limits *Limits, logger *slog.Logger) (*Cell, error) {
 	wasmBytes, err := os.ReadFile(spec.WASMPath)
 	if err != nil {
@@ -168,6 +198,15 @@ func Load(ctx context.Context, spec *manifest.CellSpec, registry *Registry, limi
 
 	rtCfg := wazero.NewRuntimeConfig().
 		WithMemoryLimitPages(limits.maxMemoryPages())
+	// Persistent compilation cache: wazero otherwise recompiles the ENTIRE wasm module on
+	// every boot (a ~40 MB cell is several seconds of machine-code generation that blocks
+	// the cell coming up). The cache keys on module content + wazero version, so the FIRST
+	// boot compiles + writes the cache and every boot after loads the precompiled module —
+	// turning a multi-second cold start into a near-instant one. Safe across cells/versions
+	// (content-addressed); a best-effort nicety, so a cache-dir failure just skips it.
+	if cache := sharedWazeroCache(); cache != nil {
+		rtCfg = rtCfg.WithCompilationCache(cache)
+	}
 	r := wazero.NewRuntimeWithConfig(ctx, rtCfg)
 	wasi_snapshot_preview1.MustInstantiate(ctx, r)
 
