@@ -33,3 +33,5 @@ testdata/**/*.wasm
 # Editor/IDE
 # .idea/
 # .vscode/
+.projx/
+audit/
