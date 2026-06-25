@@ -488,11 +488,11 @@ func runPollster(
 		}
 
 		// Broadcast: deliver to every cell declaring c.Name.
-		// Finalize is called once (after the FIRST successful delivery)
-		// since the extension's per-event slot is shared across
-		// recipients. Subsequent recipients just get the event.
-		// This matches the pre-multi-cell semantics where one event
-		// went to one cell.
+		// Each delivered copy carries the same caps slice, so each cell's
+		// step loop calls Finalize independently when it dequeues the event.
+		// Extensions whose Finalize is idempotent (e.g. ext-http: lookup by
+		// ID, no-op if already removed) handle this safely. Extensions with
+		// non-idempotent Finalize must not be used in broadcast scenarios.
 		delivered := false
 		for _, name := range broadcastTargets {
 			rt := runtimes[name]
