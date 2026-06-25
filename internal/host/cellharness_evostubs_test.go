@@ -27,6 +27,7 @@ package host
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/BananaLabs-OSS/Pulp/ext"
@@ -288,6 +289,76 @@ func siblingStubCapability() ext.Capability {
 	return ext.Capability{Name: "pulp.sibling", Register: bind, Stub: bind}
 }
 
+// ---- http.outbound stub --------------------------------------------------
+//
+// transport.http.outbound's real ext makes live network calls behind a
+// deny-all-private SSRF guard, so it can't reach an in-test sidecar. This stub
+// replaces ONLY the outbound capability (inbound stays real so h.Do still
+// drives the cell) and serves canned sidecar responses keyed by URL path. It
+// lets the P1-7 generic-proxy harness drive the cell's outbound fetches
+// (/capabilities at boot, then /versions //mods //client-mods //preflight)
+// without a real sidecar. Bodies are stable per path so legacy and generic
+// routes proxying the SAME path get byte-identical responses.
+
+func cannedSidecarResponse(rawURL string) (uint32, []byte) {
+	path := rawURL
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	switch {
+	case strings.HasSuffix(path, "/capabilities"):
+		return 200, []byte(`{"game":"minecraft","endpoints":[` +
+			`{"id":"versions","method":"GET","core":"/api/:game/versions","sidecar":"/versions","cache_s":300,"forward_query":true},` +
+			`{"id":"mods","method":"GET","core":"/api/:game/mods","sidecar":"/mods","cache_s":300,"forward_query":true},` +
+			`{"id":"client-mods","method":"POST","core":"/api/:game/client-mods","sidecar":"/client-mods","ratelimit":"heavy","cache":"body-hash","max_body":65536},` +
+			`{"id":"preflight-jre","method":"POST","core":"/api/:game/preflight/jre","sidecar":"/preflight/jre","ratelimit":"heavy","cache":"body-hash","max_body":65536}` +
+			`]}`)
+	case strings.HasSuffix(path, "/game-meta"):
+		return 200, []byte(`{"game":"minecraft","eula":{"required":true,"name":"Minecraft EULA","url":"https://aka.ms/MinecraftEULA"}}`)
+	case strings.HasSuffix(path, "/versions"):
+		return 200, []byte(`{"versions":["1.21.4","1.21.3"],"latest":"1.21.4","crossplay":true}`)
+	case strings.HasSuffix(path, "/mods"):
+		return 200, []byte(`{"mods":[{"id":"fabric-api","name":"Fabric API"}]}`)
+	case strings.HasSuffix(path, "/client-mods"):
+		return 200, []byte(`{"client_mods":[{"id":"sodium","url":"https://stub/sodium.jar"}]}`)
+	case strings.HasSuffix(path, "/preflight/jre"):
+		return 200, []byte(`{"jre":"17","ok":true}`)
+	case strings.HasSuffix(path, "/deps/health"):
+		return 200, []byte(`{"overall":"ok","deps":[]}`)
+	default:
+		return 200, []byte(`{}`)
+	}
+}
+
+func httpOutboundStubCapability() ext.Capability {
+	bind := func(b wazero.HostModuleBuilder, _ ext.Cell) error {
+		fetch := func(ctx context.Context, m api.Module, reqPtr, reqLen, op, ol uint32) uint32 {
+			var req struct {
+				URL string `msgpack:"url"`
+			}
+			_ = readStubMsgpack(m, reqPtr, reqLen, &req)
+			status, body := cannedSidecarResponse(req.URL)
+			resp := struct {
+				Status  uint32            `msgpack:"status"`
+				Headers map[string]string `msgpack:"headers"`
+				Body    []byte            `msgpack:"body"`
+			}{Status: status, Headers: map[string]string{"content-type": "application/json"}, Body: body}
+			return writeStubMsgpack(ctx, m, resp, op, ol)
+		}
+		// Streaming fetch is unused by the proxy endpoints; bind the imports so
+		// instantiation succeeds, returning a benign error/no-op.
+		begin := func(_ context.Context, _ api.Module, _, _, _, _ uint32) uint32 { return 5 }
+		read := func(_ context.Context, _ api.Module, _, _, _, _, _ uint32) uint32 { return 5 }
+		closeFn := func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 0 }
+		b.NewFunctionBuilder().WithFunc(fetch).Export("http_fetch")
+		b.NewFunctionBuilder().WithFunc(begin).Export("http_fetch_begin")
+		b.NewFunctionBuilder().WithFunc(read).Export("http_fetch_read")
+		b.NewFunctionBuilder().WithFunc(closeFn).Export("http_fetch_close")
+		return nil
+	}
+	return ext.Capability{Name: "transport.http.outbound", Register: bind, Stub: bind}
+}
+
 // evolutionStubOverrides is the full override set the Evolution harness wires.
 func evolutionStubOverrides() []ext.Capability {
 	return []ext.Capability{
@@ -296,5 +367,6 @@ func evolutionStubOverrides() []ext.Capability {
 		dockerStubCapability(),
 		workersStubCapability(),
 		siblingStubCapability(),
+		httpOutboundStubCapability(),
 	}
 }
