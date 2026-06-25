@@ -128,6 +128,14 @@ func Main() {
 			"provides", spec.Provides,
 			"consumes", spec.Consumes,
 		)
+		if spec.Restart != manifest.RestartNever {
+			logger.Warn("restart policy not yet implemented — field parsed but no supervisor exists; treating as 'never'",
+				"cell", spec.Name, "restart", spec.Restart)
+		}
+		if len(spec.SharedMemoryGroups) > 0 {
+			logger.Warn("shared_memory_groups not yet implemented — field parsed but no zero-copy linking exists; field is a no-op",
+				"cell", spec.Name, "groups", spec.SharedMemoryGroups)
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

@@ -110,6 +110,13 @@ type Capability struct {
 	// Finalize is called after the step loop processes an event
 	// from this extension. The id matches StepEvent.ID.
 	// Nil = no post-processing needed.
+	//
+	// Implementations MUST be idempotent: in multi-cell broadcast
+	// scenarios the step loop calls Finalize once per cell that
+	// dequeues the event, so the same ID may arrive multiple times.
+	// A non-idempotent Finalize (e.g. decrement a semaphore, charge a
+	// credit) must not be used on a Poll-based capability that allows
+	// broadcast (empty CellID).
 	Finalize func(id uint64)
 
 	// TeardownCell, if non-nil, is called to drop only the named
