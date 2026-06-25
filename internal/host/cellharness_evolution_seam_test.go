@@ -49,39 +49,48 @@ func startEvolutionWithSidecar(t *testing.T) *CellHarness {
 	})
 }
 
-// TestEvolution_GenericProxyMatchesLegacy is the Phase 1 red→green gate: each
-// generic /api/:game/... route must match its hardcoded /api/... twin in both
-// status and body. If this passes, Phase 2 can delete the hardcoded handlers.
-func TestEvolution_GenericProxyMatchesLegacy(t *testing.T) {
+// TestEvolution_GenericProxyServes is the Phase 2 gate (after the hardcoded MC
+// handlers were deleted): each generic /api/:game/... route must register from
+// the sidecar's /capabilities declaration and proxy through the (stub-served)
+// sidecar body unchanged. The legacy /api/mc-versions etc. no longer exist.
+func TestEvolution_GenericProxyServes(t *testing.T) {
 	h := startEvolutionWithSidecar(t)
 	warmEvolution(t, h)
 
 	cases := []struct {
-		name    string
-		method  string
-		legacy  string
-		generic string
-		body    []byte
+		name   string
+		method string
+		path   string
+		body   []byte
+		want   string // exact body the stub sidecar serves for this path
 	}{
-		{"versions", "GET", "/api/mc-versions", "/api/minecraft/versions", nil},
-		{"mods", "GET", "/api/mods?loader=fabric", "/api/minecraft/mods?loader=fabric", nil},
-		{"client-mods", "POST", "/api/client-mods", "/api/minecraft/client-mods", []byte(`{"mods":["fabric-api"]}`)},
-		{"preflight-jre", "POST", "/api/preflight/jre", "/api/minecraft/preflight/jre", []byte(`{"mods":["fabric-api"]}`)},
+		{"versions", "GET", "/api/minecraft/versions", nil, `{"versions":["1.21.4","1.21.3"],"latest":"1.21.4","crossplay":true}`},
+		{"mods", "GET", "/api/minecraft/mods?loader=fabric", nil, `{"mods":[{"id":"fabric-api","name":"Fabric API"}]}`},
+		{"client-mods", "POST", "/api/minecraft/client-mods", []byte(`{"mods":["fabric-api"]}`), `{"client_mods":[{"id":"sodium","url":"https://stub/sodium.jar"}]}`},
+		{"preflight-jre", "POST", "/api/minecraft/preflight/jre", []byte(`{"mods":["fabric-api"]}`), `{"jre":"17","ok":true}`},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			sL, bL := h.Do(tc.method, tc.legacy, nil, tc.body)
-			sG, bG := h.Do(tc.method, tc.generic, nil, tc.body)
-			if sG != 200 {
-				t.Fatalf("generic %s %s: want 200, got %d (%s)", tc.method, tc.generic, sG, bG)
+			s, b := h.Do(tc.method, tc.path, nil, tc.body)
+			if s != 200 {
+				t.Fatalf("generic %s %s: want 200, got %d (%s)", tc.method, tc.path, s, b)
 			}
-			if sL != sG {
-				t.Fatalf("%s: status mismatch legacy=%d generic=%d", tc.name, sL, sG)
-			}
-			if string(bL) != string(bG) {
-				t.Fatalf("%s: body mismatch\n legacy=%s\ngeneric=%s", tc.name, bL, bG)
+			if string(b) != tc.want {
+				t.Fatalf("%s: body mismatch\n want=%s\n got =%s", tc.name, tc.want, b)
 			}
 		})
+	}
+}
+
+// TestEvolution_LegacyMCRoutesGone confirms the cutover removed the hardcoded
+// routes — they must 404 now (only the generic /api/:game/... paths remain).
+func TestEvolution_LegacyMCRoutesGone(t *testing.T) {
+	h := startEvolutionWithSidecar(t)
+	warmEvolution(t, h)
+	for _, p := range []string{"/api/mc-versions", "/api/mods", "/api/client-mods", "/api/preflight/jre"} {
+		if s, _ := h.Do("GET", p, nil, nil); s != 404 {
+			t.Errorf("legacy route %s: want 404 after cutover, got %d", p, s)
+		}
 	}
 }
