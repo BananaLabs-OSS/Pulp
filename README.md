@@ -6,25 +6,23 @@ A minimal, universal application runtime. Go host, WASM cells, Docker-shaped bou
 
 **v0.4 — storage.** v0.3 stood up transport (HTTP / HTTPS / WebSocket / SSE) on a shared port. v0.4 adds a scoped filesystem and a per-cell SQLite database. The combination is enough to host Hytale-Auth; the existing port lives in `Hytale-Auth/pulp-cell/`.
 
-See `plans/velvet-bouncing-horizon.md` for the full design.
-
 ## Running
 
 ```sh
 go build -o pulp ./cmd/pulp
 ./pulp -manifest path/to/pulp.cell.toml
 ./pulp -manifest path/to/pulp.cell.toml -http-port 9090
-./pulp -manifest path/to/pulp.cell.toml -http-cert cert.pem -http-key key.pem
 ```
 
 Send `SIGINT` (Ctrl+C) or `SIGTERM` to shut down. On Windows, `Ctrl+Break` works (the runtime listens for `SIGBREAK` too).
 
 Flags:
 
-- `-manifest` — path to `pulp.cell.toml` (required).
-- `-http-port` — HTTP / HTTPS / WS / SSE listener port (default `8080`). Used only when the cell declares an inbound transport capability.
-- `-http-cert`, `-http-key` — PEM files. If both are given, the HTTP server switches to HTTPS.
-- `-storage-root` — root directory for cell-scoped storage (default `./data`). Each cell gets `{root}/{cell_name}/` — scoped filesystem and SQLite DB live inside.
+- `-manifest` — path to `pulp.cell.toml` (required). May be repeated or comma-separated for multi-cell deployments.
+- `-http-port` — HTTP / WS / SSE listener port (default `8080`). Used only when the cell declares an inbound transport capability. Overridden by `HTTP_PORT` env var.
+- `-storage-root` — root directory for cell-scoped storage (default `./data`). Each cell gets `{root}/{cell_name}/`.
+
+TLS is controlled by `HTTP_CERT` and `HTTP_KEY` environment variables (paths to PEM files), read by `Pulp-ext-http` during Setup — not by command-line flags.
 
 ## Cell contract
 
