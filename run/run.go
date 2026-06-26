@@ -66,6 +66,13 @@ type cellRuntime struct {
 	// failed cell inherit the failed state. Atomic: written during startup,
 	// read by ctl status concurrently.
 	failed atomic.Bool
+
+	// registry/limits/configBytes are retained from startup so the step-loop
+	// SUPERVISOR can re-instantiate the cell after a wasm trap (restart=on_crash)
+	// without run.Main's startup context — the host stays up, the cell is reborn.
+	registry    *host.Registry
+	limits      *host.Limits
+	configBytes []byte
 }
 
 // routedEvent wraps an ext.StepEvent with a back-reference to the
@@ -288,6 +295,7 @@ func Main() {
 				return
 			}
 			rt.cell = cell
+			rt.registry, rt.limits, rt.configBytes = registry, limits, configBytes // retained for crash re-instantiate
 
 			if err := cell.Init(rt.ctx, configBytes); err != nil {
 				logger.Error("init failed", "cell", spec.Name, "err", err)
@@ -547,6 +555,29 @@ func deliver(rt *cellRuntime, r routedEvent, c ext.Capability, logger *slog.Logg
 // no longer burns a measurable slice of one core each. As soon as
 // real work arrives the timer is reset, restoring the original
 // snappy pickup latency.
+// reinstantiateCell rebuilds a trapped cell module in place: re-Load from disk +
+// re-Init, then swap it onto rt and close the dead one. Returns false if the
+// rebuild itself fails (the supervisor then backs off). The host stays up
+// throughout — only the one cell is reborn, so the cockpit self-heals.
+func reinstantiateCell(rt *cellRuntime, logger *slog.Logger) bool {
+	newCell, err := host.Load(rt.ctx, rt.spec, rt.registry, rt.limits, logger)
+	if err != nil {
+		logger.Error("re-instantiate: load failed", "cell", rt.spec.Name, "err", err)
+		return false
+	}
+	if err := newCell.Init(rt.ctx, rt.configBytes); err != nil {
+		logger.Error("re-instantiate: init failed", "cell", rt.spec.Name, "err", err)
+		newCell.Close(context.Background())
+		return false
+	}
+	old := rt.cell
+	rt.cell = newCell
+	if old != nil {
+		old.Close(context.Background())
+	}
+	return true
+}
+
 func stepLoop(rt *cellRuntime, capByName map[string]ext.Capability, logger *slog.Logger) {
 	const (
 		idleMin     = 200 * time.Microsecond
@@ -560,6 +591,31 @@ func stepLoop(rt *cellRuntime, capByName map[string]ext.Capability, logger *slog
 		<-idleTimer.C
 	}
 	defer idleTimer.Stop()
+
+	// Crash supervisor: re-instantiate the cell after a wasm trap when
+	// restart=on_crash/always (the previously-unimplemented manifest policy), with
+	// a loop-breaker so a cell that traps on init can't spin forever. A bare panic
+	// is already caught in-cell (pulp_step recover); this catches the rest — a true
+	// module trap or proc_exit — so "cell did not respond" self-heals.
+	restarts := 0
+	restartWindow := time.Time{}
+	superviseTrap := func(callN uint64) {
+		if rt.spec.Restart != manifest.RestartOnCrash && rt.spec.Restart != manifest.RestartAlways {
+			return
+		}
+		now := time.Now()
+		if now.Sub(restartWindow) > 30*time.Second {
+			restarts, restartWindow = 0, now
+		}
+		if restarts >= 5 {
+			logger.Error("cell crash-restart limit hit (5 in 30s) — leaving it down", "cell", rt.spec.Name)
+			return
+		}
+		restarts++
+		if reinstantiateCell(rt, logger) {
+			logger.Warn("cell RE-INSTANTIATED after trap", "cell", rt.spec.Name, "call_number", callN, "restart_count", restarts)
+		}
+	}
 
 	for {
 		select {
@@ -590,6 +646,7 @@ func stepLoop(rt *cellRuntime, capByName map[string]ext.Capability, logger *slog
 					"cell", rt.spec.Name,
 					"call_number", n,
 					"err", err)
+				superviseTrap(n)
 			}
 			for _, c := range re.caps {
 				safe.CallFinalize(c, re.ev.ID, logger)
@@ -616,6 +673,7 @@ func stepLoop(rt *cellRuntime, capByName map[string]ext.Capability, logger *slog
 					"cell", rt.spec.Name,
 					"call_number", n,
 					"err", err)
+				superviseTrap(n)
 			}
 			if n%10000 == 0 {
 				logger.Info("step heartbeat",
