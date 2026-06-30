@@ -257,7 +257,7 @@ func Load(ctx context.Context, spec *manifest.CellSpec, registry *Registry, limi
 	// don't pass everything (cells are sandboxed, and arbitrary env
 	// leakage is a supply-chain hazard) — just the keys that the
 	// current cell ecosystem reads. Expand carefully as needed.
-	for _, key := range []string{"HTTP_PORT", "TZ", "PROJX_PROJECT_ROOT", "PROJX_ACTIVE_PROJECT", "PROJX_HOST_EXE", "PROJX_SRC_DIR", "PROJX_WASM_OUT", "PROJX_GOWORK", "PROJX_HOST_OS", "PROJX_HOST_PID", "PROJX_RELAUNCH_SPEC", "PROJX_DESKTOP_EXE", "PROJX_XVFB_DIR", "PROJX_AI_KEY", "PROJX_AI_MODEL", "PROJX_HOST_HOME", "PROJX_ROOT", "PROJX_AGENT", "PROJX_ALLOW_HOST"} {
+	for _, key := range []string{"HTTP_PORT", "TZ", "PROJX_PROJECT_ROOT", "PROJX_ACTIVE_PROJECT", "PROJX_HOST_EXE", "PROJX_SRC_DIR", "PROJX_WASM_OUT", "PROJX_GOWORK", "PROJX_HOST_OS", "PROJX_HOST_PID", "PROJX_RELAUNCH_SPEC", "PROJX_DESKTOP_EXE", "PROJX_XVFB_DIR", "PROJX_AI_KEY", "PROJX_AI_MODEL", "PROJX_AI_BASE_URL", "PROJX_SMART_CONTEXT", "PROJX_HOST_HOME", "PROJX_ROOT", "PROJX_AGENT", "PROJX_ALLOW_HOST"} {
 		if v := os.Getenv(key); v != "" {
 			cfg = cfg.WithEnv(key, v)
 		}
