@@ -49,7 +49,24 @@ type Limits struct {
 	MaxMemoryPages uint32
 	// CallTimeout bounds a single WASM entry point. 0 => default.
 	CallTimeout time.Duration
+
+	// Interruptible OPTS THIS CELL INTO wazero's WithCloseOnContextDone so a
+	// runaway guest (an infinite loop / hang inside pulp_step / pulp_on_call)
+	// is TERMINATED when its call context reaches its deadline, instead of
+	// pinning a goroutine (and the cell mutex) forever. This is the primitive
+	// the cell Supervisor's runaway guard stands on (see supervisor.go).
+	//
+	// It is OFF BY DEFAULT and purely additive: a cell loaded without it keeps
+	// the exact behaviour documented on Load below (no per-call termination
+	// checks, runaway loops unbounded), so Call/CallTyped/Step for every
+	// existing cell are byte-for-byte unchanged. When a supervised cell trips
+	// its deadline wazero closes the MODULE (per WithCloseOnContextDone's
+	// contract), so the terminated cell is dead and must be re-instantiated —
+	// exactly the kill-then-restart shape the crash supervisor already handles.
+	Interruptible bool
 }
+
+func (l *Limits) interruptible() bool { return l != nil && l.Interruptible }
 
 func (l *Limits) maxMemoryPages() uint32 {
 	if l != nil && l.MaxMemoryPages != 0 {
@@ -207,6 +224,15 @@ func Load(ctx context.Context, spec *manifest.CellSpec, registry *Registry, limi
 
 	rtCfg := wazero.NewRuntimeConfig().
 		WithMemoryLimitPages(limits.maxMemoryPages())
+	// Opt-in runaway interruptibility (see Limits.Interruptible). Enabling this
+	// makes wazero insert periodic termination checks so a call whose context
+	// hits its deadline unwinds instead of hanging — the mechanism the cell
+	// Supervisor's runaway guard relies on. Left off by default so the reactor
+	// caveat documented below (no WithCloseOnContextDone) holds for every
+	// unsupervised cell exactly as before.
+	if limits.interruptible() {
+		rtCfg = rtCfg.WithCloseOnContextDone(true)
+	}
 	// Persistent compilation cache: wazero otherwise recompiles the ENTIRE wasm module on
 	// every boot (a ~40 MB cell is several seconds of machine-code generation that blocks
 	// the cell coming up). The cache keys on module content + wazero version, so the FIRST
