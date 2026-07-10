@@ -80,6 +80,15 @@ type Cell struct {
 	// cells that only consume do not need it. Resolved at Load time.
 	onCallFn api.Function
 
+	// postReturnFn is the OPTIONAL pulp_post_return export. A cell exports it
+	// only when it returns a canonical-ABI (witcell) pointer-tree response that
+	// the host must tree-free after lifting. It is resolved at Load time but is
+	// NOT a required export: legacy msgpack cells (Evolution, Sessions-Gene,
+	// minecraft-resolver, …) do not export it and stay on the opaque Call path
+	// entirely unchanged. Its presence is the sole gate for CallTyped — see
+	// ExportsPostReturn / CallTyped.
+	postReturnFn api.Function
+
 	// mu serializes entry points that execute WASM code. wazero modules
 	// are not goroutine-safe, and sibling calls can enter the cell
 	// concurrently with its own step loop — the mutex prevents race
@@ -274,6 +283,9 @@ func Load(ctx context.Context, spec *manifest.CellSpec, registry *Registry, limi
 	p.stepFn = mod.ExportedFunction("pulp_step")
 	p.shutdownFn = mod.ExportedFunction("pulp_shutdown")
 	p.onCallFn = mod.ExportedFunction("pulp_on_call")
+	// Optional canonical-ABI tree-free export. Absent for every legacy msgpack
+	// cell, which therefore stays on the unchanged opaque Call path.
+	p.postReturnFn = mod.ExportedFunction("pulp_post_return")
 
 	var missing []string
 	if p.initFn == nil {
@@ -460,6 +472,119 @@ func (p *Cell) Call(ctx context.Context, funcName string, args []byte) ([]byte, 
 	return out, nil
 }
 
+// ErrNoPostReturn is returned by CallTyped when the target cell does not
+// export pulp_post_return. Such cells are not canonical-ABI (witcell) cells;
+// use the opaque Call path for them instead.
+var ErrNoPostReturn = errors.New("cell does not export pulp_post_return (use Call for the opaque []byte path)")
+
+// ExportsPostReturn reports whether the cell exports pulp_post_return, i.e.
+// whether it participates in the canonical-ABI (witcell) response path. This
+// is the ONE gate that distinguishes the two paths: callers route a cell to
+// CallTyped when this is true and to Call when it is false. Every legacy
+// msgpack cell returns false here, so it is impossible for one to be pulled
+// onto the new path — its opaque []byte contract is preserved exactly.
+func (p *Cell) ExportsPostReturn() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.postReturnFn != nil
+}
+
+// CallTyped is the canonical-ABI (witcell) sibling-call path — ADDITIVE to,
+// and independent of, Call. Where Call copies the response out as an opaque
+// []byte and leaves the cell to clean up (which, for a pointer-tree response,
+// would leak every string/list sub-buffer hung off the top record), CallTyped
+// is for cells that export pulp_post_return:
+//
+//  1. it invokes pulp_on_call exactly like Call;
+//  2. WHILE the response pointer tree is still PINNED in the cell's alloc
+//     table, it hands (memory, respPtr, respLen) to the caller's lift
+//     callback, which reads the typed value via its witcell-generated
+//     static-layout reader;
+//  3. only after lift returns does it call pulp_post_return(respPtr, respLen)
+//     to tree-free the WHOLE response (top record + every sub-buffer),
+//     leaving zero leaked pins.
+//
+// The request is written from args exactly as Call writes it (the caller
+// pre-lowers the flat request record). Returns ErrNoPostReturn if the cell
+// does not export pulp_post_return, ErrReentrantCall on a loopback, or any
+// trap / nonzero on-call code. Re-entrancy, timeouts, and locking match Call.
+func (p *Cell) CallTyped(ctx context.Context, funcName string, args []byte,
+	lift func(mem api.Memory, respPtr, respLen uint32) error) error {
+
+	if !p.lockForCall(ctx) {
+		return ErrReentrantCall
+	}
+	defer p.mu.Unlock()
+
+	if p.onCallFn == nil {
+		return fmt.Errorf("cell %q does not export pulp_on_call (or is closed)", p.name)
+	}
+	if p.postReturnFn == nil {
+		return ErrNoPostReturn
+	}
+
+	callCtx, cancel := p.callContext(ctx)
+	defer cancel()
+
+	nameBytes := []byte(funcName)
+	namePtr, err := p.writeBytes(callCtx, nameBytes)
+	if err != nil {
+		return fmt.Errorf("write name: %w", err)
+	}
+	defer p.free(callCtx, namePtr, uint32(len(nameBytes)))
+
+	var argsPtr uint32
+	if len(args) > 0 {
+		argsPtr, err = p.writeBytes(callCtx, args)
+		if err != nil {
+			return fmt.Errorf("write args: %w", err)
+		}
+		defer p.free(callCtx, argsPtr, uint32(len(args)))
+	}
+
+	// Allocate 8 bytes for (respPtr, respLen) out-params.
+	outPtr, err := p.alloc(callCtx, 8)
+	if err != nil {
+		return fmt.Errorf("alloc out-params: %w", err)
+	}
+	defer p.free(callCtx, outPtr, 8)
+
+	results, err := p.onCallFn.Call(callCtx,
+		uint64(namePtr), uint64(len(nameBytes)),
+		uint64(argsPtr), uint64(len(args)),
+		uint64(outPtr), uint64(outPtr+4),
+	)
+	if err != nil {
+		return fmt.Errorf("pulp_on_call trap: %w", err)
+	}
+	if code := uint32(results[0]); code != 0 {
+		return fmt.Errorf("pulp_on_call returned %d", code)
+	}
+
+	respPtr, ok := p.module.Memory().ReadUint32Le(outPtr)
+	if !ok {
+		return errors.New("read respPtr failed")
+	}
+	respLen, ok := p.module.Memory().ReadUint32Le(outPtr + 4)
+	if !ok {
+		return errors.New("read respLen failed")
+	}
+
+	// Lift the typed value while the tree is still pinned (pulp_post_return has
+	// NOT run yet), then tree-free. Even if lift fails we still post_return so
+	// the cell never leaks the response tree.
+	var liftErr error
+	if lift != nil {
+		liftErr = lift(p.module.Memory(), respPtr, respLen)
+	}
+	if respPtr != 0 {
+		if _, perr := p.postReturnFn.Call(callCtx, uint64(respPtr), uint64(respLen)); perr != nil {
+			liftErr = errors.Join(liftErr, fmt.Errorf("pulp_post_return trap: %w", perr))
+		}
+	}
+	return liftErr
+}
+
 // Shutdown calls pulp_shutdown. Error if the cell returns nonzero or traps.
 // Serialized against Init, Step, and Call via the module mutex so wazero
 // never sees concurrent calls into the same module.
@@ -536,6 +661,7 @@ func (p *Cell) Close(ctx context.Context) error {
 	p.stepFn = nil
 	p.shutdownFn = nil
 	p.onCallFn = nil
+	p.postReturnFn = nil
 	return err
 }
 
