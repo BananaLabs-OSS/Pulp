@@ -13,15 +13,28 @@ package host
 //   - builds the Evolution cell to wasm and Inits it under a test Pulp host
 //     (StartCellHTTP + the shared stripe/s3/docker/sibling stubs), so bootstrap
 //     runs the real migrations against a host-provided temp SQLite (the test
-//     opens that same data.db to seed + inspect it directly);
+//     opens that same data.db to inspect it directly + seed deployment reference
+//     data — the tier/game_visibility catalog no cell endpoint creates);
+//   - drives a server to ACTIVE entirely through the cell's REAL customer
+//     endpoints (provisionActiveServer): POST /api/checkout creates the paid
+//     order, POST /api/webhooks/stripe flips it to `paid` (the stub's webhook
+//     verify passes; with no sessions gene the cell's fallback marks it paid),
+//     and pumped ticks run enqueueNewOrders -> promoteQueue -> provision ->
+//     createContainer against the Bananagine stub, so the ACTIVE row is written
+//     by the cell's OWN poller — not seeded on a side connection;
 //   - stubs the cell's OUTBOUND HTTP (Bananagine) with a canned responder whose
-//     container status is a live atomic — /health=200 and a flippable
-//     stopped<->running container status (mirrors the native fakeBananagine);
+//     container status is a live atomic — /health=200, a POST create that 201s
+//     with an id/ip/ports, and a flippable stopped<->running status;
 //   - captures every outbound Resend email by decoding the workers.Submit
 //     payload (the async http.fetch the cell enqueues for email); and
-//   - DRIVES THE POLLER TICK by letting the harness pump submit idle steps: the
+//   - DRIVES THE POLLER TICK via driveTick: every inbound request runs the
 //     cell's OnStep -> poll.tickIfDue -> mainTick -> healthCheckActive ->
-//     settleDowntimeCompensation runs on its own, exactly as in production.
+//     settleDowntimeCompensation. NOTE (corrective, see ADR cell-test-harness):
+//     the harness's idle step-pump does NOT reach OnStep, so mainTick only
+//     advances on a request — that, not any "cross-connection SQLite
+//     invisibility", is why the earlier settle proofs never saw the poller act.
+//     Cross-connection reads work fine (the poller sees the checkout-written
+//     order and the test-backdated first_seen).
 //
 // CLOCK NOTE (why the window is opened THROUGH the cell, then backdated): the
 // settle path measures the outage as time.Since(first_seen) using the CELL's
@@ -76,10 +89,11 @@ func evoBananagineOutboundStub() ext.Capability {
 	bind := func(b wazero.HostModuleBuilder, _ ext.Cell) error {
 		fetch := func(ctx context.Context, m api.Module, reqPtr, reqLen, op, ol uint32) uint32 {
 			var req struct {
-				URL string `msgpack:"url"`
+				Method string `msgpack:"method"`
+				URL    string `msgpack:"url"`
 			}
 			_ = readStubMsgpack(m, reqPtr, reqLen, &req)
-			status, body := evoBananagineResponse(req.URL)
+			status, body := evoBananagineResponse(req.Method, req.URL)
 			resp := struct {
 				Status  uint32            `msgpack:"status"`
 				Headers map[string]string `msgpack:"headers"`
@@ -99,8 +113,10 @@ func evoBananagineOutboundStub() ext.Capability {
 	return ext.Capability{Name: "transport.http.outbound", Register: bind, Stub: bind}
 }
 
-// evoBananagineResponse mirrors the native fakeBananagine mux.
-func evoBananagineResponse(rawURL string) (uint32, []byte) {
+// evoBananagineResponse mirrors the native fakeBananagine mux. Method is read
+// so POST /orchestration/servers (createContainer) and GET /orchestration/servers
+// (reconcileOrphanContainers list) — which share a URL — return different bodies.
+func evoBananagineResponse(method, rawURL string) (uint32, []byte) {
 	path := rawURL
 	if i := strings.IndexByte(path, '?'); i >= 0 {
 		path = path[:i]
@@ -109,21 +125,35 @@ func evoBananagineResponse(rawURL string) (uint32, []byte) {
 	case strings.HasSuffix(path, "/health"):
 		return 200, []byte(`{}`)
 	case strings.HasSuffix(path, "/orchestration/servers"):
+		if method == "POST" {
+			// createContainer — 201 with an id/name/ip/ports so provision()
+			// can flip the server to active. Deterministic identifiers keyed
+			// off the count so retries/adopt don't collide.
+			n := evoContainerNext.Add(1)
+			return 201, []byte(fmt.Sprintf(
+				`{"id":"cont-%d","name":"srv-%d","ip":"10.0.0.1","ports":{"java":25565,"bedrock":19132}}`, n, n))
+		}
 		// reconcileOrphanContainers list — empty => no orphans to reap.
 		return 200, []byte(`[]`)
 	case strings.Contains(path, "/orchestration/servers/") &&
 		(strings.HasSuffix(path, "/restart") || strings.HasSuffix(path, "/exec")):
 		return 200, []byte(`{}`)
 	case strings.Contains(path, "/orchestration/servers/"):
+		// getContainerStatus / adoptExistingContainer probe. A GET for a
+		// concrete container id reports the flippable live status.
 		st, _ := evoBananagineStatus.Load().(string)
 		if st == "" {
 			st = "running"
 		}
-		return 200, []byte(fmt.Sprintf(`{"status":%q}`, st))
+		return 200, []byte(fmt.Sprintf(`{"id":%q,"status":%q,"ip":"10.0.0.1","ports":{"java":25565}}`,
+			strings.TrimPrefix(path[strings.LastIndex(path, "/")+1:], ""), st))
 	default:
 		return 200, []byte(`{}`)
 	}
 }
+
+// evoContainerNext mints unique container ids for the createContainer stub.
+var evoContainerNext atomic.Uint32
 
 // ---- email-capturing workers stub ----------------------------------------
 //
@@ -282,26 +312,110 @@ func startEvolutionDowntime(t *testing.T) (*CellHarness, *sql.DB) {
 	return h, db
 }
 
-// seedActiveServerWithOrder inserts a fulfilled order + an active server
-// carrying a container id, display name, and expires_at. Only NOT-NULL-without-
-// default columns are set explicitly; the rest fall to their schema defaults.
-func seedActiveServerWithOrder(t *testing.T, db *sql.DB, orderID, serverID, email, displayName string, expiresAt time.Time) {
+// seedDowntimeCatalog inserts the ONE enabled tier + the minecraft
+// game_visibility row that /api/checkout's deploy-gate kernel requires (an
+// enabled tier + a gv row for the template — else it denies "unknown template").
+// This is deployment REFERENCE data: on a real box it comes from the
+// seed-fresh-db tool (and, for a template's first gv row, from Bananagine's
+// template sync). No cell endpoint creates a template's FIRST gv row, so the
+// harness seeds it directly via this connection — reference config, NOT a
+// test-only write path into the production cell (zero production surface, same
+// pattern the harness already used for orders/servers). A synchronous cell
+// handler reads it fine (proven: checkout succeeds), because the blocker the
+// ADR pinned was never cross-connection invisibility — it was that the poller's
+// mainTick wasn't being driven (see driveUntil / the ADR update).
+func seedDowntimeCatalog(t *testing.T, db *sql.DB) {
 	t.Helper()
 	now := time.Now().UTC()
 	if _, err := db.Exec(
-		`INSERT INTO orders (id, stripe_session_id, server_type, email, status, auto_redeem, created_at)
-		 VALUES (?, ?, 'minecraft', ?, 'fulfilled', 0, ?)`,
-		orderID, "ss_"+orderID, email, now,
+		`INSERT INTO tiers (id, name, label, price_cents, duration, enabled, sort_order, max_cpu, max_ram_mb, created_at)
+		 VALUES ('standard','session','Session',1400,'336h',1,0,2.0,4096,?)`, now,
 	); err != nil {
-		t.Fatalf("seed order %s: %v", orderID, err)
+		t.Fatalf("seed tier: %v", err)
 	}
 	if _, err := db.Exec(
-		`INSERT INTO servers (id, order_id, container_id, server_name, template, state, ip, port, ports_json, display_name, expires_at, created_at)
-		 VALUES (?, ?, ?, ?, 'minecraft', 'active', '10.0.0.1', 25565, '{"bedrock":19132}', ?, ?, ?)`,
-		serverID, orderID, "cont-"+serverID, "srv-"+serverID, displayName, expiresAt.UTC(), now,
+		`INSERT INTO game_visibility (template, tier_id, game_id, enabled)
+		 VALUES ('minecraft','standard','minecraft',1)`,
 	); err != nil {
-		t.Fatalf("seed server %s: %v", serverID, err)
+		t.Fatalf("seed game_visibility: %v", err)
 	}
+	checkpoint(db)
+}
+
+// driveTick fires one GET /health at the cell. Every inbound request runs the
+// cell's OnStep hook (DrainAdminAsyncQueue + poll.tickIfDue) BEFORE dispatch, so
+// a request is what advances the poller's mainTick in the harness — the idle
+// step-pump alone does not reach OnStep, which is why the earlier settle proofs
+// (which waited on background ticks) never saw the poller act. checkpoint()
+// flushes this connection's WAL frames so the read-back is immediate.
+func driveTick(h *CellHarness, db *sql.DB) {
+	h.Do("GET", "/health", nil, nil)
+	checkpoint(db)
+}
+
+// driveUntil pumps poller ticks (via driveTick) until cond holds or the deadline
+// elapses. Replaces the passive waitFor for anything that depends on the poller
+// mainTick running (enqueue, provision, health-check, settle).
+func driveUntil(t *testing.T, h *CellHarness, db *sql.DB, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		driveTick(h, db)
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("timed out driving poller ticks for: %s", what)
+}
+
+// provisionActiveServer drives a brand-new server to ACTIVE entirely through the
+// cell's REAL customer endpoints, so the ACTIVE row is written by the cell's OWN
+// poller (createContainer against the Bananagine stub) — not seeded on a side
+// connection. Flow: POST /api/checkout (creates a pending paid-intent order) ->
+// POST /api/webhooks/stripe payment_intent.succeeded (the stub's webhook_verify
+// passes; with no sessions gene loaded the cell's fallback flips the order
+// straight to `paid`) -> pump ticks so enqueueNewOrders + promoteQueue +
+// provision create + start the container and mark it active. Returns the
+// poller-assigned server id, order id, generated display name, and the initial
+// expires_at (the credit baseline).
+func provisionActiveServer(t *testing.T, h *CellHarness, db *sql.DB, email string) (serverID, orderID, displayName string, origExpiry time.Time) {
+	t.Helper()
+	seedDowntimeCatalog(t, db)
+
+	body, _ := json.Marshal(map[string]any{
+		"server_type":   "minecraft",
+		"email":         email,
+		"age_confirmed": true,
+		"tos_accepted":  true,
+		"eula_accepted": true,
+	})
+	if s, b := h.Do("POST", "/api/checkout", map[string]string{"Content-Type": "application/json"}, body); s != 200 {
+		t.Fatalf("checkout: want 200, got %d (%s)", s, b)
+	}
+	// The stripe stub mints a PaymentIntent id "pi_stub_<amount_cents>"; the
+	// default minecraft price is 1400 with no discount.
+	const pi = "pi_stub_1400"
+	wh := []byte(fmt.Sprintf(
+		`{"id":"evt-%s","type":"payment_intent.succeeded","data":{"object":{"id":%q,"amount_received":1400}}}`,
+		email, pi))
+	if s, b := h.Do("POST", "/api/webhooks/stripe",
+		map[string]string{"Content-Type": "application/json", "Stripe-Signature": "t=1,v1=stub"}, wh); s != 200 {
+		t.Fatalf("stripe webhook: want 200, got %d (%s)", s, b)
+	}
+
+	driveUntil(t, h, db, "checkout order provisioned to an active server", func() bool {
+		return db.QueryRow(
+			`SELECT s.id, s.order_id, s.display_name
+			   FROM servers s JOIN orders o ON o.id = s.order_id
+			  WHERE o.stripe_session_id = ? AND s.state = 'active'`, pi,
+		).Scan(&serverID, &orderID, &displayName) == nil
+	})
+	if serverID == "" {
+		t.Fatal("no active server after provisioning")
+	}
+	origExpiry = readExpiresAt(t, db, serverID)
+	return serverID, orderID, displayName, origExpiry
 }
 
 // checkpoint forces this connection's WAL frames into the main db file so the
@@ -316,34 +430,25 @@ func checkpoint(db *sql.DB) {
 // openBackdatedWindow opens a downtime_window THROUGH the cell (so first_seen is
 // stamped in the cell's own clock), then backdates it by ageSeconds to simulate
 // an outage of that length, then flips the container back to "running" so the
-// next tick settles it. This keeps the whole outage measurement in the cell's
-// clock frame (see the CLOCK NOTE at the top of the file).
+// next settle tick credits it. This keeps the whole outage measurement in the
+// cell's clock frame (see the CLOCK NOTE at the top of the file).
 //
-// Returns false if the cell never opens the window within the deadline. That
-// is the KNOWN BLOCKER (see visibilityBlocker): the running cell's long-lived
-// ext-sqlite connection does not observe rows this separate test connection
-// commits, so healthCheckActive never sees the seeded server. Callers t.Skip on
-// false rather than fail, so the proof spec is preserved and lights up the day
-// a cell-side seed seam (or an ext-sqlite visibility fix) lands.
-func openBackdatedWindow(t *testing.T, db *sql.DB, serverID string, ageSeconds int) bool {
+// It drives poller ticks (driveTick) while waiting for the window to open —
+// healthCheckActive runs on the poller's mainTick, which the harness advances
+// via inbound requests, not the idle step-pump. The server it acts on is the
+// REAL active server provisionActiveServer created through the cell, so
+// healthCheckActive sees it on the first stopped tick and recordAlert opens the
+// window; the test then backdates first_seen and the recovery tick settles.
+func openBackdatedWindow(t *testing.T, h *CellHarness, db *sql.DB, serverID string, ageSeconds int) {
 	t.Helper()
 	setEvoBananagineStatus("stopped")
 	var fs string
-	opened := false
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if err := db.QueryRow(
+	driveUntil(t, h, db, "downtime_window opened by healthCheckActive", func() bool {
+		return db.QueryRow(
 			`SELECT first_seen FROM alerts WHERE server_id=? AND type='downtime_window' AND resolved=0`,
 			serverID,
-		).Scan(&fs); err == nil && fs != "" {
-			opened = true
-			break
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	if !opened {
-		return false
-	}
+		).Scan(&fs) == nil && fs != ""
+	})
 	cellFirst := parseDBTime(t, fs)
 	back := cellFirst.Add(-time.Duration(ageSeconds) * time.Second)
 	if _, err := db.Exec(
@@ -356,21 +461,9 @@ func openBackdatedWindow(t *testing.T, db *sql.DB, serverID string, ageSeconds i
 	if _, err := db.Exec(`UPDATE servers SET restart_count=0 WHERE id=?`, serverID); err != nil {
 		t.Fatalf("reset restart_count for %s: %v", serverID, err)
 	}
+	checkpoint(db)
 	setEvoBananagineStatus("running")
-	return true
 }
-
-// visibilityBlocker is the message the three settle proofs skip with until the
-// cross-connection visibility gap is closed. Empirically established by
-// TestEvolution_DowntimeHarness_Smoke: a paid order this test connection commits
-// is never picked up by the cell's enqueueNewOrders tick, i.e. the running
-// cell's ext-sqlite connection does not observe an external connection's
-// commits (the reverse — the test reading the cell's boot seed — works). The
-// fix is a cell-side seed seam that writes THROUGH the cell's own DB handle
-// (so the poller sees it), or driving state end-to-end through the cell's write
-// endpoints, or an ext-sqlite change that shares the cell's connection with the
-// harness. See ADR cell-test-harness.
-const visibilityBlocker = "poller-driven proof blocked: the running cell's ext-sqlite connection does not observe rows committed by this separate test connection (see visibilityBlocker + ADR cell-test-harness)"
 
 func readExpiresAt(t *testing.T, db *sql.DB, serverID string) time.Time {
 	t.Helper()
@@ -413,43 +506,21 @@ func countOpenWindows(t *testing.T, db *sql.DB, serverID string) int {
 	return n
 }
 
-// waitFor polls cond until true or the deadline elapses.
-func waitFor(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(25 * time.Second)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for: %s", what)
-}
-
 // ===========================================================================
 // THE PROOF
 // ===========================================================================
 
 func TestEvolution_DowntimeCompensation_CreditsRoundedUpHourOnce(t *testing.T) {
-	_, db := startEvolutionDowntime(t)
+	h, db := startEvolutionDowntime(t)
 
-	const (
-		orderID = "ord-dt-2h"
-		srvID   = "srv-dt-2h"
-		email   = "player2h@example.com"
-		display = "brave-otter-9k2f"
-	)
-	orig := time.Now().UTC().Add(6 * time.Hour).Truncate(time.Second)
-	seedActiveServerWithOrder(t, db, orderID, srvID, email, display, orig)
-	origStored := readExpiresAt(t, db, srvID)
+	const email = "player2h@example.com"
+	srvID, _, display, origStored := provisionActiveServer(t, h, db, email)
 
 	// ~90-minute outage: above the 1h floor, rounds UP to exactly 2h.
-	if !openBackdatedWindow(t, db, srvID, 90*60) {
-		t.Skip(visibilityBlocker)
-	}
+	openBackdatedWindow(t, h, db, srvID, 90*60)
 
 	// A running-container tick settles the window: +2h and one email.
-	waitFor(t, "expires_at extended by the downtime credit", func() bool {
+	driveUntil(t, h, db, "expires_at extended by the downtime credit", func() bool {
 		return readExpiresAt(t, db, srvID).Sub(origStored) > time.Minute
 	})
 
@@ -461,7 +532,7 @@ func TestEvolution_DowntimeCompensation_CreditsRoundedUpHourOnce(t *testing.T) {
 		t.Fatalf("expected outage window resolved, %d still open", n)
 	}
 
-	waitFor(t, "compensation email captured", func() bool {
+	driveUntil(t, h, db, "compensation email captured", func() bool {
 		return len(evoCompEmailsFor(email)) >= 1
 	})
 	emails := evoCompEmailsFor(email)
@@ -478,7 +549,10 @@ func TestEvolution_DowntimeCompensation_CreditsRoundedUpHourOnce(t *testing.T) {
 
 	// Repeat recovery ticks must NOT double-credit and send no 2nd email.
 	afterCredit := readExpiresAt(t, db, srvID)
-	time.Sleep(2500 * time.Millisecond) // several 1s ticks
+	for i := 0; i < 8; i++ { // several running-container settle ticks
+		driveTick(h, db)
+		time.Sleep(50 * time.Millisecond)
+	}
 	if again := readExpiresAt(t, db, srvID); again.Sub(afterCredit) > time.Second {
 		t.Fatalf("double-credit on repeat tick: %s -> %s", afterCredit, again)
 	}
@@ -488,25 +562,16 @@ func TestEvolution_DowntimeCompensation_CreditsRoundedUpHourOnce(t *testing.T) {
 }
 
 func TestEvolution_DowntimeCompensation_BelowHourFloorNoCredit(t *testing.T) {
-	_, db := startEvolutionDowntime(t)
+	h, db := startEvolutionDowntime(t)
 
-	const (
-		orderID = "ord-dt-40m"
-		srvID   = "srv-dt-40m"
-		email   = "player40m@example.com"
-		display = "quiet-fox-11aa"
-	)
-	orig := time.Now().UTC().Add(6 * time.Hour).Truncate(time.Second)
-	seedActiveServerWithOrder(t, db, orderID, srvID, email, display, orig)
-	origStored := readExpiresAt(t, db, srvID)
+	const email = "player40m@example.com"
+	srvID, _, _, origStored := provisionActiveServer(t, h, db, email)
 
 	// 40-minute outage: below the 1h meaningful-downtime floor.
-	if !openBackdatedWindow(t, db, srvID, 40*60) {
-		t.Skip(visibilityBlocker)
-	}
+	openBackdatedWindow(t, h, db, srvID, 40*60)
 
 	// The window is settled (resolved) on recovery even below the floor.
-	waitFor(t, "outage window resolved even below floor", func() bool {
+	driveUntil(t, h, db, "outage window resolved even below floor", func() bool {
 		return countOpenWindows(t, db, srvID) == 0
 	})
 
@@ -514,31 +579,25 @@ func TestEvolution_DowntimeCompensation_BelowHourFloorNoCredit(t *testing.T) {
 	if added := readExpiresAt(t, db, srvID).Sub(origStored); added > time.Second {
 		t.Fatalf("below-floor outage must not credit; expiry moved by %s", added)
 	}
-	time.Sleep(1500 * time.Millisecond) // give any (erroneous) email time to land
+	for i := 0; i < 6; i++ { // give any (erroneous) email time to land
+		driveTick(h, db)
+		time.Sleep(50 * time.Millisecond)
+	}
 	if n := len(evoCompEmailsFor(email)); n != 0 {
 		t.Fatalf("below-floor outage must not send a compensation email; captured %d", n)
 	}
 }
 
 func TestEvolution_DowntimeCompensation_DayWording(t *testing.T) {
-	_, db := startEvolutionDowntime(t)
+	h, db := startEvolutionDowntime(t)
 
-	const (
-		orderID = "ord-dt-day"
-		srvID   = "srv-dt-day"
-		email   = "playerday@example.com"
-		display = "sleepy-lynx-7c3d"
-	)
-	orig := time.Now().UTC().Add(48 * time.Hour).Truncate(time.Second)
-	seedActiveServerWithOrder(t, db, orderID, srvID, email, display, orig)
-	origStored := readExpiresAt(t, db, srvID)
+	const email = "playerday@example.com"
+	srvID, _, _, origStored := provisionActiveServer(t, h, db, email)
 
 	// 24.5h outage: rounds up to exactly 25h -> ">=24h renders in DAYS".
-	if !openBackdatedWindow(t, db, srvID, 24*3600+30*60) {
-		t.Skip(visibilityBlocker)
-	}
+	openBackdatedWindow(t, h, db, srvID, 24*3600+30*60)
 
-	waitFor(t, "expires_at extended by the day-scale credit", func() bool {
+	driveUntil(t, h, db, "expires_at extended by the day-scale credit", func() bool {
 		return readExpiresAt(t, db, srvID).Sub(origStored) > 20*time.Hour
 	})
 	added := readExpiresAt(t, db, srvID).Sub(origStored)
@@ -546,7 +605,7 @@ func TestEvolution_DowntimeCompensation_DayWording(t *testing.T) {
 		t.Fatalf("expected ~25h credit for a 24.5h outage, got %s", added)
 	}
 
-	waitFor(t, "day-wording email captured", func() bool {
+	driveUntil(t, h, db, "day-wording email captured", func() bool {
 		return len(evoCompEmailsFor(email)) >= 1
 	})
 	got := evoCompEmailsFor(email)[0]
@@ -559,58 +618,46 @@ func TestEvolution_DowntimeCompensation_DayWording(t *testing.T) {
 }
 
 // TestEvolution_DowntimeHarness_Smoke proves the harness INFRASTRUCTURE works
-// end-to-end for everything that is reachable, AND pins the exact boundary that
-// blocks the poller-driven proof:
+// end-to-end:
 //
 //   1. the Evolution cell builds to wasm, Inits under the Pulp host (real
 //      migrations), and serves /health — via warmEvolution in startEvolution*;
-//   2. the test opens the cell's host-provided data.db and round-trips a write
-//      (cell->test AND test->test visibility both work);
-//   3. BUT a paid order this test connection commits is NEVER picked up by the
-//      cell's enqueueNewOrders tick — establishing that the running cell's
-//      long-lived ext-sqlite connection does not observe an external
-//      connection's commits. THIS is why the settle proofs skip.
+//   2. the test opens the cell's host-provided data.db and observes the cell's
+//      boot-seeded config (cross-connection reads work — the ADR's "cross-
+//      connection invisibility" was a MISDIAGNOSIS; see the corrective note);
+//   3. a paid order committed by THIS connection IS picked up by the cell's
+//      enqueueNewOrders tick and provisioned to a server row — once the poller's
+//      mainTick is actually driven (an inbound request runs OnStep -> tickIfDue;
+//      the idle step-pump does not, which is what made the earlier settle proofs
+//      appear "blocked"). driveTick supplies that drive.
 func TestEvolution_DowntimeHarness_Smoke(t *testing.T) {
-	_, db := startEvolutionDowntime(t)
+	h, db := startEvolutionDowntime(t)
 
 	// (2) The cell booted and seeded baseline config on ITS connection; the test
-	// connection observes it (cell->test visibility) — and a test write
-	// round-trips on the test connection.
+	// connection observes it — cross-connection reads work in both directions.
 	var nsc int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM site_config`).Scan(&nsc); err != nil || nsc == 0 {
 		t.Fatalf("cell->test visibility broken: site_config=%d err=%v", nsc, err)
 	}
+
+	// (3) A paid order this connection commits (with the catalog reference rows
+	// the enqueue path needs) is enqueued + provisioned by the poller ONCE ticks
+	// are driven — refuting the old "the cell never observes external commits"
+	// conclusion. This is the corrective infra guard.
+	seedDowntimeCatalog(t, db)
 	now := time.Now().UTC()
 	if _, err := db.Exec(
-		`INSERT INTO orders (id, stripe_session_id, server_type, email, status, auto_redeem, created_at)
-		 VALUES ('smoke-ord','ss_smoke','minecraft','s@e.com','paid',0,?)`, now,
+		`INSERT INTO orders (id, stripe_session_id, server_type, tier_id, email, status, auto_redeem, created_at)
+		 VALUES ('smoke-ord','ss_smoke','minecraft','standard','s@e.com','paid',0,?)`, now,
 	); err != nil {
 		t.Fatalf("seed paid order: %v", err)
 	}
-	var got string
-	if err := db.QueryRow(`SELECT status FROM orders WHERE id='smoke-ord'`).Scan(&got); err != nil || got != "paid" {
-		t.Fatalf("test->test round-trip broken: status=%q err=%v", got, err)
-	}
+	checkpoint(db)
 
-	// (3) The cell's poller runs enqueueNewOrders every mainTick; a visible paid
-	// order without a server would be enqueued (a server row created). Confirm
-	// it is NOT — the boundary that blocks the poller-driven proofs.
-	deadline := time.Now().Add(8 * time.Second)
-	cellSaw := false
-	for time.Now().Before(deadline) {
+	driveUntil(t, h, db, "poller enqueues + provisions the committed paid order", func() bool {
 		var n int
 		_ = db.QueryRow(`SELECT COUNT(*) FROM servers WHERE order_id='smoke-ord'`).Scan(&n)
-		if n > 0 {
-			cellSaw = true
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if cellSaw {
-		// The visibility gap is CLOSED — the settle proofs above should now run
-		// instead of skipping. Surface it loudly so we flip them from Skip.
-		t.Log("NOTE: the cell now observes external writes — remove the visibilityBlocker skips and let the settle proofs run")
-	} else {
-		t.Log("confirmed: the running cell does not observe this connection's commits (visibilityBlocker); settle proofs skip until a cell-side seed seam lands")
-	}
+		return n > 0
+	})
+	t.Log("confirmed: the poller observes this connection's committed order and provisions it once mainTick is driven (no cross-connection blocker)")
 }
