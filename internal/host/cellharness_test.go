@@ -102,6 +102,12 @@ type CellHarness struct {
 	cell   *Cell
 	client *http.Client
 
+	// StorageRoot is the temp dir shared by the declared storage caps. For a
+	// storage.sqlite cell the backing file is <StorageRoot>/<Name>/data.db —
+	// a test can open it directly (single conn + WAL) to seed / inspect the
+	// cell's DB, exactly as the Sessions-Gene harness does.
+	StorageRoot string
+
 	cancel  context.CancelFunc
 	pumpWG  sync.WaitGroup
 	t       *testing.T
@@ -257,6 +263,7 @@ func StartCellHTTP(t *testing.T, cfg CellHarnessConfig) *CellHarness {
 		t:            t,
 		httpCap:      httpCap,
 		teardownCaps: teardownCaps,
+		StorageRoot:  storageRoot,
 	}
 
 	// Pump: poll the http capability for inbound requests, step them into
