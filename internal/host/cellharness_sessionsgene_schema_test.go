@@ -179,6 +179,8 @@ CREATE TABLE IF NOT EXISTS game_visibility (
 	game_id TEXT NOT NULL,
 	label TEXT,
 	enabled BOOLEAN NOT NULL DEFAULT FALSE,
+	hidden BOOLEAN NOT NULL DEFAULT FALSE,
+	engine TEXT NOT NULL DEFAULT '',
 	price_override INTEGER,
 	duration_override TEXT,
 	max_players_override INTEGER,

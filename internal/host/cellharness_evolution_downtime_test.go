@@ -122,6 +122,18 @@ func evoBananagineResponse(method, rawURL string) (uint32, []byte) {
 		path = path[:i]
 	}
 	switch {
+	// Mojang Java-UUID lookup (resolveJavaUUID, reached via POST
+	// /api/servers/:id/whitelist with platform=java). A "Nobody" name 404s
+	// (player-not-found); any other name returns Notch's canonical 32-hex id so
+	// the handler can dash-format and echo it back.
+	case strings.Contains(path, "/users/profiles/minecraft/"):
+		if strings.HasSuffix(path, "/Nobody") {
+			return 404, []byte(`{}`)
+		}
+		return 200, []byte(`{"id":"069a79f444e94726a5befca90e38aaf5","name":"Notch"}`)
+	// GeyserMC Bedrock-UUID lookup (resolveBedrockUUID, platform=bedrock).
+	case strings.Contains(path, "/v2/utils/uuid/bedrock_or_java/"):
+		return 200, []byte(`{"id":"00000000000000000009000005ccdde3"}`)
 	case strings.HasSuffix(path, "/health"):
 		return 200, []byte(`{}`)
 	case strings.HasSuffix(path, "/orchestration/servers"):
@@ -254,6 +266,15 @@ func evoDowntimeOverrides() []ext.Capability {
 // ---- harness --------------------------------------------------------------
 
 func startEvolutionDowntime(t *testing.T) (*CellHarness, *sql.DB) {
+	return startEvolutionDowntimeCfg(t, "")
+}
+
+// startEvolutionDowntimeCfg is startEvolutionDowntime with a configurable
+// internal_secret. An empty secret leaves the internal-auth'd routes
+// (/api/servers/*) fail-closed (503) as the downtime proofs expect; a non-empty
+// secret opens them so a test can drive an internal endpoint by sending the
+// matching X-Internal-Secret header (see the whitelist-add UUID ports).
+func startEvolutionDowntimeCfg(t *testing.T, internalSecret string) (*CellHarness, *sql.DB) {
 	t.Helper()
 	setEvoBananagineStatus("running")
 	resetEvoEmails()
@@ -273,13 +294,13 @@ func startEvolutionDowntime(t *testing.T) (*CellHarness, *sql.DB) {
 			"entropy.read",
 		},
 		Config: map[string]any{
-			"internal_secret":  "",
-			"frontend_url":     "https://sessions.gg",
-			"max_servers":      12,
-			"poll_interval":    "50ms",
-			"server_lifetime":  "336h",
-			"refund_threshold": "10m",
-			"db_dialect":       "",
+			"internal_secret":      internalSecret,
+			"frontend_url":         "https://sessions.gg",
+			"max_servers":          12,
+			"poll_interval":        "50ms",
+			"server_lifetime":      "336h",
+			"refund_threshold":     "10m",
+			"db_dialect":           "",
 			"r2_account_id":        "stub-account",
 			"r2_access_key_id":     "stub-key",
 			"r2_secret_access_key": "stub-secret",
@@ -620,16 +641,16 @@ func TestEvolution_DowntimeCompensation_DayWording(t *testing.T) {
 // TestEvolution_DowntimeHarness_Smoke proves the harness INFRASTRUCTURE works
 // end-to-end:
 //
-//   1. the Evolution cell builds to wasm, Inits under the Pulp host (real
-//      migrations), and serves /health — via warmEvolution in startEvolution*;
-//   2. the test opens the cell's host-provided data.db and observes the cell's
-//      boot-seeded config (cross-connection reads work — the ADR's "cross-
-//      connection invisibility" was a MISDIAGNOSIS; see the corrective note);
-//   3. a paid order committed by THIS connection IS picked up by the cell's
-//      enqueueNewOrders tick and provisioned to a server row — once the poller's
-//      mainTick is actually driven (an inbound request runs OnStep -> tickIfDue;
-//      the idle step-pump does not, which is what made the earlier settle proofs
-//      appear "blocked"). driveTick supplies that drive.
+//  1. the Evolution cell builds to wasm, Inits under the Pulp host (real
+//     migrations), and serves /health — via warmEvolution in startEvolution*;
+//  2. the test opens the cell's host-provided data.db and observes the cell's
+//     boot-seeded config (cross-connection reads work — the ADR's "cross-
+//     connection invisibility" was a MISDIAGNOSIS; see the corrective note);
+//  3. a paid order committed by THIS connection IS picked up by the cell's
+//     enqueueNewOrders tick and provisioned to a server row — once the poller's
+//     mainTick is actually driven (an inbound request runs OnStep -> tickIfDue;
+//     the idle step-pump does not, which is what made the earlier settle proofs
+//     appear "blocked"). driveTick supplies that drive.
 func TestEvolution_DowntimeHarness_Smoke(t *testing.T) {
 	h, db := startEvolutionDowntime(t)
 
