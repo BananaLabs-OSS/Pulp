@@ -26,6 +26,9 @@ package host
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
@@ -56,6 +59,69 @@ func getStripeStubPIStatus() string {
 	stripeStubMu.Lock()
 	defer stripeStubMu.Unlock()
 	return stripeStubPIStatus
+}
+
+// ---- Layer D: opt-in webhook-signature verification ----------------------
+//
+// The stripe stub's webhook verify returns "valid" (code 0) for EVERY inbound
+// signature by default, so the existing checkout->webhook->provision proofs can
+// drive the cell with a placeholder Stripe-Signature. That default makes the
+// two native signature-reject tests (RejectsBadSignature / RejectsMissing
+// signature) unreachable — nothing the harness sends is ever rejected.
+//
+// stripeStubVerifySig makes the stub ACTUALLY verify the Stripe-style HMAC when
+// a test opts in (default false preserves every existing test's behaviour). The
+// host-side ext owns the signing secret in production; in-harness the STUB owns
+// it, so a test that opts in signs its payload with stripeStubWebhookSecret and
+// the stub validates against the same secret — a bad or missing signature then
+// returns code 6 (ErrStripeSignatureInvalid), which the cell's real webhook
+// handler surfaces as HTTP 400, exactly the native contract.
+const stripeStubWebhookSecret = "whsec_harness_test"
+
+var (
+	stripeStubVerifySigMu sync.Mutex
+	stripeStubVerifySig   = false
+)
+
+func setStripeStubVerifySig(on bool) {
+	stripeStubVerifySigMu.Lock()
+	stripeStubVerifySig = on
+	stripeStubVerifySigMu.Unlock()
+}
+
+func getStripeStubVerifySig() bool {
+	stripeStubVerifySigMu.Lock()
+	defer stripeStubVerifySigMu.Unlock()
+	return stripeStubVerifySig
+}
+
+// verifyStripeStubSignature reimplements Stripe's HMAC-SHA256 scheme: the header
+// is "t=<unix>,v1=<hex-hmac>" and the signed payload is "<t>.<raw-body>". An
+// empty header (missing signature) or any mismatch is invalid.
+func verifyStripeStubSignature(header string, payload []byte) bool {
+	if header == "" {
+		return false
+	}
+	var ts, sig string
+	for _, part := range strings.Split(header, ",") {
+		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		switch kv[0] {
+		case "t":
+			ts = kv[1]
+		case "v1":
+			sig = kv[1]
+		}
+	}
+	if ts == "" || sig == "" {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(stripeStubWebhookSecret))
+	mac.Write([]byte(ts + "." + string(payload)))
+	want := hex.EncodeToString(mac.Sum(nil))
+	return hmac.Equal([]byte(want), []byte(sig))
 }
 
 // writeStubMsgpack marshals v and hands it back to the guest using the same
@@ -166,9 +232,25 @@ func stripeStubCapability() ext.Capability {
 		okObj := func(ctx context.Context, m api.Module, _, _, op, ol uint32) uint32 {
 			return writeStubMsgpack(ctx, m, map[string]any{}, op, ol)
 		}
-		// webhook_verify is a 2-arg fn returning a bare code; ok = signature
-		// valid. Not on any pinned path but must bind.
-		verify := func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 0 }
+		// webhook_verify is a 2-arg fn returning a bare code (0=valid,
+		// 6=ErrStripeSignatureInvalid). Default: always valid so existing
+		// proofs can drive the webhook with a placeholder signature. When a
+		// test opts into stripeStubVerifySig, actually verify the Stripe-style
+		// HMAC over the WebhookVerifyRequest{payload, signature_header}.
+		verify := func(_ context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+			if !getStripeStubVerifySig() {
+				return 0
+			}
+			var req struct {
+				Payload         []byte `msgpack:"payload"`
+				SignatureHeader string `msgpack:"signature_header"`
+			}
+			_ = readStubMsgpack(m, reqPtr, reqLen, &req)
+			if verifyStripeStubSignature(req.SignatureHeader, req.Payload) {
+				return 0
+			}
+			return 6
+		}
 
 		b.NewFunctionBuilder().WithFunc(piCreate).Export("stripe_payment_intent_create")
 		b.NewFunctionBuilder().WithFunc(piGet).Export("stripe_payment_intent_get")
