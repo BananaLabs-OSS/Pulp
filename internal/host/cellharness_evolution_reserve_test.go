@@ -1,30 +1,25 @@
 package host
 
-// "Reserve now, charge when live" — schema proofs (Evolution migration
-// 00000002_reserve_columns).
+// "Reserve now, charge when live" — schema proofs.
 //
 // A full fleet must not refuse the sale: checkout runs a Stripe SetupIntent, the
 // card sits at Stripe, and nothing is charged until promoteQueue brings the
-// server live. These pin the DATA MODEL that flow stands on, before any of the
-// payment behaviour exists.
+// server live. These pin the DATA MODEL that flow stands on.
 //
-// SCOPE — read this before trusting it. 00000002 has two branches and this file
-// exercises exactly one:
+// SCOPE — read this before trusting it. There is deliberately NO migration file
+// (Nick, 2026-07-17): Evolution is not on sow, and a hand-written bun migration
+// was dropped in favour of ALTERing the DB directly. So the columns arrive by two
+// different routes and this file can only prove one:
 //
-//   - FRESH DB (here): the migrator runs the baseline first, whose createTables
-//     builds `orders` from cellmodels.AllModels() — which already declares these
-//     fields. So the columns exist and 00000002's loop skips every one. What
-//     this proves is that the models, the baseline and the migration AGREE, and
-//     that 00000002 is a clean no-op rather than a "duplicate column" boot
-//     failure.
-//   - EXISTING DB (prod, Crunchy Postgres): the columns are genuinely absent and
-//     00000002 must ALTER them in. That branch is NOT covered here — the harness
-//     always starts from an empty temp dir, StorageRoot isn't injectable, and
-//     rebooting a cell onto a pre-seeded DB would mean changing shared harness
-//     semantics. It is guarded instead by the migration's own post-condition
-//     (re-introspect, hard error if a column is still missing), so the prod path
-//     fails LOUDLY at boot rather than silently scanning into a missing column.
-//     It still wants a real Postgres dry-run before deploy.
+//   - FRESH DB (covered here): the baseline's createTables builds `orders` from
+//     cellmodels.AllModels(), which declares these fields — so a new deploy and
+//     this harness get them automatically. What that proves is the model and the
+//     schema have not drifted.
+//   - EXISTING DB (prod, Crunchy Postgres): CREATE TABLE IF NOT EXISTS never
+//     alters an existing table, so prod gets these columns ONLY when someone runs
+//     the ALTER by hand. Nothing here can prove that happened. If it is skipped,
+//     bun scans into columns that do not exist and the failure lands far from the
+//     cause. The DDL is recorded in the reserve-charge-on-live ADR.
 
 import (
 	"database/sql"
@@ -39,6 +34,7 @@ var reserveColumns = []string{
 	"stripe_payment_method_id",
 	"charged_at",
 	"charge_attempts",
+	"last_charge_attempt_at", // drives the decline backoff; without it retries storm
 	"grace_until",
 	"last_charge_error",
 }
@@ -54,39 +50,41 @@ func ordersHasColumn(t *testing.T, db *sql.DB, col string) bool {
 	return n > 0
 }
 
-func TestEvolution_Reserve_ColumnsExistAfterMigration(t *testing.T) {
+func TestEvolution_Reserve_ColumnsExist(t *testing.T) {
 	_, db := startEvolutionDowntime(t)
 
 	for _, col := range reserveColumns {
 		if !ordersHasColumn(t, db, col) {
-			t.Errorf("orders.%s missing after migrations: a reserved order cannot "+
+			t.Errorf("orders.%s missing: a reserved order cannot "+
 				"record its Stripe references, so the charge-on-live flow has nowhere to live", col)
 		}
 	}
 }
 
-// The cell must BOOT with 00000002 registered. On a fresh DB the baseline has
-// already created these columns, so a naive `ALTER TABLE ADD COLUMN` would fail
-// with "duplicate column" and take the whole cell down on startup. Reaching a
-// serving state at all is the proof.
-func TestEvolution_Reserve_MigrationIsCleanOnFreshDB(t *testing.T) {
+// There is deliberately NO migration file for the reserve columns (Nick,
+// 2026-07-17): a fresh DB gets them from the models via the baseline's
+// createTables, and an existing DB is ALTERed directly by hand. This pins the
+// half that is automatic — the cell must boot and build the columns from the
+// models alone, with no migration involved.
+//
+// The other half has no test and cannot have one here: an EXISTING prod DB only
+// gets these columns if someone runs the ALTER. See the reserve-charge-on-live
+// ADR for the exact DDL. If that is skipped, bun scans into columns that do not
+// exist and the failure lands far from the cause.
+func TestEvolution_Reserve_FreshDBGetsColumnsFromModelsAlone(t *testing.T) {
 	h, db := startEvolutionDowntime(t)
 
 	status, _ := h.Do("GET", "/health", nil, nil)
 	if status != 200 {
-		t.Fatalf("cell did not boot cleanly with migration 00000002: /health = %d", status)
+		t.Fatalf("cell did not boot: /health = %d", status)
 	}
 
-	// bun records applied versions in bun_migrations. 00000002 must be there:
-	// if the migrator skipped it, prod would never get its ALTER.
-	var applied int
-	if err := db.QueryRow(
-		`SELECT COUNT(*) FROM bun_migrations WHERE name LIKE '00000002%'`,
-	).Scan(&applied); err != nil {
-		t.Fatalf("read bun_migrations: %v", err)
-	}
-	if applied == 0 {
-		t.Fatalf("migration 00000002 was never recorded as applied; prod would not get the reserve columns")
+	for _, col := range reserveColumns {
+		if !ordersHasColumn(t, db, col) {
+			t.Errorf("orders.%s absent on a fresh DB: the baseline builds orders from "+
+				"cellmodels.AllModels(), so a field missing here means the model and the "+
+				"schema have drifted", col)
+		}
 	}
 }
 
