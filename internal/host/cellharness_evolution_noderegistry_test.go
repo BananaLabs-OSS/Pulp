@@ -38,21 +38,13 @@ func TestEvolution_NodeRegistry_NodeBudgetSumsActiveNode(t *testing.T) {
 	// same 14/48 whether it reads the seeded node row or (before the row is
 	// visible / while the 60s cache is warm) the single-node bridge — the value
 	// under test is stable regardless of cache timing.
-	h, db := startEvolutionDowntimeExtra(t, "", map[string]any{
+	h, _ := startEvolutionDowntimeExtra(t, "", map[string]any{
 		"bananagine_url": budgetNodeURL,
 	})
 
-	// Seed one active node — the registry's node-1, url already warmed.
-	now := time.Now().UTC()
-	if _, err := db.Exec(
-		`INSERT INTO nodes (id, name, bananagine_url, state, registered_at)
-		 VALUES ('node-1', 'node-1', ?, 'active', ?)`,
-		budgetNodeURL, now,
-	); err != nil {
-		t.Fatalf("seed node: %v", err)
-	}
-	checkpoint(db)
-
+	// No manual seed: the cell registers its own node-1 at boot (registerLocalNode)
+	// from cfg.BananagineURL, which is budgetNodeURL here. So node-1 is already an
+	// active node reporting 14/48 — this now also proves boot self-registration.
 	status, body := h.Do("GET", "/api/calendar", nil, nil)
 	if status != 200 {
 		t.Fatalf("GET /api/calendar: want 200, got %d (%s)", status, body)
