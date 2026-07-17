@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"testing"
 
 	"github.com/BananaLabs-OSS/Pulp/ext"
 	"github.com/tetratelabs/wazero"
@@ -189,6 +190,55 @@ type stubPaymentIntent struct {
 	Metadata      map[string]string `msgpack:"metadata"`
 }
 
+// stubSetupIntent mirrors Pulp-ext-stripe's setupIntentResponse. A SetupIntent
+// stores a card WITHOUT charging it — the mechanism behind "reserve now, charge
+// when the server goes live", which a manual-capture auth-hold cannot do because
+// it expires in ~7 days while a queue can run for weeks.
+type stubSetupIntent struct {
+	ID            string            `msgpack:"id"`
+	Status        string            `msgpack:"status"`
+	ClientSecret  string            `msgpack:"client_secret,omitempty"`
+	Customer      string            `msgpack:"customer,omitempty"`
+	PaymentMethod string            `msgpack:"payment_method,omitempty"`
+	Usage         string            `msgpack:"usage,omitempty"`
+	LastErrorMsg  string            `msgpack:"last_error,omitempty"`
+	LastErrorCode string            `msgpack:"last_error_code,omitempty"`
+	Metadata      map[string]string `msgpack:"metadata"`
+}
+
+type stubCustomer struct {
+	ID    string `msgpack:"id"`
+	Email string `msgpack:"email,omitempty"`
+}
+
+// stripeStubSetupPM controls what payment_method a fetched SetupIntent reports.
+// Empty models the real pre-confirmation state: Stripe only attaches the card
+// once the customer completes the SetupIntent in the browser, so a cell that
+// reads it too early legitimately sees nothing. Guarded by the existing
+// stripeStubMu (declared with stripeStubPIStatus above).
+var stripeStubSetupPM = "pm_stub_card"
+
+func getStripeStubSetupPM() string {
+	stripeStubMu.Lock()
+	defer stripeStubMu.Unlock()
+	return stripeStubSetupPM
+}
+
+// setStripeStubSetupPM points the stub at a given saved card (or "" for
+// not-yet-confirmed). Restores the previous value on test cleanup.
+func setStripeStubSetupPM(t *testing.T, pm string) {
+	t.Helper()
+	stripeStubMu.Lock()
+	prev := stripeStubSetupPM
+	stripeStubSetupPM = pm
+	stripeStubMu.Unlock()
+	t.Cleanup(func() {
+		stripeStubMu.Lock()
+		stripeStubSetupPM = prev
+		stripeStubMu.Unlock()
+	})
+}
+
 func stripeStubCapability() ext.Capability {
 	bind := func(b wazero.HostModuleBuilder, _ ext.Cell) error {
 		// payment_intent_create — mint a deterministic PI id from the
@@ -252,12 +302,68 @@ func stripeStubCapability() ext.Capability {
 			return 6
 		}
 
+		// setup_intent_create / _get — a stored card, no charge. Echo the
+		// customer back so a cell that hangs a card off a customer can be
+		// asserted end-to-end.
+		seCreate := func(ctx context.Context, m api.Module, reqPtr, reqLen, op, ol uint32) uint32 {
+			var req struct {
+				Customer string `msgpack:"customer"`
+				Usage    string `msgpack:"usage,omitempty"`
+			}
+			_ = readStubMsgpack(m, reqPtr, reqLen, &req)
+			return writeStubMsgpack(ctx, m, stubSetupIntent{
+				ID:           "seti_stub_1",
+				Status:       "requires_payment_method",
+				ClientSecret: "seti_stub_secret",
+				Customer:     req.Customer,
+				Usage:        req.Usage,
+				Metadata:     map[string]string{},
+			}, op, ol)
+		}
+		seGet := func(ctx context.Context, m api.Module, reqPtr, reqLen, op, ol uint32) uint32 {
+			var req struct {
+				ID string `msgpack:"id"`
+			}
+			_ = readStubMsgpack(m, reqPtr, reqLen, &req)
+			pm := getStripeStubSetupPM()
+			status := "succeeded"
+			if pm == "" {
+				// Not yet completed in the browser: no card attached.
+				status = "requires_payment_method"
+			}
+			return writeStubMsgpack(ctx, m, stubSetupIntent{
+				ID:            req.ID,
+				Status:        status,
+				Customer:      "cus_stub_1",
+				PaymentMethod: pm,
+				Usage:         "off_session",
+				Metadata:      map[string]string{},
+			}, op, ol)
+		}
+		custCreate := func(ctx context.Context, m api.Module, reqPtr, reqLen, op, ol uint32) uint32 {
+			var req struct {
+				Email string `msgpack:"email,omitempty"`
+			}
+			_ = readStubMsgpack(m, reqPtr, reqLen, &req)
+			return writeStubMsgpack(ctx, m, stubCustomer{ID: "cus_stub_1", Email: req.Email}, op, ol)
+		}
+
 		b.NewFunctionBuilder().WithFunc(piCreate).Export("stripe_payment_intent_create")
 		b.NewFunctionBuilder().WithFunc(piGet).Export("stripe_payment_intent_get")
 		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_payment_intent_capture")
 		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_payment_intent_cancel")
 		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_refund_create")
-		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_customer_create")
+		// customer_create must return a REAL id, not okObj's empty object: the
+		// reserve flow hangs the saved card off this customer, and an empty id
+		// would be stored on the order and quietly make the later off-session
+		// charge impossible.
+		b.NewFunctionBuilder().WithFunc(custCreate).Export("stripe_customer_create")
+		// These MUST be exported even by tests that never drive them: once
+		// router.go references CreateSetupIntent the cell's wasmimport is live,
+		// and a missing host export fails module instantiation — which would
+		// take down every Evolution proof at once, not just the reserve ones.
+		b.NewFunctionBuilder().WithFunc(seCreate).Export("stripe_setup_intent_create")
+		b.NewFunctionBuilder().WithFunc(seGet).Export("stripe_setup_intent_get")
 		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_invoice_create")
 		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_invoice_finalize")
 		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_invoice_item_create")
