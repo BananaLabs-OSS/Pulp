@@ -275,9 +275,39 @@ func startEvolutionDowntime(t *testing.T) (*CellHarness, *sql.DB) {
 // secret opens them so a test can drive an internal endpoint by sending the
 // matching X-Internal-Secret header (see the whitelist-add UUID ports).
 func startEvolutionDowntimeCfg(t *testing.T, internalSecret string) (*CellHarness, *sql.DB) {
+	return startEvolutionDowntimeExtra(t, internalSecret, nil)
+}
+
+// startEvolutionDowntimeExtra is startEvolutionDowntimeCfg with extra cell
+// config keys merged over the defaults. The capacity proofs need it: at the
+// default cpu_budget/memory_budget of 0, Marrow's canFitTemplate skips the
+// check entirely (`if opts.CPUBudget > 0 && ...`), so the deploy-gate kernel
+// can never return DenyCapacityFull and the branch under test is unreachable.
+func startEvolutionDowntimeExtra(t *testing.T, internalSecret string, extra map[string]any) (*CellHarness, *sql.DB) {
 	t.Helper()
 	setEvoBananagineStatus("running")
 	resetEvoEmails()
+
+	cellCfg := map[string]any{
+		"internal_secret":      internalSecret,
+		"frontend_url":         "https://sessions.gg",
+		"max_servers":          12,
+		"poll_interval":        "50ms",
+		"server_lifetime":      "336h",
+		"refund_threshold":     "10m",
+		"db_dialect":           "",
+		"r2_account_id":        "stub-account",
+		"r2_access_key_id":     "stub-key",
+		"r2_secret_access_key": "stub-secret",
+		"r2_bucket":            "stub-bucket",
+		// Non-empty so enqueueEmail does not short-circuit ("no API key").
+		"resend_api_key": "re_stub_downtime",
+		// bananagine_url left default (http://localhost:3000); the outbound
+		// stub answers by path suffix regardless of host.
+	}
+	for k, v := range extra {
+		cellCfg[k] = v
+	}
 
 	h := StartCellHTTP(t, CellHarnessConfig{
 		SourceDir: evolutionSourceDir(),
@@ -293,23 +323,7 @@ func startEvolutionDowntimeCfg(t *testing.T, internalSecret string) (*CellHarnes
 			"workers",
 			"entropy.read",
 		},
-		Config: map[string]any{
-			"internal_secret":      internalSecret,
-			"frontend_url":         "https://sessions.gg",
-			"max_servers":          12,
-			"poll_interval":        "50ms",
-			"server_lifetime":      "336h",
-			"refund_threshold":     "10m",
-			"db_dialect":           "",
-			"r2_account_id":        "stub-account",
-			"r2_access_key_id":     "stub-key",
-			"r2_secret_access_key": "stub-secret",
-			"r2_bucket":            "stub-bucket",
-			// Non-empty so enqueueEmail does not short-circuit ("no API key").
-			"resend_api_key": "re_stub_downtime",
-			// bananagine_url left default (http://localhost:3000); the outbound
-			// stub answers by path suffix regardless of host.
-		},
+		Config:              cellCfg,
 		CapabilityOverrides: evoDowntimeOverrides(),
 	})
 	warmEvolution(t, h)
