@@ -1,0 +1,14 @@
+# Go tooling is LF-only. With core.autocrlf=true (Git-for-Windows system
+# default) and no .gitattributes, checkouts rewrote source to CRLF, gofmt then
+# flagged whole files, and `git stash` became destructive. Unlike the sibling
+# repos whose blobs were already LF, Pulp had CRLF committed into history, so
+# this repo also needs a one-time `git add --renormalize .` alongside this file.
+#
+# eol=lf pins the working tree to LF regardless of core.autocrlf.
+*.go   text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
+*.wit  text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*.sh   text eol=lf
