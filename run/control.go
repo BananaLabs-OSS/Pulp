@@ -41,7 +41,7 @@ const (
 )
 
 type ctlRequest struct {
-	Op     string `msgpack:"op"`
+	Op   string `msgpack:"op"`
 	Cell string `msgpack:"cell,omitempty"`
 }
 
@@ -52,8 +52,8 @@ type ctlStatus struct {
 }
 
 type ctlResponse struct {
-	OK      bool        `msgpack:"ok,omitempty"`
-	Error   string      `msgpack:"error,omitempty"`
+	OK    bool        `msgpack:"ok,omitempty"`
+	Error string      `msgpack:"error,omitempty"`
 	Cells []ctlStatus `msgpack:"cells,omitempty"`
 }
 
