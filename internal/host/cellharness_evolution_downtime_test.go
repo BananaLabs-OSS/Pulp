@@ -136,6 +136,17 @@ func evoBananagineResponse(method, rawURL string) (uint32, []byte) {
 		return 200, []byte(`{"id":"00000000000000000009000005ccdde3"}`)
 	case strings.HasSuffix(path, "/health"):
 		return 200, []byte(`{}`)
+	case strings.HasSuffix(path, "/orchestration/stats"):
+		// nodeBudget's per-node capacity report. A node whose bananagine_url
+		// routes to the "budgetnode" host reports a REAL budget so the node-
+		// registry test can prove nodeBudget sums it; every other host (the
+		// default localhost the other proofs use) reports an empty object, i.e.
+		// cpu_budget/memory_budget 0 — byte-identical to the pre-registry stub,
+		// which had no /stats case and fell through to `{}`.
+		if strings.Contains(rawURL, "budgetnode") {
+			return 200, []byte(`{"node":{"cpu_budget":14,"memory_budget":48}}`)
+		}
+		return 200, []byte(`{}`)
 	case strings.HasSuffix(path, "/orchestration/servers"):
 		if method == "POST" {
 			// createContainer — 201 with an id/name/ip/ports so provision()
