@@ -241,6 +241,16 @@ func registerCrossApplicationImport(builder wazero.HostModuleBuilder, registry *
 			if errors.Is(err, errCrossApplicationDenied) {
 				return 11
 			}
+			slog.Default().Error(
+				"pulp_app_call_v1 failed",
+				"caller_app", caller.application.Identity,
+				"caller_cell", caller.cellAddress,
+				"target_app", string(app),
+				"target_instance", string(instance),
+				"target_cell", string(cell),
+				"provider", string(provider),
+				"err", err,
+			)
 			return 4
 		}
 		return writeSiblingResponse(ctx, module, response, responsePtrOut, responseLenOut)
