@@ -48,7 +48,16 @@ func LoadAll(paths []string) (*Set, error) {
 		}
 		specs = append(specs, spec)
 	}
+	return buildSet(specs)
+}
 
+// buildSet validates already-loaded cell specs as one deployment. App
+// manifests use this after injecting their verified orchestration script;
+// direct -manifest loading reaches the same validation through LoadAll.
+func buildSet(specs []*CellSpec) (*Set, error) {
+	if len(specs) == 0 {
+		return nil, fmt.Errorf("no manifests supplied")
+	}
 	// Duplicate cell names across the set.
 	byName := make(map[string]*CellSpec, len(specs))
 	for _, s := range specs {
@@ -56,6 +65,35 @@ func LoadAll(paths []string) (*Set, error) {
 			return nil, fmt.Errorf("duplicate cell name %q (in %s and %s)", s.Name, prev.ManifestPath, s.ManifestPath)
 		}
 		byName[s.Name] = s
+	}
+
+	// Every consumed value is an exact callable provider/function, not a cell
+	// alias or broad permission. It must resolve to exactly one provider so a
+	// caller never gains an implicit, order-dependent target. Runtime still
+	// requires the explicit target cell to declare the same provider.
+	providers := make(map[string][]string)
+	for _, s := range specs {
+		seen := make(map[string]struct{}, len(s.Provides))
+		for _, provider := range s.Provides {
+			if _, duplicate := seen[provider]; duplicate {
+				continue
+			}
+			seen[provider] = struct{}{}
+			providers[provider] = append(providers[provider], s.Name)
+		}
+	}
+	for _, s := range specs {
+		for _, consumed := range s.Consumes {
+			owners := providers[consumed]
+			switch len(owners) {
+			case 0:
+				return nil, fmt.Errorf("cell %q consumes %q but no cell provides that exact provider", s.Name, consumed)
+			case 1:
+				// Valid. Runtime still checks the explicitly named target cell.
+			default:
+				return nil, fmt.Errorf("cell %q consumes %q but it has ambiguous providers %s", s.Name, consumed, strings.Join(owners, ", "))
+			}
+		}
 	}
 
 	// Missing dependencies — every entry in depends_on must match a cell

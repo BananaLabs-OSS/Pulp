@@ -19,6 +19,10 @@ type Capability = ext.Capability
 // Stub functions run.
 func (p *Cell) Name() string { return p.name }
 
+// Scope returns the immutable application/cell placement assigned at Load.
+// It makes *Cell an ext.ScopedCell without changing the legacy ext.Cell API.
+func (p *Cell) Scope() ext.Scope { return p.scope }
+
 // A Registry collects the Capabilities that this Pulp host knows how to
 // provide. Some capabilities are always bound regardless of the manifest
 // (logging, entropy); others are only bound when declared explicitly

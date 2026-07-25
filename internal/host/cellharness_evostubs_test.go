@@ -477,6 +477,57 @@ func siblingStubCapability() ext.Capability {
 	return ext.Capability{Name: "pulp.sibling", Register: bind, Stub: bind}
 }
 
+// ---- cross-application call stub -----------------------------------------
+//
+// The current Pulp-Lua package imports pulp_app_call_v1 unconditionally so
+// one WASM artifact can run in both `pulp -host` and monolithic `pulp -app`
+// mode. Production binds the routed implementation in run. This single-cell
+// harness has no application graph, but current Evolution performs its
+// idempotent owner-import handoff during bootstrap, so the stub acknowledges
+// only those migration providers and fails every ordinary application call
+// closed.
+
+func crossApplicationHarnessStubCapability() ext.Capability {
+	bind := func(b wazero.HostModuleBuilder, _ ext.Cell) error {
+		appCall := func(ctx context.Context, module api.Module,
+			_, _,
+			_, _,
+			_, _,
+			providerPtr, providerLen,
+			_, _,
+			responsePtrOut, responseLenOut uint32) uint32 {
+			providerBytes, ok := module.Memory().Read(providerPtr, providerLen)
+			if !ok {
+				return 2
+			}
+			if !isLegacyOwnerImportProvider(string(providerBytes)) {
+				return 4
+			}
+			return writeStubMsgpack(ctx, module, map[string]any{"ok": true}, responsePtrOut, responseLenOut)
+		}
+		b.NewFunctionBuilder().WithFunc(appCall).Export("pulp_app_call_v1")
+		return nil
+	}
+	return ext.Capability{Name: "pulp.cross-application.v1", Register: bind, Stub: bind}
+}
+
+func isLegacyOwnerImportProvider(provider string) bool {
+	switch provider {
+	case "commerce.legacy.backfill.v1",
+		"fleet.v1.command.legacy.import",
+		"funding.v1.legacy.import",
+		"identity.v1.legacy.import.claim",
+		"identity.v1.legacy.import.verification",
+		"identity.v1.legacy.import.deletion",
+		"identity.v1.legacy.import.ban",
+		"identity.v1.legacy.import.suppression",
+		"control.v1.import_legacy_projection":
+		return true
+	default:
+		return false
+	}
+}
+
 // ---- http.outbound stub --------------------------------------------------
 //
 // transport.http.outbound's real ext makes live network calls behind a
@@ -555,6 +606,7 @@ func evolutionStubOverrides() []ext.Capability {
 		dockerStubCapability(),
 		workersStubCapability(),
 		siblingStubCapability(),
+		crossApplicationHarnessStubCapability(),
 		httpOutboundStubCapability(),
 	}
 }

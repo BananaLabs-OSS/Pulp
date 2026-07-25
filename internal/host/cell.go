@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/BananaLabs-OSS/Pulp/abi"
+	"github.com/BananaLabs-OSS/Pulp/ext"
 	"github.com/BananaLabs-OSS/Pulp/internal/manifest"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -85,8 +86,13 @@ func (l *Limits) callTimeout() time.Duration {
 // Cell is a single loaded WASM module with the three required Pulp exports.
 type Cell struct {
 	name    string
+	scope   ext.Scope
 	runtime wazero.Runtime
 	module  api.Module
+	// closeModule owns this cell's module lifetime. Legacy loads close their
+	// private runtime; cache-aware loads close only their module-cache lease so
+	// sibling instances can keep using the shared compilation runtime.
+	closeModule func(context.Context) error
 
 	initFn     api.Function
 	stepFn     api.Function
@@ -216,7 +222,20 @@ func sharedWazeroCache() wazero.CompilationCache {
 	return wazeroCache
 }
 
+// Load constructs a legacy name-scoped cell. New application runtimes should
+// use LoadScoped so extensions can isolate mutable resources by application
+// and instance as well as cell name.
 func Load(ctx context.Context, spec *manifest.CellSpec, registry *Registry, limits *Limits, logger *slog.Logger) (*Cell, error) {
+	return LoadScoped(ctx, spec, registry, limits, logger, ext.LegacyScope(spec.Name))
+}
+
+// LoadScoped reads a cell's WASM file and constructs it with its immutable
+// application/cell placement. The public Load function remains the compatible
+// legacy entry point for callers that do not yet have an application scope.
+func LoadScoped(ctx context.Context, spec *manifest.CellSpec, registry *Registry, limits *Limits, logger *slog.Logger, scope ext.Scope) (*Cell, error) {
+	if err := scope.Validate(); err != nil {
+		return nil, fmt.Errorf("cell scope: %w", err)
+	}
 	wasmBytes, err := os.ReadFile(spec.WASMPath)
 	if err != nil {
 		return nil, fmt.Errorf("read wasm: %w", err)
@@ -255,6 +274,7 @@ func Load(ctx context.Context, spec *manifest.CellSpec, registry *Registry, limi
 
 	p := &Cell{
 		name:        spec.Name,
+		scope:       scope,
 		runtime:     r,
 		callTimeout: limits.callTimeout(),
 		log:         logger.With("cell", spec.Name),
@@ -680,9 +700,14 @@ func (p *Cell) Close(ctx context.Context) error {
 	if p.runtime == nil {
 		return nil
 	}
-	err := p.runtime.Close(ctx)
+	closer := p.closeModule
+	if closer == nil {
+		closer = p.runtime.Close
+	}
+	err := closer(ctx)
 	p.runtime = nil
 	p.module = nil
+	p.closeModule = nil
 	p.initFn = nil
 	p.stepFn = nil
 	p.shutdownFn = nil

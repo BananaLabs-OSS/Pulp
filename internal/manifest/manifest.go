@@ -52,6 +52,10 @@ type CellSpec struct {
 	// Dependency graph inputs. Resolved by the dependency resolver (not here).
 	Provides []string
 	Consumes []string
+	// HostConsumes lists exact provider/functions this cell may call through
+	// pulp_app_call_v1. Unlike Consumes, these are resolved only by LoadHost
+	// against direct dependency applications.
+	HostConsumes []string
 
 	// DependsOn lists cell names (not capabilities) that must finish Init
 	// before this cell starts. The host refuses to boot on cycles or
@@ -107,6 +111,11 @@ type CellSpec struct {
 	// the manifest). If the field is absent, defaults to cell.wasm next
 	// to the manifest.
 	WASMPath string
+
+	// WASMSHA256 optionally pins the exact bytes of WASMPath. It is enforced
+	// when the cell is loaded as part of an application; an application can
+	// require this field for every cell with require_wasm_sha256 = true.
+	WASMSHA256 string
 }
 
 // raw mirrors the TOML schema exactly. It's the only struct BurntSushi/toml
@@ -117,10 +126,12 @@ type raw struct {
 	Name    string `toml:"name"`
 	Version string `toml:"version"`
 
-	WASM string `toml:"wasm"`
+	WASM       string  `toml:"wasm"`
+	WASMSHA256 *string `toml:"wasm_sha256"`
 
 	Provides     []string `toml:"provides"`
 	Consumes     []string `toml:"consumes"`
+	HostConsumes []string `toml:"host_consumes"`
 	DependsOn    []string `toml:"depends_on"`
 	Capabilities []string `toml:"capabilities"`
 
@@ -219,12 +230,25 @@ func normalize(r *raw, manifestPath string) (*CellSpec, error) {
 		wasmPath = filepath.Join(dir, wasmPath)
 	}
 
+	hostConsumes, err := normalizeHostConsumes(r.HostConsumes)
+	if err != nil {
+		return nil, err
+	}
+	wasmSHA256 := ""
+	if r.WASMSHA256 != nil {
+		wasmSHA256, err = normalizeSHA256(*r.WASMSHA256, "wasm_sha256")
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return &CellSpec{
 		SchemaVersion:      schemaVersion,
 		Name:               strings.TrimSpace(r.Name),
 		Version:            strings.TrimSpace(r.Version),
 		Provides:           dedupe(r.Provides),
 		Consumes:           dedupe(r.Consumes),
+		HostConsumes:       hostConsumes,
 		DependsOn:          dedupe(r.DependsOn),
 		Capabilities:       dedupe(lowerAll(r.Capabilities)),
 		SharedMemoryGroups: dedupe(r.SharedMemoryGroups),
@@ -236,7 +260,31 @@ func normalize(r *raw, manifestPath string) (*CellSpec, error) {
 		Config:             r.Config,
 		ManifestPath:       manifestPath,
 		WASMPath:           wasmPath,
+		WASMSHA256:         wasmSHA256,
 	}, nil
+}
+
+func normalizeHostConsumes(values []string) ([]string, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for index, value := range values {
+		normalized := strings.TrimSpace(value)
+		if normalized == "" {
+			return nil, fmt.Errorf("host_consumes[%d] must be a non-empty exact provider", index)
+		}
+		if normalized != value || strings.IndexFunc(normalized, func(r rune) bool { return r <= ' ' }) >= 0 {
+			return nil, fmt.Errorf("host_consumes[%d] %q must not contain whitespace", index, value)
+		}
+		if _, duplicate := seen[normalized]; duplicate {
+			return nil, fmt.Errorf("duplicate host_consumes provider %q", normalized)
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+	return out, nil
 }
 
 func lowerAll(in []string) []string {

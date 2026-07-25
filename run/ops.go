@@ -104,7 +104,7 @@ func (o *runtimeOps) shutdownCell(name string) error {
 		if !rt.declared[c.Name] || c.TeardownCell == nil {
 			continue
 		}
-		if err := c.TeardownCell(shutdownCtx, name); err != nil {
+		if err := c.TeardownCell(shutdownCtx, rt.eventTargetID()); err != nil {
 			o.logger.Warn("control: capability teardown_cell failed",
 				"cell", name, "capability", c.Name, "err", err)
 		}
@@ -275,7 +275,7 @@ func (o *runtimeOps) reloadCell(name string) error {
 		if !rt.declared[c.Name] || c.TeardownCell == nil {
 			continue
 		}
-		if err := c.TeardownCell(shutdownCtx, name); err != nil {
+		if err := c.TeardownCell(shutdownCtx, rt.eventTargetID()); err != nil {
 			o.logger.Warn("control: reload teardown_cell failed",
 				"cell", name, "capability", c.Name, "err", err)
 		}
@@ -306,7 +306,7 @@ func (o *runtimeOps) reloadCell(name string) error {
 		MaxMemoryPages: spec.MaxMemoryPages,
 		CallTimeout:    time.Duration(spec.CallTimeoutMS) * time.Millisecond,
 	}
-	cell, err := host.Load(rt.ctx, spec, o.registry, limits, o.logger)
+	cell, err := host.LoadScoped(rt.ctx, spec, o.registry, limits, o.logger, rt.effectiveScope())
 	if err != nil {
 		rt.failed.Store(true)
 		return fmt.Errorf("reload %q: load: %w", name, err)
@@ -317,6 +317,7 @@ func (o *runtimeOps) reloadCell(name string) error {
 		return fmt.Errorf("reload %q: init: %w", name, err)
 	}
 	rt.cell = cell
+	rt.eventTarget = ext.CellIDOf(cell)
 	rt.failed.Store(false)
 	rt.callNumber.Store(0)
 

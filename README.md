@@ -12,17 +12,45 @@ A minimal, universal application runtime. Go host, WASM cells, Docker-shaped bou
 go build -o pulp ./cmd/pulp
 ./pulp -manifest path/to/pulp.cell.toml
 ./pulp -manifest path/to/pulp.cell.toml -http-port 9090
+./pulp -app path/to/pulp.app.toml
 ```
 
 Send `SIGINT` (Ctrl+C) or `SIGTERM` to shut down. On Windows, `Ctrl+Break` works (the runtime listens for `SIGBREAK` too).
 
 Flags:
 
-- `-manifest` — path to `pulp.cell.toml` (required). May be repeated or comma-separated for multi-cell deployments.
+- `-manifest` — path to `pulp.cell.toml`. May be repeated or comma-separated for multi-cell deployments.
+- `-app` — path to one `pulp.app.toml` application composition. Cannot be combined with `-manifest`.
 - `-http-port` — HTTP / WS / SSE listener port (default `8080`). Used only when the cell declares an inbound transport capability. Overridden by `HTTP_PORT` env var.
 - `-storage-root` — root directory for cell-scoped storage (default `./data`). Each cell gets `{root}/{cell_name}/`.
 
 TLS is controlled by `HTTP_CERT` and `HTTP_KEY` environment variables (paths to PEM files), read by `Pulp-ext-http` during Setup — not by command-line flags.
+
+## Application manifests
+
+`pulp.app.toml` makes a named application from cell manifests plus one verified
+Lua orchestration script:
+
+```toml
+schema_version = 1
+name = "evolution"
+version = "2026.7.25"
+cells = [
+  "cells/sessions/pulp.cell.toml",
+  "cells/lua-orchestrator/pulp.cell.toml",
+  "cells/evolution/pulp.cell.toml",
+]
+
+[orchestrator]
+manifest = "cells/lua-orchestrator/pulp.cell.toml"
+script = "evolution.lua"
+sha256 = "64-lower-or-uppercase-hex-characters"
+```
+
+Every path must be relative to `pulp.app.toml`. The orchestrator manifest must
+also appear in `cells`. Pulp verifies the script SHA-256, injects its bytes as
+the orchestrator cell's `config.script`, then performs the same duplicate,
+dependency, and cycle validation used by repeated `-manifest` flags.
 
 ## Cell contract
 

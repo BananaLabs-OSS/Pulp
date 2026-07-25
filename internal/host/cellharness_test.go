@@ -206,6 +206,28 @@ func StartCellHTTP(t *testing.T, cfg CellHarnessConfig) *CellHarness {
 	for _, name := range cfg.Capabilities {
 		declared[name] = true
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &CellHarness{
+		URL:         fmt.Sprintf("http://127.0.0.1:%d", port),
+		client:      &http.Client{Timeout: 5 * time.Second},
+		cancel:      cancel,
+		t:           t,
+		httpCap:     httpCap,
+		StorageRoot: storageRoot,
+	}
+	for name, c := range caps {
+		if declared[name] && c.Teardown != nil {
+			h.teardownCaps = append(h.teardownCaps, c)
+		}
+	}
+
+	// Register cleanup before the first extension setup. Load and Init can fail
+	// after storage.sqlite/storage.fs or the HTTP listener have acquired
+	// process-global resources; without this early cleanup, the first failed
+	// harness poisons every later test with a stale storage root or listener.
+	t.Cleanup(h.stop)
+
 	for name, c := range caps {
 		if !declared[name] || c.Setup == nil {
 			continue
@@ -214,8 +236,6 @@ func StartCellHTTP(t *testing.T, cfg CellHarnessConfig) *CellHarness {
 			t.Fatalf("capability %q setup: %v", name, err)
 		}
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
 
 	spec := &manifest.CellSpec{
 		SchemaVersion: manifest.CurrentSchemaVersion,
@@ -233,37 +253,16 @@ func StartCellHTTP(t *testing.T, cfg CellHarnessConfig) *CellHarness {
 
 	configBytes, err := manifest.EncodeConfig(cfg.Config)
 	if err != nil {
-		cancel()
 		t.Fatalf("encode config: %v", err)
 	}
 
 	cell, err := Load(ctx, spec, registry, nil, logger)
 	if err != nil {
-		cancel()
 		t.Fatalf("load cell: %v", err)
 	}
+	h.cell = cell
 	if err := cell.Init(ctx, configBytes); err != nil {
-		cell.Close(context.Background())
-		cancel()
 		t.Fatalf("init cell: %v", err)
-	}
-
-	var teardownCaps []ext.Capability
-	for name, c := range caps {
-		if declared[name] && c.Teardown != nil {
-			teardownCaps = append(teardownCaps, c)
-		}
-	}
-
-	h := &CellHarness{
-		URL:          fmt.Sprintf("http://127.0.0.1:%d", port),
-		cell:         cell,
-		client:       &http.Client{Timeout: 5 * time.Second},
-		cancel:       cancel,
-		t:            t,
-		httpCap:      httpCap,
-		teardownCaps: teardownCaps,
-		StorageRoot:  storageRoot,
 	}
 
 	// Pump: poll the http capability for inbound requests, step them into
@@ -273,7 +272,6 @@ func StartCellHTTP(t *testing.T, cfg CellHarnessConfig) *CellHarness {
 	h.pumpWG.Add(1)
 	go h.pump(ctx)
 
-	t.Cleanup(h.stop)
 	return h
 }
 

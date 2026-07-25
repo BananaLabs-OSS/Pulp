@@ -269,6 +269,7 @@ func evoDowntimeOverrides() []ext.Capability {
 		s3StubCapability(),
 		dockerStubCapability(),
 		siblingStubCapability(),
+		crossApplicationHarnessStubCapability(),
 		evoBananagineOutboundStub(),
 		evoCapturingWorkersStub(),
 	}

@@ -68,7 +68,10 @@ import (
 
 // ---- gene wire types (mirror of Fiber/pulp/gene; see header) --------------
 
-const fnHandleRoute = "gene.handle_route"
+const (
+	fnHandleRoute   = "gene.handle_route"
+	fnOnServerReady = "gene.on_server_ready"
+)
 
 type geneHTTPRequest struct {
 	Method  string            `msgpack:"method"`
@@ -80,10 +83,81 @@ type geneHTTPRequest struct {
 }
 
 type geneHTTPResponse struct {
-	Status  uint32            `msgpack:"status"`
-	Headers map[string]string `msgpack:"headers,omitempty"`
-	Cookies []string          `msgpack:"cookies,omitempty"`
-	Body    []byte            `msgpack:"body,omitempty"`
+	Status   uint32              `msgpack:"status"`
+	Headers  map[string]string   `msgpack:"headers,omitempty"`
+	Cookies  []string            `msgpack:"cookies,omitempty"`
+	Body     []byte              `msgpack:"body,omitempty"`
+	Commands []geneEngineCommand `msgpack:"commands,omitempty"`
+}
+
+type geneEngineCommand struct {
+	ScheduleOrder      *geneScheduleOrder      `msgpack:"schedule_order,omitempty"`
+	UnscheduleOrder    *geneUnscheduleOrder    `msgpack:"unschedule_order,omitempty"`
+	SwapOrderTemplate  *geneSwapOrderTemplate  `msgpack:"swap_order_template,omitempty"`
+	UpdateOrderConfig  *geneUpdateOrderConfig  `msgpack:"update_order_config,omitempty"`
+	UpdateOrderUpgrade *geneUpdateOrderUpgrade `msgpack:"update_order_upgrade,omitempty"`
+	RedeemOrder        *geneRedeemOrder        `msgpack:"redeem_order,omitempty"`
+}
+
+type geneScheduleOrder struct {
+	OrderID         string `msgpack:"order_id"`
+	ScheduledAtUnix int64  `msgpack:"scheduled_at_unix"`
+	ServerType      string `msgpack:"server_type,omitempty"`
+	ExtendServerID  string `msgpack:"extend_server_id,omitempty"`
+	ExtendMode      string `msgpack:"extend_mode,omitempty"`
+}
+
+type geneUnscheduleOrder struct {
+	OrderID string `msgpack:"order_id"`
+}
+
+type geneSwapOrderTemplate struct {
+	OrderID        string `msgpack:"order_id"`
+	TargetTemplate string `msgpack:"target_template"`
+}
+
+type geneUpdateOrderConfig struct {
+	OrderID      string `msgpack:"order_id"`
+	Gamemode     string `msgpack:"gamemode"`
+	Difficulty   string `msgpack:"difficulty"`
+	PVP          string `msgpack:"pvp"`
+	Hardcore     string `msgpack:"hardcore"`
+	Seed         string `msgpack:"seed"`
+	WorldType    string `msgpack:"world_type"`
+	MOTD         string `msgpack:"motd"`
+	GameRules    string `msgpack:"game_rules"`
+	DatapackURLs string `msgpack:"datapack_urls"`
+}
+
+type geneUpdateOrderUpgrade struct {
+	OrderID    string `msgpack:"order_id"`
+	TierID     string `msgpack:"tier_id,omitempty"`
+	ServerType string `msgpack:"server_type,omitempty"`
+	IntentID   string `msgpack:"intent_id,omitempty"`
+	Target     string `msgpack:"target,omitempty"`
+}
+
+type geneRedeemOrder struct {
+	OrderID        string `msgpack:"order_id"`
+	ServerType     string `msgpack:"server_type"`
+	ExtendServerID string `msgpack:"extend_server_id,omitempty"`
+	ExtendMode     string `msgpack:"extend_mode,omitempty"`
+	Gamemode       string `msgpack:"gamemode,omitempty"`
+	Difficulty     string `msgpack:"difficulty,omitempty"`
+	PVP            string `msgpack:"pvp,omitempty"`
+	Hardcore       string `msgpack:"hardcore,omitempty"`
+	Seed           string `msgpack:"seed,omitempty"`
+	WorldType      string `msgpack:"world_type,omitempty"`
+	MOTD           string `msgpack:"motd,omitempty"`
+	GameRules      string `msgpack:"game_rules,omitempty"`
+	DatapackURLs   string `msgpack:"datapack_urls,omitempty"`
+	DatapackIDs    string `msgpack:"datapack_ids,omitempty"`
+	ModsJSON       string `msgpack:"mods_json,omitempty"`
+	UploadID       string `msgpack:"upload_id,omitempty"`
+	Username       string `msgpack:"username,omitempty"`
+	Whitelist      string `msgpack:"whitelist,omitempty"`
+	Engine         string `msgpack:"engine,omitempty"`
+	Version        string `msgpack:"version,omitempty"`
 }
 
 // ---- harness --------------------------------------------------------------
@@ -251,6 +325,22 @@ func (h *geneHarness) handleRoute(method, path string, params, query map[string]
 	return resp
 }
 
+// onServerReady drives the lifecycle hook over the same msgpack sibling wire
+// used by Evolution after it commits the engine-owned lifecycle transition.
+func (h *geneHarness) onServerReady(orderID, serverID string) {
+	h.t.Helper()
+	args, err := msgpack.Marshal(map[string]string{
+		"order_id":  orderID,
+		"server_id": serverID,
+	})
+	if err != nil {
+		h.t.Fatalf("marshal on-server-ready request: %v", err)
+	}
+	if _, err := h.cell.Call(context.Background(), fnOnServerReady, args); err != nil {
+		h.t.Fatalf("cell.Call(%s): %v", fnOnServerReady, err)
+	}
+}
+
 // seedOrder inserts a minimal order row (the gate only needs id/email/status).
 func (h *geneHarness) seedOrder(id, email, status string) {
 	h.t.Helper()
@@ -324,10 +414,12 @@ func sessionsGeneMutatingCases() []mutatingCase {
 			acceptSeedStatus: "paid", // wants "scheduled" -> 400 after gate
 		},
 		{
-			name:             "swap",
-			method:           "POST",
-			pathFor:          func(id string) string { return "/api/voucher/" + id + "/swap" },
-			body:             func(e string) map[string]any { return map[string]any{"email": e, "target_template": "minecraft-session"} },
+			name:    "swap",
+			method:  "POST",
+			pathFor: func(id string) string { return "/api/voucher/" + id + "/swap" },
+			body: func(e string) map[string]any {
+				return map[string]any{"email": e, "target_template": "minecraft-session"}
+			},
 			acceptSeedStatus: "paid", // wants "purchased"|"scheduled" -> 400 after gate
 		},
 		{

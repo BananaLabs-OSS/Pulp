@@ -100,6 +100,17 @@ func TestSessionsGene_VoucherUnschedule_Success(t *testing.T) {
 	if resp.Status != 200 {
 		t.Fatalf("unschedule scheduled voucher: want 200, got %d (%s)", resp.Status, resp.Body)
 	}
+	if len(resp.Commands) != 1 || resp.Commands[0].UnscheduleOrder == nil ||
+		resp.Commands[0].UnscheduleOrder.OrderID != id {
+		t.Fatalf("expected one unschedule engine command, got %#v", resp.Commands)
+	}
+	var status string
+	if err := h.db.QueryRow(`SELECT status FROM orders WHERE id = ?`, id).Scan(&status); err != nil {
+		t.Fatalf("read order: %v", err)
+	}
+	if status != "scheduled" {
+		t.Fatalf("gene mutated engine-owned order directly: status=%q", status)
+	}
 }
 
 // futureDate returns a YYYY-MM-DD safely in the future for schedule bodies.

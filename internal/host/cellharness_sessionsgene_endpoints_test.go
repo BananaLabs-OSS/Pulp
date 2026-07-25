@@ -20,6 +20,41 @@ import (
 	"time"
 )
 
+func TestSessionsGene_DeploySession_ReturnsEngineCommand(t *testing.T) {
+	h := startSessionsGene(t)
+	h.seedGeneTier("standard", "session", 1400, 0)
+	h.seedGeneGameVisibility("minecraft-session", "standard")
+	const id = "deploy-ok"
+	h.seedOrder(id, sgOwnerEmail, "purchased")
+
+	resp := h.handleRoute("POST", "/api/session/"+id+"/deploy", map[string]string{"id": id}, nil,
+		map[string]any{
+			"email":       sgOwnerEmail,
+			"server_type": "minecraft-session",
+			"gamemode":    "creative",
+			"motd":        "hello\nserver",
+		})
+	if resp.Status != 200 {
+		t.Fatalf("deploy success: want 200, got %d (%s)", resp.Status, resp.Body)
+	}
+	if len(resp.Commands) != 1 || resp.Commands[0].RedeemOrder == nil {
+		t.Fatalf("expected one redeem engine command, got %#v", resp.Commands)
+	}
+	command := resp.Commands[0].RedeemOrder
+	if command.OrderID != id || command.ServerType != "minecraft-session" ||
+		command.Gamemode != "creative" || command.MOTD != "helloserver" {
+		t.Fatalf("unexpected redeem command: %#v", command)
+	}
+
+	var status string
+	if err := h.db.QueryRow(`SELECT status FROM orders WHERE id = ?`, id).Scan(&status); err != nil {
+		t.Fatalf("read order: %v", err)
+	}
+	if status != "purchased" {
+		t.Fatalf("gene mutated engine-owned redeem state: status=%q", status)
+	}
+}
+
 // seedGeneGameVisibility inserts an enabled game_visibility row (pointing at
 // tierID for the pricing chain) so the gene's schedule/availability/swap
 // template checks resolve.
@@ -49,7 +84,8 @@ func (h *geneHarness) seedGeneTier(id, name string, priceCents int, sortOrder in
 
 // TestSessionsGene_VoucherSchedule_Success ports TestVoucherSchedule_Success:
 // a purchased voucher scheduled to a valid future date with a valid template ->
-// 200, order flipped to scheduled with scheduled_at set.
+// 200 with a typed engine command. The gene's isolated DB remains unchanged;
+// Evolution applies the command after the sibling call returns.
 func TestSessionsGene_VoucherSchedule_Success(t *testing.T) {
 	h := startSessionsGene(t)
 	h.seedGeneGameVisibility("minecraft", "standard")
@@ -62,15 +98,20 @@ func TestSessionsGene_VoucherSchedule_Success(t *testing.T) {
 		t.Fatalf("schedule success: want 200, got %d (%s)", resp.Status, resp.Body)
 	}
 
-	var status, scheduledAt string
-	if err := h.db.QueryRow(`SELECT status, scheduled_at FROM orders WHERE id = ?`, id).Scan(&status, &scheduledAt); err != nil {
+	if len(resp.Commands) != 1 || resp.Commands[0].ScheduleOrder == nil {
+		t.Fatalf("expected one schedule engine command, got %#v", resp.Commands)
+	}
+	command := resp.Commands[0].ScheduleOrder
+	if command.OrderID != id || command.ServerType != "minecraft" || command.ScheduledAtUnix <= 0 {
+		t.Fatalf("unexpected schedule command: %#v", command)
+	}
+
+	var status string
+	if err := h.db.QueryRow(`SELECT status FROM orders WHERE id = ?`, id).Scan(&status); err != nil {
 		t.Fatalf("read order: %v", err)
 	}
-	if status != "scheduled" {
-		t.Fatalf("expected status=scheduled, got %q", status)
-	}
-	if scheduledAt == "" {
-		t.Fatalf("expected scheduled_at set, got empty")
+	if status != "purchased" {
+		t.Fatalf("gene mutated engine-owned order directly: status=%q", status)
 	}
 }
 
@@ -100,6 +141,41 @@ func TestSessionsGene_VoucherSchedule_RejectsInvalidTemplate(t *testing.T) {
 	}
 }
 
+// --- config ---
+
+func TestSessionsGene_VoucherConfig_ReturnsEngineCommand(t *testing.T) {
+	h := startSessionsGene(t)
+	const id = "config-ok"
+	h.seedOrder(id, sgOwnerEmail, "purchased")
+
+	resp := h.handleRoute("POST", "/api/voucher/"+id+"/config", map[string]string{"id": id}, nil,
+		map[string]any{
+			"email":      sgOwnerEmail,
+			"gamemode":   "creative",
+			"motd":       "hello\nserver",
+			"game_rules": `{"keepInventory":true}`,
+		})
+	if resp.Status != 200 {
+		t.Fatalf("config success: want 200, got %d (%s)", resp.Status, resp.Body)
+	}
+	if len(resp.Commands) != 1 || resp.Commands[0].UpdateOrderConfig == nil {
+		t.Fatalf("expected one config engine command, got %#v", resp.Commands)
+	}
+	command := resp.Commands[0].UpdateOrderConfig
+	if command.OrderID != id || command.Gamemode != "creative" ||
+		command.MOTD != "helloserver" || command.GameRules != `{"keepInventory":true}` {
+		t.Fatalf("unexpected config command: %#v", command)
+	}
+
+	var motd string
+	if err := h.db.QueryRow(`SELECT COALESCE(motd, '') FROM orders WHERE id = ?`, id).Scan(&motd); err != nil {
+		t.Fatalf("read order: %v", err)
+	}
+	if motd != "" {
+		t.Fatalf("gene mutated engine-owned config directly: motd=%q", motd)
+	}
+}
+
 // --- unschedule ---
 
 // TestSessionsGene_VoucherUnschedule_ExpiredRejected ports
@@ -125,7 +201,7 @@ func TestSessionsGene_VoucherUnschedule_ExpiredRejected(t *testing.T) {
 
 // TestSessionsGene_VoucherSwap_FreeWhenNoUpcharge ports the free half of the
 // voucher-swap logic: a target template whose price is <= the voucher's paid
-// ceiling swaps inline (free:true) and updates server_type.
+// ceiling returns free:true plus a typed engine command.
 func TestSessionsGene_VoucherSwap_FreeWhenNoUpcharge(t *testing.T) {
 	h := startSessionsGene(t)
 	h.seedGeneGameVisibility("minecraft", "standard")
@@ -138,12 +214,19 @@ func TestSessionsGene_VoucherSwap_FreeWhenNoUpcharge(t *testing.T) {
 	if resp.Status != 200 {
 		t.Fatalf("swap free: want 200, got %d (%s)", resp.Status, resp.Body)
 	}
+	if len(resp.Commands) != 1 || resp.Commands[0].SwapOrderTemplate == nil {
+		t.Fatalf("expected one template-swap engine command, got %#v", resp.Commands)
+	}
+	command := resp.Commands[0].SwapOrderTemplate
+	if command.OrderID != id || command.TargetTemplate != "minecraft" {
+		t.Fatalf("unexpected template-swap command: %#v", command)
+	}
 	var serverType string
 	if err := h.db.QueryRow(`SELECT server_type FROM orders WHERE id = ?`, id).Scan(&serverType); err != nil {
 		t.Fatalf("read order: %v", err)
 	}
-	if serverType != "minecraft" {
-		t.Fatalf("expected server_type swapped to minecraft, got %q", serverType)
+	if serverType != "minecraft-session" {
+		t.Fatalf("gene mutated engine-owned server_type directly: %q", serverType)
 	}
 }
 
@@ -172,6 +255,34 @@ func TestSessionsGene_VoucherSwap_PaymentRequiredOnUpcharge(t *testing.T) {
 }
 
 // --- upgrade ---
+
+func TestSessionsGene_UpgradeSession_FreeReturnsEngineCommand(t *testing.T) {
+	h := startSessionsGene(t)
+	h.seedGeneTier("plus", "session-plus", 0, 1)
+	const id = "up-free"
+	h.seedOrder(id, sgOwnerEmail, "purchased")
+
+	resp := h.handleRoute("POST", "/api/session/"+id+"/upgrade", map[string]string{"id": id}, nil,
+		map[string]any{"email": sgOwnerEmail, "new_tier": "plus"})
+	if resp.Status != 200 {
+		t.Fatalf("free upgrade: want 200, got %d (%s)", resp.Status, resp.Body)
+	}
+	if len(resp.Commands) != 1 || resp.Commands[0].UpdateOrderUpgrade == nil {
+		t.Fatalf("expected one upgrade engine command, got %#v", resp.Commands)
+	}
+	command := resp.Commands[0].UpdateOrderUpgrade
+	if command.OrderID != id || command.TierID != "plus" || command.IntentID != "" {
+		t.Fatalf("unexpected free-upgrade command: %#v", command)
+	}
+
+	var tierID string
+	if err := h.db.QueryRow(`SELECT COALESCE(tier_id, '') FROM orders WHERE id = ?`, id).Scan(&tierID); err != nil {
+		t.Fatalf("read order: %v", err)
+	}
+	if tierID != "" {
+		t.Fatalf("gene mutated engine-owned upgrade state: tier_id=%q", tierID)
+	}
+}
 
 // TestSessionsGene_UpgradeSession_InvalidTier covers upgradeSession's tier
 // validation: an unknown target tier -> 400.

@@ -6,10 +6,11 @@
 // mutex so wazero never sees concurrent calls into the same module.
 //
 // The capability is always bound (no manifest declaration required) —
-// every cell can call sibling providers as long as its manifest
-// declares the target in `consumes`. Enforcement is manifest-level, not
-// runtime-gated, so the call is as cheap as a Go function call plus
-// two msgpack hops.
+// every cell can call sibling providers only when its manifest declares the
+// exact provider/function in `consumes`. `depends_on` is lifecycle ordering
+// only; it is never call authority. Enforcement is manifest-level, not
+// runtime-gated, so the call is as cheap as a Go function call plus two
+// msgpack hops.
 
 package run
 
@@ -25,8 +26,8 @@ import (
 )
 
 // siblingRegistry is the narrow view of the runtime the sibling-call
-// handler needs: lookup a cell by name and verify the caller is
-// allowed to reach it per manifest `consumes`.
+// handler needs: lookup a cell by name and verify the caller is allowed to
+// invoke an exact manifest-declared provider/function.
 type siblingRegistry struct {
 	runtimes map[string]*cellRuntime
 }
@@ -45,10 +46,23 @@ func newSiblingRegistry(runtimes map[string]*cellRuntime) *siblingRegistry {
 // as error code 99 ("host panic") so cell authors can distinguish it
 // from a normal error return.
 func siblingCapability(reg *siblingRegistry) ext.Capability {
+	return siblingCapabilityWithCrossApplication(reg, nil, HostedApplication{})
+}
+
+// siblingCapabilityWithCrossApplication binds the normal same-application
+// sibling wire and exactly one cross-application implementation into the one
+// `pulp` host module. A host module cannot export the same symbol twice, so
+// single-app mode gets the fail-closed compatibility stub here while `-host`
+// supplies the scoped implementation.
+func siblingCapabilityWithCrossApplication(reg *siblingRegistry, crossApplications *crossApplicationRegistry, application HostedApplication) ext.Capability {
 	return ext.Capability{
 		Name: "pulp.sibling", // always-bound; declaring in manifest is optional
 		Register: func(b wazero.HostModuleBuilder, cell ext.Cell) error {
-			caller := cell.Name()
+			caller := siblingCallerAddress(reg, cell)
+			crossCaller := crossApplicationCaller{application: application, cellAddress: caller}
+			if runtime := reg.runtimes[caller]; runtime != nil && runtime.spec != nil {
+				crossCaller.hostConsumes = append([]string(nil), runtime.spec.HostConsumes...)
+			}
 			b.NewFunctionBuilder().
 				WithFunc(func(ctx context.Context, m api.Module,
 					targetPtr, targetLen,
@@ -104,7 +118,10 @@ func siblingCapability(reg *siblingRegistry) ext.Capability {
 					return writeSiblingResponse(ctx, m, resp, respPtrOut, respLenOut)
 				}).
 				Export("pulp_call")
-			return nil
+			if crossApplications == nil {
+				return registerCrossApplicationUnavailableImport(b)
+			}
+			return registerCrossApplicationImport(b, crossApplications, crossCaller)
 		},
 		Stub: func(b wazero.HostModuleBuilder, _ ext.Cell) error {
 			b.NewFunctionBuilder().
@@ -112,14 +129,30 @@ func siblingCapability(reg *siblingRegistry) ext.Capability {
 					return 99
 				}).
 				Export("pulp_call")
-			return nil
+			return registerCrossApplicationUnavailableImport(b)
 		},
 	}
 }
 
-// allowedToCall checks the caller's manifest spec against the target.
-// Separated from siblingRegistry so the capability closure can call it
-// without generic-interface gymnastics.
+func siblingCallerAddress(reg *siblingRegistry, cell ext.Cell) string {
+	if reg == nil || cell == nil {
+		return ""
+	}
+	scope := ext.ScopeOf(cell)
+	if !scope.IsLegacy() {
+		for address, runtime := range reg.runtimes {
+			if runtime.effectiveScope().RoutingID() == scope.RoutingID() {
+				return address
+			}
+		}
+	}
+	return cell.Name()
+}
+
+// allowedToCall accepts only an exact function/provider declared by both the
+// caller (`consumes`) and target (`provides`). A `depends_on` edge orders Init
+// and does not authorize calls. This deliberately rejects broad placeholders
+// such as a cell name unless that string is itself a declared function name.
 func allowedToCall(reg *siblingRegistry, caller, target, funcName string) bool {
 	callerRT, ok := reg.runtimes[caller]
 	if !ok {
@@ -129,22 +162,15 @@ func allowedToCall(reg *siblingRegistry, caller, target, funcName string) bool {
 	if !ok {
 		return false
 	}
-	for _, d := range callerRT.spec.DependsOn {
-		if d == target {
+	return containsExact(callerRT.spec.Consumes, funcName) && containsExact(targetRT.spec.Provides, funcName)
+}
+
+func containsExact(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
 			return true
 		}
 	}
-	for _, c := range callerRT.spec.Consumes {
-		if c == target {
-			return true
-		}
-		for _, prov := range targetRT.spec.Provides {
-			if c == prov {
-				return true
-			}
-		}
-	}
-	_ = funcName
 	return false
 }
 
@@ -200,12 +226,15 @@ func writeSiblingResponse(ctx context.Context, m api.Module, resp []byte, respPt
 // slice means everything is wired up.
 func validateSiblingLinks(runtimes map[string]*cellRuntime) []string {
 	// Collect all provides by name → slice of provider cell names.
-	provided := map[string][]string{} // capability/provider → cell names
+	provided := map[string]map[string]struct{}{} // provider -> template cell names
 	names := map[string]bool{}
 	for _, rt := range runtimes {
 		names[rt.spec.Name] = true
 		for _, p := range rt.spec.Provides {
-			provided[p] = append(provided[p], rt.spec.Name)
+			if provided[p] == nil {
+				provided[p] = map[string]struct{}{}
+			}
+			provided[p][rt.spec.Name] = struct{}{}
 		}
 	}
 	var missing []string
@@ -216,15 +245,17 @@ func validateSiblingLinks(runtimes map[string]*cellRuntime) []string {
 			}
 		}
 		for _, c := range rt.spec.Consumes {
-			if names[c] {
-				continue
+			providers := provided[c]
+			switch len(providers) {
+			case 0:
+				missing = append(missing, fmt.Sprintf("%s consumes %s (no provider)", rt.spec.Name, c))
+			case 1:
+				// Runtime also checks the explicitly named target cell against this
+				// exact provider, so no implicit provider selection occurs.
+			default:
+				missing = append(missing, fmt.Sprintf("%s consumes %s (ambiguous provider templates: %v)", rt.spec.Name, c, providers))
 			}
-			if _, ok := provided[c]; ok {
-				continue
-			}
-			missing = append(missing, fmt.Sprintf("%s consumes %s (no provider)", rt.spec.Name, c))
 		}
 	}
 	return missing
 }
-

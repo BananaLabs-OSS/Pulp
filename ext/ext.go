@@ -54,10 +54,48 @@ type Cell interface {
 // it needs to initialize host-side resources (HTTP servers, databases,
 // filesystem roots, etc.).
 type SetupEnv struct {
-	CellName  string
+	// Scope identifies the application placement that owns resources created
+	// during setup. Zero retains the legacy CellName-derived namespace.
+	Scope Scope
+	// Endpoints receives lifecycle notices for host-visible endpoints created
+	// by this extension. Nil preserves legacy extension behavior: endpoint
+	// discovery is optional and extensions may operate without a host gateway.
+	Endpoints   EndpointReporter
+	CellName    string
 	StorageRoot string
 	Config      map[string]any
 	Logger      *slog.Logger
+}
+
+// Endpoint is a host-visible address owned by one scoped capability. Name
+// distinguishes a capability's endpoint roles (for example, "public" from a
+// future administration listener). Address is the actual bound address, not
+// merely a requested listen value, so it is valid when the host assigned port
+// zero dynamically.
+type Endpoint struct {
+	Scope      Scope
+	Capability string
+	Name       string
+	Address    string
+}
+
+// EndpointReporter is host-owned, concurrency-safe endpoint discovery. Ready
+// must reject an attempt to replace a live scoped endpoint with a different
+// owner or address. Gone is best-effort notification when that endpoint is no
+// longer available. A nil reporter means endpoint discovery is disabled.
+type EndpointReporter interface {
+	Ready(Endpoint) error
+	Gone(Endpoint)
+}
+
+// EffectiveScope returns the validated explicit setup scope when one was
+// supplied. Existing extensions that only populated CellName retain their
+// stable legacy namespace without any registration API change.
+func (env SetupEnv) EffectiveScope() Scope {
+	if err := env.Scope.Validate(); err == nil {
+		return env.Scope
+	}
+	return LegacyScope(env.CellName)
 }
 
 // StepEvent is a pending event an extension wants to deliver to the
@@ -75,10 +113,10 @@ type SetupEnv struct {
 // Extensions that do not yet populate CellID keep working with a
 // deprecation log from the host.
 type StepEvent struct {
-	Kind     string
-	Payload  []byte
-	ID       uint64
-	CellID string
+	Kind    string
+	Payload []byte
+	ID      uint64
+	CellID  string
 }
 
 // Capability is a named bundle of host imports plus optional
@@ -100,6 +138,11 @@ type Capability struct {
 
 	// Teardown is called on shutdown. Nil = no cleanup needed.
 	Teardown func(ctx context.Context) error
+
+	// TeardownScope releases resources belonging to exactly one application
+	// scope. Multi-application hosts prefer it over legacy process-wide
+	// Teardown so one application cannot tear down another's handles.
+	TeardownScope func(ctx context.Context, scope Scope) error
 
 	// Poll returns the next pending event from this extension, if
 	// any. The step loop calls Poll on every active extension each

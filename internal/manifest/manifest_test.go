@@ -1,6 +1,8 @@
 package manifest
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,6 +52,7 @@ wasm = "ant-farm.wasm"
 
 provides = ["game.tick", "game.state", "game.tick"]
 consumes = ["identity.verify"]
+host_consumes = ["remote.search.v1"]
 capabilities = ["Transport.HTTP", "entropy"]
 shared_memory_groups = ["core"]
 dedicated_thread = true
@@ -80,6 +83,9 @@ name = "hill-alpha"
 	if len(spec.Provides) != 2 {
 		t.Errorf("provides should dedupe: %v", spec.Provides)
 	}
+	if len(spec.HostConsumes) != 1 || spec.HostConsumes[0] != "remote.search.v1" {
+		t.Errorf("host_consumes = %v", spec.HostConsumes)
+	}
 	if spec.Capabilities[0] != "transport.http" {
 		t.Errorf("capabilities should be lowercased: %v", spec.Capabilities)
 	}
@@ -91,6 +97,53 @@ name = "hill-alpha"
 	}
 	if !strings.HasSuffix(spec.WASMPath, "ant-farm.wasm") {
 		t.Errorf("wasm path: %s", spec.WASMPath)
+	}
+}
+
+func TestLoadNormalizesWASMSHA256(t *testing.T) {
+	digest := sha256.Sum256([]byte("package bytes"))
+	path := writeManifest(t, fmt.Sprintf("\nname = \"pinned\"\nversion = \"1\"\nwasm_sha256 = \"%X\"\n", digest))
+	spec, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := fmt.Sprintf("%x", digest); spec.WASMSHA256 != want {
+		t.Fatalf("WASMSHA256 = %q, want %q", spec.WASMSHA256, want)
+	}
+
+	for _, value := range []string{"", "not-a-digest", strings.Repeat("a", 63)} {
+		path := writeManifest(t, fmt.Sprintf("\nname = \"invalid\"\nversion = \"1\"\nwasm_sha256 = %q\n", value))
+		if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "wasm_sha256") {
+			t.Fatalf("Load invalid wasm_sha256 %q error = %v", value, err)
+		}
+	}
+}
+
+func TestLoadHostConsumesValidatesSyntaxAndDuplicatesWithoutResolving(t *testing.T) {
+	standalone := writeManifest(t, `
+name = "caller"
+version = "1"
+host_consumes = ["orders.apply.v1"]
+`)
+	spec, err := Load(standalone)
+	if err != nil || len(spec.HostConsumes) != 1 {
+		t.Fatalf("standalone host_consumes load = %#v, %v", spec, err)
+	}
+	for _, test := range []struct {
+		name string
+		list string
+		want string
+	}{
+		{"duplicate", `["orders.apply.v1", "orders.apply.v1"]`, "duplicate host_consumes"},
+		{"blank", `[""]`, "non-empty exact provider"},
+		{"whitespace", `["orders apply"]`, "must not contain whitespace"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := writeManifest(t, "name = \"caller\"\nversion = \"1\"\nhost_consumes = "+test.list+"\n")
+			if _, err := Load(path); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 
