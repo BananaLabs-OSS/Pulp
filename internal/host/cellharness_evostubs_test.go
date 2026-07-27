@@ -417,13 +417,19 @@ func stripeRuntimeStubCapability() ext.Capability {
 			result := map[string]any{}
 			switch {
 			case strings.Contains(intent.Kind, "payment-intent.create"):
-				result = map[string]any{"id": "pi_stub_1200", "payment_intent": "pi_stub_1200", "client_secret": "pi_stub_secret", "status": "requires_capture"}
+				// Reservation promotion uses an off-session PaymentIntent and
+				// requires the provider status to be succeeded. Keep this fixture
+				// aligned with the existing controllable Stripe stub so tests can
+				// exercise both the decline and promotion branches.
+				result = map[string]any{"id": "pi_stub_1200", "payment_intent": "pi_stub_1200", "client_secret": "pi_stub_secret", "status": getStripeStubPIStatus()}
 			case strings.Contains(intent.Kind, "payment-intent.capture"):
 				result = map[string]any{"id": "pi_stub_1200", "payment_intent": "pi_stub_1200", "status": "succeeded"}
 			case strings.Contains(intent.Kind, "customer.create"):
 				result = map[string]any{"customer_id": "cus_stub_1"}
 			case strings.Contains(intent.Kind, "setup-intent.create"):
-				result = map[string]any{"id": "seti_stub_1", "client_secret": "seti_stub_secret", "customer": "cus_stub_1", "status": "requires_payment_method"}
+				result = map[string]any{"id": "seti_stub_1", "setup_intent_id": "seti_stub_1", "client_secret": "seti_stub_secret", "customer": "cus_stub_1", "payment_method": "pm_stub_card", "status": "succeeded"}
+			case strings.Contains(intent.Kind, "setup-intent.get"):
+				result = map[string]any{"id": "seti_stub_1", "setup_intent_id": "seti_stub_1", "customer": "cus_stub_1", "payment_method": "pm_stub_card", "status": "succeeded"}
 			case strings.Contains(intent.Kind, "invoice-item.create"):
 				result = map[string]any{"invoice_item_id": "ii_stub_1"}
 			case strings.Contains(intent.Kind, "invoice.create"):
@@ -440,6 +446,65 @@ func stripeRuntimeStubCapability() ext.Capability {
 		return nil
 	}
 	return ext.Capability{Name: "effect.stripe.runtime", Register: bind, Stub: bind}
+}
+
+// evoCapacityObservationBudget is a harness-only fixture for the narrow
+// capacity-observation extension. The real extension owns its connection to
+// Bananagine; this fixture exposes only the observed, provider-neutral facts
+// required by the composed Lua workflow.
+var evoCapacityObservationBudget = struct {
+	sync.RWMutex
+	cpu, memory int64
+}{cpu: 0, memory: 0}
+
+func setEvoCapacityObservationBudget(cpu, memory int64) {
+	evoCapacityObservationBudget.Lock()
+	evoCapacityObservationBudget.cpu, evoCapacityObservationBudget.memory = cpu, memory
+	evoCapacityObservationBudget.Unlock()
+}
+
+func capacityObservationStubCapability() ext.Capability {
+	bind := func(b wazero.HostModuleBuilder, _ ext.Cell) error {
+		execute := func(ctx context.Context, m api.Module, reqPtr, reqLen, op, ol uint32) uint32 {
+			var intent struct {
+				Version        string             `msgpack:"version"`
+				ID             string             `msgpack:"id"`
+				Kind           string             `msgpack:"kind"`
+				IdempotencyKey string             `msgpack:"idempotency_key"`
+				Payload        msgpack.RawMessage `msgpack:"payload"`
+			}
+			if !readStubMsgpack(m, reqPtr, reqLen, &intent) || intent.Version != "pulp.effect.v1" || intent.Kind != "pulp.effect.capacity-observation.execute.v1" || intent.ID == "" || intent.IdempotencyKey == "" {
+				return 3
+			}
+			var command struct {
+				Contract       string `msgpack:"contract"`
+				CommandID      string `msgpack:"command_id"`
+				IdempotencyKey string `msgpack:"idempotency_key"`
+			}
+			if err := msgpack.Unmarshal(intent.Payload, &command); err != nil || command.Contract != "capacity-observation.v1" || command.CommandID != intent.ID || command.IdempotencyKey != intent.IdempotencyKey {
+				return 4
+			}
+			evoCapacityObservationBudget.RLock()
+			cpu, memory := evoCapacityObservationBudget.cpu, evoCapacityObservationBudget.memory
+			evoCapacityObservationBudget.RUnlock()
+			quantity := func(cpu, memory int64) map[string]any {
+				return map[string]any{"version": "contracts.v1", "cpu_millicores": cpu, "memory_bytes": memory, "storage_bytes": int64(0)}
+			}
+			result := map[string]any{
+				"contract": command.Contract, "command_id": intent.ID, "idempotency_key": intent.IdempotencyKey,
+				"facts": []any{map[string]any{
+					"version": "contracts.v1", "node": map[string]any{"version": "contracts.v1", "id": map[string]any{"version": "contracts.v1", "value": "node-1"}},
+					"generation": int64(1), "observed_at": "2026-07-27T00:00:00Z",
+					"capacity": quantity(cpu, memory), "allocated": quantity(0, 0), "reserved": quantity(0, 0), "available": quantity(cpu, memory),
+				}},
+			}
+			receipt := map[string]any{"version": intent.Version, "intent_id": intent.ID, "kind": intent.Kind, "idempotency_key": intent.IdempotencyKey, "status": "completed", "result": result}
+			return writeStubMsgpack(ctx, m, receipt, op, ol)
+		}
+		b.NewFunctionBuilder().WithFunc(execute).Export("capacity_observation_execute")
+		return nil
+	}
+	return ext.Capability{Name: "effect.capacity.observation", Register: bind, Stub: bind}
 }
 
 // ---- s3 stub -------------------------------------------------------------

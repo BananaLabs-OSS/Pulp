@@ -57,7 +57,9 @@ package host
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -112,6 +114,124 @@ func evoBananagineOutboundStub() ext.Capability {
 		return nil
 	}
 	return ext.Capability{Name: "transport.http.outbound", Register: bind, Stub: bind}
+}
+
+// evoMinecraftProfileStub is the deterministic implementation of the narrow
+// identity.minecraft-profile.resolve capability used by the composed Evolution
+// harness. UUID resolution used to share transport.http.outbound, but it is now
+// intentionally brokered by Pulp-ext-http so a guest cannot choose an arbitrary
+// egress URL. Keep this separate from evoBananagineOutboundStub: production
+// continues to use the origin-bound profile authority while the harness has no
+// network dependency.
+func evoMinecraftProfileStub() ext.Capability {
+	bind := func(b wazero.HostModuleBuilder, _ ext.Cell) error {
+		resolve := func(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+			var request struct {
+				PlayerName string `msgpack:"player_name"`
+				Platform   string `msgpack:"platform"`
+			}
+			if !readStubMsgpack(m, reqPtr, reqLen, &request) {
+				return 3
+			}
+			if request.Platform == "java" && request.PlayerName == "Nobody" {
+				return 7 // Fiber profile.Resolve maps this to pulp.ErrNotFound.
+			}
+			var uuid string
+			switch request.Platform {
+			case "java":
+				uuid = "069a79f4-44e9-4726-a5be-fca90e38aaf5"
+			case "bedrock":
+				uuid = "00000000-0000-0000-0009-000005ccdde3"
+			default:
+				return 3
+			}
+			return writeStubMsgpack(ctx, m, struct {
+				UUID   string `msgpack:"uuid"`
+				Name   string `msgpack:"name"`
+				Source string `msgpack:"source"`
+			}{UUID: uuid, Name: request.PlayerName, Source: request.Platform}, respPtrOut, respLenOut)
+		}
+		b.NewFunctionBuilder().WithFunc(resolve).Export("minecraft_profile_resolve")
+		return nil
+	}
+	return ext.Capability{Name: "identity.minecraft-profile.resolve", Register: bind, Stub: bind}
+}
+
+// evoServerMutationEffectStub executes only a fenced whitelist-add claim for
+// the composed harness. It is intentionally narrower than production's
+// privileged extension: callers cannot supply an endpoint, credential, or
+// arbitrary operation.
+func evoServerMutationEffectStub() ext.Capability {
+	type opaqueRef struct {
+		Version string `msgpack:"version"`
+		Value   string `msgpack:"value"`
+	}
+	type fence struct {
+		Version string    `msgpack:"version"`
+		Intent  opaqueRef `msgpack:"intent"`
+		Lease   opaqueRef `msgpack:"lease"`
+		Attempt uint32    `msgpack:"attempt"`
+	}
+	type intent struct {
+		Payload []byte `msgpack:"payload"`
+	}
+	type lease struct {
+		Intent intent `msgpack:"intent"`
+		Fence  fence  `msgpack:"fence"`
+	}
+	type request struct {
+		Version string `msgpack:"version"`
+		Owner   string `msgpack:"owner"`
+		Claim   []byte `msgpack:"claim"`
+	}
+	bind := func(b wazero.HostModuleBuilder, _ ext.Cell) error {
+		execute := func(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+			var input request
+			if !readStubMsgpack(m, reqPtr, reqLen, &input) || input.Version != "server-mutation-host.v4" || input.Owner != "runtime-control" {
+				return 3
+			}
+			var claimed lease
+			if len(input.Claim) == 0 || msgpack.Unmarshal(input.Claim, &claimed) != nil {
+				return 4
+			}
+			var envelope struct {
+				Body struct {
+					Operation string `msgpack:"operation"`
+					Payload   struct {
+						Action   string `msgpack:"action"`
+						Name     string `msgpack:"name"`
+						UUID     string `msgpack:"uuid"`
+						Platform string `msgpack:"platform"`
+					} `msgpack:"payload"`
+				} `msgpack:"body"`
+			}
+			if len(claimed.Intent.Payload) == 0 || msgpack.Unmarshal(claimed.Intent.Payload, &envelope) != nil || envelope.Body.Operation != "minecraft.access.apply" || envelope.Body.Payload.Action != "whitelist.add" || envelope.Body.Payload.Name == "" || envelope.Body.Payload.UUID == "" || (envelope.Body.Payload.Platform != "java" && envelope.Body.Payload.Platform != "bedrock") {
+				return 4
+			}
+			added := envelope.Body.Payload.Name
+			if envelope.Body.Payload.Platform == "bedrock" {
+				added = "." + added
+			}
+			output, err := msgpack.Marshal(map[string]any{"version": "server-mutation-whitelist-result.v1", "kind": "whitelist.add", "status": "executed", "added": added, "uuid": envelope.Body.Payload.UUID})
+			if err != nil {
+				return 5
+			}
+			digest := sha256.Sum256(output)
+			completed := time.Now().UTC().Format(time.RFC3339Nano)
+			genericReceipt, err := msgpack.Marshal(map[string]any{"version": "contracts.v1", "fence": claimed.Fence, "succeeded": true, "output_sha256": hex.EncodeToString(digest[:]), "completed_at": completed})
+			if err != nil {
+				return 5
+			}
+			operationReceipt, err := msgpack.Marshal(map[string]any{"version": "contracts.v1", "operation": "minecraft.access.apply", "fence": claimed.Fence, "output": output, "output_sha256": hex.EncodeToString(digest[:]), "completed_at": completed})
+			if err != nil {
+				return 5
+			}
+			return writeStubMsgpack(ctx, m, map[string]any{"version": "server-mutation-host.v4", "owner": input.Owner, "generic_receipt": genericReceipt, "operation_receipt": operationReceipt}, respPtrOut, respLenOut)
+		}
+		b.NewFunctionBuilder().WithFunc(execute).Export("server_mutation_execute_v4")
+		return nil
+	}
+	return ext.Capability{Name: "effect.server-mutation.v4", Register: bind, Stub: bind}
 }
 
 // evoBananagineResponse mirrors the native fakeBananagine mux. Method is read
@@ -262,16 +382,18 @@ func evoCapturingWorkersStub() ext.Capability {
 }
 
 // evoDowntimeOverrides is the override set for the downtime harness: the shared
-// stripe/s3/docker/sibling stubs plus the controllable Bananagine outbound and
-// the email-capturing workers stub (both replace their ext.All() cap by name).
+// stripe/s3/docker/sibling stubs plus deterministic Bananagine, player identity,
+// and worker capabilities. Each replaces its matching host capability by name.
 func evoDowntimeOverrides() []ext.Capability {
 	return []ext.Capability{
 		stripeStubCapability(),
+		capacityObservationStubCapability(),
 		s3StubCapability(),
 		dockerStubCapability(),
 		siblingStubCapability(),
 		crossApplicationHarnessStubCapability(),
 		evoBananagineOutboundStub(),
+		evoMinecraftProfileStub(),
 		evoCapturingWorkersStub(),
 	}
 }
@@ -321,6 +443,18 @@ func startEvolutionDowntimeExtra(t *testing.T, internalSecret string, extra map[
 	for k, v := range extra {
 		cellCfg[k] = v
 	}
+	capacityCPU, capacityMemory := int64(0), int64(0)
+	if strings.Contains(fmt.Sprint(cellCfg["bananagine_url"]), "budgetnode") {
+		capacityCPU, capacityMemory = 14, 48
+	}
+	if v, ok := extra["cpu_budget"].(float64); ok && v >= 0 {
+		capacityCPU = int64(v)
+	}
+	if v, ok := extra["memory_budget"].(float64); ok && v >= 0 {
+		capacityMemory = int64(v)
+	}
+	setEvoCapacityObservationBudget(capacityCPU*1000, capacityMemory*(1024*1024*1024))
+	t.Cleanup(func() { setEvoCapacityObservationBudget(0, 0) })
 
 	h := StartEvolutionApplicationHTTP(t, CellHarnessConfig{
 		SourceDir: evolutionSourceDir(),
@@ -346,17 +480,28 @@ func startEvolutionDowntimeExtra(t *testing.T, internalSecret string, extra map[
 	if fleet := h.cellsByName["fleet"]; fleet != nil {
 		cpu := int64(8)
 		memory := int64(16384)
-		if v, ok := extra["cpu_budget"].(float64); ok && v > 0 { cpu = int64(v) }
-		if v, ok := extra["memory_budget"].(float64); ok && v > 0 { memory = int64(v) }
+		if strings.Contains(fmt.Sprint(cellCfg["bananagine_url"]), "budgetnode") {
+			cpu, memory = 14, 48
+		}
+		if v, ok := extra["cpu_budget"].(float64); ok && v > 0 {
+			cpu = int64(v)
+		}
+		if v, ok := extra["memory_budget"].(float64); ok && v > 0 {
+			memory = int64(v)
+		}
 		args, err := msgpack.Marshal(map[string]any{
-			"id": "harness-fleet-node-upsert",
+			"id":   "harness-fleet-node-upsert",
 			"node": map[string]any{"id": "node-1", "name": "Harness Fleet Node", "cpu_capacity": cpu, "cpu_capacity_millis": cpu * 1000, "memory_capacity": memory, "status": "active"},
 		})
-		if err != nil { t.Fatalf("encode Fleet harness node: %v", err) }
+		if err != nil {
+			t.Fatalf("encode Fleet harness node: %v", err)
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_, err = fleet.Call(ctx, "fleet.v1.command.node.upsert", args)
 		cancel()
-		if err != nil { t.Fatalf("seed Fleet harness node: %v", err) }
+		if err != nil {
+			t.Fatalf("seed Fleet harness node: %v", err)
+		}
 	}
 
 	// Match ext-sqlite's path byte-for-byte (filepath.Join). SQLite keys the
@@ -367,6 +512,12 @@ func startEvolutionDowntimeExtra(t *testing.T, internalSecret string, extra map[
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("open cell db: %v", err)
+	}
+	if strings.Contains(fmt.Sprint(cellCfg["bananagine_url"]), "budgetnode") {
+		if _, err := db.Exec(`UPDATE nodes SET cpu_budget=14,memory_budget=48 WHERE id='node-1'`); err != nil {
+			t.Fatalf("seed budget-node capacity: %v", err)
+		}
+		checkpoint(db)
 	}
 	db.SetMaxOpenConns(1)
 	for _, p := range []string{"PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=5000"} {

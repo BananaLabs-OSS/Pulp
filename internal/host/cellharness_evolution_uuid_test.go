@@ -16,17 +16,20 @@ package host
 // the assertion lands on the resolver's output.
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 // whitelistSecret opens the internal-auth'd /api/servers/* route group so the
 // whitelist-add flow (which is behind internalAuth) is reachable.
 const whitelistSecret = "wl-internal-secret"
 
-func seedWhitelistActiveServer(t *testing.T, db *sql.DB, id string) string {
+func seedWhitelistActiveServer(t *testing.T, h *CellHarness, db *sql.DB, id string) string {
 	t.Helper()
 	if _, err := db.Exec(
 		`INSERT INTO servers
@@ -37,6 +40,35 @@ func seedWhitelistActiveServer(t *testing.T, db *sql.DB, id string) string {
 		t.Fatalf("seed whitelist server: %v", err)
 	}
 	checkpoint(db)
+
+	// The public route is now a Lua composition over runtime-control rather
+	// than a native DB mutation. Seed the corresponding neutral owner state
+	// through its real provider so the test exercises identity resolution and
+	// the complete owner path instead of depending on a retired legacy mirror.
+	runtime := h.cellsByName["runtime-control"]
+	if runtime == nil {
+		t.Fatal("composed application did not load runtime-control")
+	}
+	ref := func(value string) map[string]any {
+		return map[string]any{"version": "contracts.v1", "value": value}
+	}
+	request := map[string]any{
+		"version":             "runtime-control.v1",
+		"workload":            map[string]any{"version": "contracts.v1", "id": ref(id)},
+		"node":                map[string]any{"version": "contracts.v1", "id": ref("node-1")},
+		"desired":             "running",
+		"expected_generation": uint64(0),
+		"id":                  ref("harness-whitelist-runtime-" + id),
+		"idempotency":         ref("harness-whitelist-runtime-" + id),
+		"requested_at":        time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	wire, err := msgpack.Marshal(request)
+	if err != nil {
+		t.Fatalf("encode runtime seed: %v", err)
+	}
+	if _, err := runtime.Call(context.Background(), "runtime-control.v1.desired.apply", wire); err != nil {
+		t.Fatalf("seed runtime owner for whitelist server: %v", err)
+	}
 	return id
 }
 
@@ -57,7 +89,7 @@ func postWhitelist(t *testing.T, h *CellHarness, serverID, name, platform string
 // UUID resolveJavaUUID produced.
 func TestEvolution_WhitelistAdd_ResolvesJavaUUID(t *testing.T) {
 	h, db := startEvolutionDowntimeCfg(t, whitelistSecret)
-	srvID := seedWhitelistActiveServer(t, db, "whitelist-java")
+	srvID := seedWhitelistActiveServer(t, h, db, "whitelist-java")
 
 	status, out := postWhitelist(t, h, srvID, "Notch", "java")
 	if status != 200 {
@@ -73,7 +105,7 @@ func TestEvolution_WhitelistAdd_ResolvesJavaUUID(t *testing.T) {
 // the whitelist-add handler surfaces 400 "Java player not found".
 func TestEvolution_WhitelistAdd_JavaPlayerNotFound(t *testing.T) {
 	h, db := startEvolutionDowntimeCfg(t, whitelistSecret)
-	srvID := seedWhitelistActiveServer(t, db, "whitelist-java-missing")
+	srvID := seedWhitelistActiveServer(t, h, db, "whitelist-java-missing")
 
 	status, out := postWhitelist(t, h, srvID, "Nobody", "java")
 	if status != 400 {
@@ -87,7 +119,7 @@ func TestEvolution_WhitelistAdd_JavaPlayerNotFound(t *testing.T) {
 // produced (the added name is dot-prefixed for Bedrock).
 func TestEvolution_WhitelistAdd_ResolvesBedrockUUID(t *testing.T) {
 	h, db := startEvolutionDowntimeCfg(t, whitelistSecret)
-	srvID := seedWhitelistActiveServer(t, db, "whitelist-bedrock")
+	srvID := seedWhitelistActiveServer(t, h, db, "whitelist-bedrock")
 
 	status, out := postWhitelist(t, h, srvID, "SirNiklas9369", "bedrock")
 	if status != 200 {
