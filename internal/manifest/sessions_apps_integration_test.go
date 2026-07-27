@@ -51,9 +51,13 @@ func TestSessionsSourceMonolithAndSplitCompositionsLoad(t *testing.T) {
 		t.Fatalf("LoadHost(%s): %v", hostPath, err)
 	}
 	if len(host.ApplicationOrder) != 3 ||
-		host.ApplicationOrder[0].ID != "minecraft-resolver" ||
-		host.ApplicationOrder[1].ID != "sessions" ||
+		host.ApplicationOrder[0].ID != "sessions" ||
+		host.ApplicationOrder[1].ID != "minecraft-resolver" ||
 		host.ApplicationOrder[2].ID != "evolution" {
 		t.Fatalf("host application order = %#v", host.ApplicationOrder)
+	}
+	if len(host.ApplicationOrder[1].DependsOn) != 1 ||
+		host.ApplicationOrder[1].DependsOn[0] != "sessions" {
+		t.Fatalf("resolver dependencies = %#v, want [sessions]", host.ApplicationOrder[1].DependsOn)
 	}
 }

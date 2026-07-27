@@ -16,13 +16,29 @@ package host
 // the assertion lands on the resolver's output.
 
 import (
+	"database/sql"
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 // whitelistSecret opens the internal-auth'd /api/servers/* route group so the
 // whitelist-add flow (which is behind internalAuth) is reachable.
 const whitelistSecret = "wl-internal-secret"
+
+func seedWhitelistActiveServer(t *testing.T, db *sql.DB, id string) string {
+	t.Helper()
+	if _, err := db.Exec(
+		`INSERT INTO servers
+		 (id, order_id, container_id, template, state, whitelist_json, created_at)
+		 VALUES (?, ?, ?, 'minecraft', 'active', '[]', ?)`,
+		id, "order-"+id, "container-"+id, time.Now().UTC(),
+	); err != nil {
+		t.Fatalf("seed whitelist server: %v", err)
+	}
+	checkpoint(db)
+	return id
+}
 
 // postWhitelist adds a player to a server's whitelist and returns status + body.
 // The route is internal-auth'd, so it carries the X-Internal-Secret header.
@@ -41,7 +57,7 @@ func postWhitelist(t *testing.T, h *CellHarness, serverID, name, platform string
 // UUID resolveJavaUUID produced.
 func TestEvolution_WhitelistAdd_ResolvesJavaUUID(t *testing.T) {
 	h, db := startEvolutionDowntimeCfg(t, whitelistSecret)
-	srvID, _, _, _ := provisionActiveServer(t, h, db, "wljava@example.com")
+	srvID := seedWhitelistActiveServer(t, db, "whitelist-java")
 
 	status, out := postWhitelist(t, h, srvID, "Notch", "java")
 	if status != 200 {
@@ -57,7 +73,7 @@ func TestEvolution_WhitelistAdd_ResolvesJavaUUID(t *testing.T) {
 // the whitelist-add handler surfaces 400 "Java player not found".
 func TestEvolution_WhitelistAdd_JavaPlayerNotFound(t *testing.T) {
 	h, db := startEvolutionDowntimeCfg(t, whitelistSecret)
-	srvID, _, _, _ := provisionActiveServer(t, h, db, "wlghost@example.com")
+	srvID := seedWhitelistActiveServer(t, db, "whitelist-java-missing")
 
 	status, out := postWhitelist(t, h, srvID, "Nobody", "java")
 	if status != 400 {
@@ -71,7 +87,7 @@ func TestEvolution_WhitelistAdd_JavaPlayerNotFound(t *testing.T) {
 // produced (the added name is dot-prefixed for Bedrock).
 func TestEvolution_WhitelistAdd_ResolvesBedrockUUID(t *testing.T) {
 	h, db := startEvolutionDowntimeCfg(t, whitelistSecret)
-	srvID, _, _, _ := provisionActiveServer(t, h, db, "wlbedrock@example.com")
+	srvID := seedWhitelistActiveServer(t, db, "whitelist-bedrock")
 
 	status, out := postWhitelist(t, h, srvID, "SirNiklas9369", "bedrock")
 	if status != 200 {

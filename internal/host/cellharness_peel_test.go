@@ -1,7 +1,7 @@
 package host
 
-// Cell HTTP harness against the REAL deployed Peel cell (UDP relay +
-// HTTP control API), pinning Peel's audit fixes.
+// Cell HTTP harness against the REAL deployed Peel application (UDP relay +
+// composed HTTP control API), pinning Peel's audit fixes.
 //
 // Peel needs network.udp (the relay binds an inbound UDP socket on init)
 // + transport.http.{inbound,outbound}. The harness blank-imports ext-udp;
@@ -38,21 +38,11 @@ func peelSourceDir() string {
 	return filepath.Join("..", "..", "..", "Peel", "pulp-cell")
 }
 
-// startPeel boots the Peel cell with the given service token. listen_addr
-// is an ephemeral loopback UDP port so the relay's inbound bind succeeds
-// without colliding with a real deployment's :5520. bananasplit_url is left
-// at its default; the auth gate + backend validation are decided before any
-// outbound lookup, so Bananasplit is never reached for these assertions.
+// startPeel boots the composed Peel application with the given service token.
+// Its relay uses an ephemeral loopback UDP port, and the API routes reach the
+// real API -> Lua -> owner/relay boundary without external backends.
 func startPeel(t *testing.T, serviceToken string) *CellHarness {
-	return StartCellHTTP(t, CellHarnessConfig{
-		SourceDir:    peelSourceDir(),
-		Name:         "peel",
-		Capabilities: []string{"transport.http.inbound", "transport.http.outbound", "network.udp"},
-		Config: map[string]any{
-			"service_token": serviceToken,
-			"listen_addr":   "127.0.0.1:0",
-		},
-	})
+	return startPeelApplicationHTTP(t, serviceToken)
 }
 
 func TestPeel_ControlAPIAuthEnforcedWhenTokenSet(t *testing.T) {

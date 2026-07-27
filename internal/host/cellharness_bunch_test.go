@@ -38,7 +38,7 @@ func startBunch(t *testing.T) *CellHarness {
 	return StartCellHTTP(t, CellHarnessConfig{
 		SourceDir:    bunchSourceDir(),
 		Name:         "bunch",
-		Capabilities: []string{"transport.http.inbound", "transport.ws.inbound", "storage.sqlite"},
+		Capabilities: []string{"transport.http.inbound", "transport.ws.inbound", "storage.sqlite", "entropy.read"},
 		Config: map[string]any{
 			"jwt_secret":     bunchJWTSecret,
 			"service_secret": "bunch-harness-service-secret",

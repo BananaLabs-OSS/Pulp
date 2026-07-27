@@ -98,9 +98,14 @@ type CellHarnessConfig struct {
 
 // CellHarness is a running cell with a real HTTP listener in front of it.
 type CellHarness struct {
-	URL    string // http://127.0.0.1:<port>
-	cell   *Cell
-	client *http.Client
+	URL   string // http://127.0.0.1:<port>
+	cell  *Cell
+	cells []*Cell
+	// cellsByName exposes authoritative package instances to composed
+	// compatibility tests so state assertions can use owner contracts instead
+	// of reaching into another package's persistence.
+	cellsByName map[string]*Cell
+	client      *http.Client
 
 	// StorageRoot is the temp dir shared by the declared storage caps. For a
 	// storage.sqlite cell the backing file is <StorageRoot>/<Name>/data.db —
@@ -112,11 +117,20 @@ type CellHarness struct {
 	pumpWG  sync.WaitGroup
 	t       *testing.T
 	httpCap ext.Capability
+	// beforeRequest lets a composed compatibility harness refresh one-way
+	// legacy state into its authoritative owner cells after a test seeds the
+	// legacy database and before the next HTTP request enters the application.
+	beforeRequest func() error
 	// teardownCaps are the declared capabilities (resolved, override-aware)
 	// whose Teardown must run on stop — e.g. storage.sqlite closing its
 	// per-cell *sql.DB so Windows can remove the TempDir-backed db file.
 	teardownCaps []ext.Capability
 }
+
+var cellBuildCache = struct {
+	sync.Mutex
+	wasm map[string][]byte
+}{wasm: map[string][]byte{}}
 
 // BuildCell compiles the cell at sourceDir to a wasip1/wasm module and
 // returns the output path. The binary is written under t.TempDir so it is
@@ -129,6 +143,14 @@ func BuildCell(t *testing.T, sourceDir string) string {
 		t.Fatalf("resolve source dir: %v", err)
 	}
 	out := filepath.Join(t.TempDir(), "cell.wasm")
+	cellBuildCache.Lock()
+	defer cellBuildCache.Unlock()
+	if cached, ok := cellBuildCache.wasm[abs]; ok {
+		if err := os.WriteFile(out, cached, 0o600); err != nil {
+			t.Fatalf("stage cached cell %s: %v", sourceDir, err)
+		}
+		return out
+	}
 	// -buildmode=c-shared produces a wasip1 REACTOR (exports _initialize +
 	// keeps the module alive) rather than a command (_start → main → exit).
 	// Pulp cells are reactors: pulp_init/step/on_call are called repeatedly
@@ -142,6 +164,11 @@ func BuildCell(t *testing.T, sourceDir string) string {
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("build cell %s to wasm: %v\n%s", sourceDir, err, stderr.String())
 	}
+	wasm, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("cache built cell %s: %v", sourceDir, err)
+	}
+	cellBuildCache.wasm[abs] = wasm
 	return out
 }
 
@@ -322,7 +349,14 @@ func (h *CellHarness) step(ctx context.Context, callNum uint64, kind string, pay
 func (h *CellHarness) stop() {
 	h.cancel()
 	h.pumpWG.Wait()
-	if h.cell != nil {
+	if len(h.cells) != 0 {
+		for index := len(h.cells) - 1; index >= 0; index-- {
+			_ = h.cells[index].Shutdown(context.Background())
+			_ = h.cells[index].Close(context.Background())
+		}
+		h.cells = nil
+		h.cell = nil
+	} else if h.cell != nil {
 		_ = h.cell.Shutdown(context.Background())
 		_ = h.cell.Close(context.Background())
 	}
@@ -338,6 +372,11 @@ func (h *CellHarness) stop() {
 // be supplied via the headers map. Body may be nil.
 func (h *CellHarness) Do(method, path string, headers map[string]string, body []byte) (status int, respBody []byte) {
 	h.t.Helper()
+	if h.beforeRequest != nil {
+		if err := h.beforeRequest(); err != nil {
+			h.t.Fatalf("refresh composed owner state before %s %s: %v", method, path, err)
+		}
+	}
 	var rdr io.Reader
 	if body != nil {
 		rdr = bytes.NewReader(body)

@@ -39,7 +39,6 @@ package host
 //   - wallet-index PG boot path (postgres dialect index DDL).
 
 import (
-	"encoding/json"
 	"net/http"
 	"path/filepath"
 	"testing"
@@ -82,7 +81,7 @@ func evolutionSourceDir() string {
 // bananagine_url / minecraft_sidecar_url are left empty so bootstrap skips the
 // reachability probe + sidecar warmup (no outbound calls at Init).
 func startEvolution(t *testing.T, internalSecret string) *CellHarness {
-	return StartCellHTTP(t, CellHarnessConfig{
+	return StartEvolutionApplicationHTTP(t, CellHarnessConfig{
 		SourceDir: evolutionSourceDir(),
 		Name:      "evolution",
 		Capabilities: []string{
@@ -100,17 +99,17 @@ func startEvolution(t *testing.T, internalSecret string) *CellHarness {
 			// it is unnecessary and keeps the harness honest about what runs.
 		},
 		Config: map[string]any{
-			"internal_secret":     internalSecret,
-			"frontend_url":        "https://sessions.gg",
-			"max_servers":         12,
-			"poll_interval":       "15s",
-			"server_lifetime":     "336h",
-			"refund_threshold":    "10m",
-			"db_dialect":          "", // sqlite dialect (ext-sqlite backend)
-			"r2_account_id":       "stub-account",
-			"r2_access_key_id":    "stub-key",
+			"internal_secret":      internalSecret,
+			"frontend_url":         "https://sessions.gg",
+			"max_servers":          12,
+			"poll_interval":        "15s",
+			"server_lifetime":      "336h",
+			"refund_threshold":     "10m",
+			"db_dialect":           "", // sqlite dialect (ext-sqlite backend)
+			"r2_account_id":        "stub-account",
+			"r2_access_key_id":     "stub-key",
 			"r2_secret_access_key": "stub-secret",
-			"r2_bucket":           "stub-bucket",
+			"r2_bucket":            "stub-bucket",
 		},
 		CapabilityOverrides: evolutionStubOverrides(),
 	})
@@ -226,74 +225,16 @@ func TestEvolution_FinalizeThrottleSharedAcrossAssets(t *testing.T) {
 	}
 }
 
-// poolCreateResp / contributeResp decode the JSON the pool endpoints return.
-type poolCreateResp struct {
-	PoolToken      string `json:"pool_token"`
-	ContributionID string `json:"contribution_id"`
-}
-
-// createSessionPool drives POST /api/pool/create for a session pool (no
-// server_type => session pool; quantity sets the target). Returns the pool
-// token + the creator contribution id. The stripe stub mints the creator PI.
-func createSessionPool(t *testing.T, h *CellHarness, email string) poolCreateResp {
-	t.Helper()
-	body, _ := json.Marshal(map[string]any{
-		"email":        email,
-		"username":     "creator",
-		"quantity":     1,
-		"amount_cents": 1200,
-	})
-	status, b := h.Do("POST", "/api/pool/create",
-		map[string]string{"Content-Type": "application/json"}, body)
-	if status != 200 {
-		t.Fatalf("POST /api/pool/create: want 200, got %d (%s)", status, b)
-	}
-	var out poolCreateResp
-	if err := json.Unmarshal(b, &out); err != nil {
-		t.Fatalf("decode pool create resp: %v (%s)", err, b)
-	}
-	if out.PoolToken == "" || out.ContributionID == "" {
-		t.Fatalf("pool create returned empty token/contribution: %s", b)
-	}
-	return out
-}
-
-// TestEvolution_PoolConfirmRejectsUnauthorizedPI pins the /confirm PI-verify
-// fix (router.go:5010). The stripe stub returns a PI whose status is NOT
-// requires_capture; /confirm must reject 400 "payment not authorized" rather
-// than crediting the pool on a trusted-client flag.
+// TestEvolution_PoolConfirmRejectsUnauthorizedPI pins the receipt-driven
+// confirmation gate. A completed host receipt whose PaymentIntent is not
+// requires_capture must not settle or credit the Funding aggregate.
 func TestEvolution_PoolConfirmRejectsUnauthorizedPI(t *testing.T) {
-	// Stub all PIs to an un-authorized status BEFORE booting so the creator
-	// PI minted at pool-create also carries it.
-	setStripeStubPIStatus("requires_payment_method")
-	defer setStripeStubPIStatus("requires_capture")
-
-	h := startEvolution(t, "")
-	warmEvolution(t, h)
-	pool := createSessionPool(t, h, "reject@example.com")
-
-	confirmBody, _ := json.Marshal(map[string]string{"contribution_id": pool.ContributionID})
-	status, b := h.Do("POST", "/api/pool/"+pool.PoolToken+"/confirm",
-		map[string]string{"Content-Type": "application/json"}, confirmBody)
-	if status != 400 {
-		t.Fatalf("pool confirm with non-requires_capture PI: want 400 (payment not authorized), got %d (%s)", status, b)
-	}
+	exercisePoolConfirmationEffectStatus(t, "reject-confirm", "requires_payment_method", false)
 }
 
-// TestEvolution_PoolConfirmAcceptsAuthorizedPI is the positive half: with the
-// stub PI in requires_capture, /confirm passes the audit gate (credits the
-// pool — 200). Proves the 400 above is the PI-status check firing, not a
-// blanket reject.
+// TestEvolution_PoolConfirmAcceptsAuthorizedPI is the positive half: the exact
+// fenced requires_capture receipt settles, and a later HTTP request projects
+// the confirmed Funding state.
 func TestEvolution_PoolConfirmAcceptsAuthorizedPI(t *testing.T) {
-	setStripeStubPIStatus("requires_capture") // explicit (default), for clarity
-	h := startEvolution(t, "")
-	warmEvolution(t, h)
-	pool := createSessionPool(t, h, "accept@example.com")
-
-	confirmBody, _ := json.Marshal(map[string]string{"contribution_id": pool.ContributionID})
-	status, b := h.Do("POST", "/api/pool/"+pool.PoolToken+"/confirm",
-		map[string]string{"Content-Type": "application/json"}, confirmBody)
-	if status != 200 {
-		t.Fatalf("pool confirm with requires_capture PI: want 200 (gate passed), got %d (%s)", status, b)
-	}
+	exercisePoolConfirmationEffectStatus(t, "accept-confirm", "requires_capture", true)
 }

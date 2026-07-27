@@ -178,9 +178,18 @@ func Load(path string) (*CellSpec, error) {
 	if undecoded := meta.Undecoded(); len(undecoded) > 0 {
 		names := make([]string, 0, len(undecoded))
 		for _, k := range undecoded {
-			names = append(names, k.String())
+			// Config is intentionally free-form. BurntSushi/TOML records nested
+			// map descendants as undecoded even after placing them in Config;
+			// only reject unknown manifest schema fields outside that boundary.
+			name := k.String()
+			if name == "config" || strings.HasPrefix(name, "config.") {
+				continue
+			}
+			names = append(names, name)
 		}
-		return nil, fmt.Errorf("unknown manifest fields: %s", strings.Join(names, ", "))
+		if len(names) > 0 {
+			return nil, fmt.Errorf("unknown manifest fields: %s", strings.Join(names, ", "))
+		}
 	}
 
 	spec, err := normalize(&r, abs)

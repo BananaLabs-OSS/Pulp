@@ -3,7 +3,9 @@ package run
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +16,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/BananaLabs-OSS/Pulp/abi"
 	"github.com/BananaLabs-OSS/Pulp/ext"
@@ -67,9 +70,10 @@ func TestEvolutionApplicationDispatchesRealLuaRoute(t *testing.T) {
 	if len(applications) != 3 {
 		t.Fatalf("host applications = %d, want 3", len(applications))
 	}
-	if applications[0].Identity != (ApplicationIdentity{ApplicationID: "minecraft-resolver", InstanceID: "primary"}) ||
-		applications[1].Identity != (ApplicationIdentity{ApplicationID: "sessions", InstanceID: "primary"}) ||
+	if applications[0].Identity != (ApplicationIdentity{ApplicationID: "sessions", InstanceID: "primary"}) ||
+		applications[1].Identity != (ApplicationIdentity{ApplicationID: "minecraft-resolver", InstanceID: "primary"}) ||
 		applications[2].Identity != (ApplicationIdentity{ApplicationID: "evolution", InstanceID: "primary"}) ||
+		len(applications[1].DependsOn) != 1 || applications[1].DependsOn[0] != "sessions" ||
 		len(applications[2].DependsOn) != 2 ||
 		applications[2].DependsOn[0] != "minecraft-resolver" ||
 		applications[2].DependsOn[1] != "sessions" {
@@ -98,9 +102,20 @@ func TestEvolutionApplicationDispatchesRealLuaRoute(t *testing.T) {
 		))
 	}
 
-	seedEvolutionControlProjection(t, ctx, started[1].cells["control"].cell)
+	var sessions, evolution *evolutionHostedApplication
+	for _, application := range started {
+		switch application.application.Identity.ApplicationID {
+		case "sessions":
+			sessions = application
+		case "evolution":
+			evolution = application
+		}
+	}
+	if sessions == nil || evolution == nil || sessions.cells["control"] == nil {
+		t.Fatalf("started applications do not expose Sessions control and Evolution: %#v", started)
+	}
+	seedEvolutionControlProjection(t, ctx, sessions.cells["control"].cell)
 
-	evolution := started[2]
 	assertEvolutionLuaCrossApplicationRoute(t, ctx, evolution.cells["lua-orchestrator"].cell)
 	baseAddress, ok := endpoints.ApplicationAddress("evolution", "primary", "transport.http.inbound", "public")
 	if !ok {
@@ -252,6 +267,34 @@ func assertEvolutionLuaCrossApplicationRoute(t *testing.T, ctx context.Context, 
 	}
 	if geneResponse.Status != http.StatusOK || !json.Valid(geneResponse.Body) || !strings.Contains(string(geneResponse.Body), "tier-compose-smoke") {
 		t.Fatalf("Evolution Lua forwarded route = status %d body %s", geneResponse.Status, geneResponse.Body)
+	}
+}
+
+// TestEvolutionApplicationMonolithFixtureCoversDeclaredCellsAndCapabilities
+// keeps the real-app harness aligned with the production all-in-one
+// composition. Every declared cell must have a concrete source and every
+// declared capability must be available through its explicit test-host ABI.
+func TestEvolutionApplicationMonolithFixtureCoversDeclaredCellsAndCapabilities(t *testing.T) {
+	workspace, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("resolve workspace: %v", err)
+	}
+	composition, err := manifest.LoadApp(filepath.Join(workspace, "Evolution", "pulp-cell", "pulp.app.toml"))
+	if err != nil {
+		t.Fatalf("load monolithic Evolution application: %v", err)
+	}
+	sources := evolutionApplicationCellSources(workspace)
+	capabilities := evolutionAppCapabilities()
+	for _, spec := range composition.Cells.Order {
+		if source := sources[spec.Name]; source == "" {
+			t.Errorf("monolith cell %q has no fixture source", spec.Name)
+		}
+		for _, name := range spec.Capabilities {
+			capability, ok := capabilities[name]
+			if !ok || capability.Register == nil || capability.Stub == nil {
+				t.Errorf("monolith cell %q capability %q = %#v", spec.Name, name, capability)
+			}
+		}
 	}
 }
 
@@ -414,18 +457,19 @@ func writeEvolutionSessionsHost(t *testing.T, workspace string) string {
 name = "evolution-sessions-real-integration"
 
 [[applications]]
-id = "minecraft-resolver"
-manifest = %q
-aliases = ["primary"]
-storage_namespace = "minecraft-resolver"
-event_namespace = "minecraft-resolver"
-
-[[applications]]
 id = "sessions"
 manifest = %q
 aliases = ["primary"]
 storage_namespace = "sessions"
 event_namespace = "sessions"
+
+[[applications]]
+id = "minecraft-resolver"
+manifest = %q
+aliases = ["primary"]
+storage_namespace = "minecraft-resolver"
+event_namespace = "minecraft-resolver"
+depends_on = ["sessions"]
 
 [[applications]]
 id = "evolution"
@@ -434,7 +478,7 @@ aliases = ["primary"]
 storage_namespace = "evolution"
 event_namespace = "evolution"
 depends_on = ["minecraft-resolver", "sessions"]
-`, filepath.ToSlash(resolverRelative), filepath.ToSlash(sessionsRelative), filepath.ToSlash(evolutionRelative))
+`, filepath.ToSlash(sessionsRelative), filepath.ToSlash(resolverRelative), filepath.ToSlash(evolutionRelative))
 	if err := os.WriteFile(hostPath, []byte(content), 0o600); err != nil {
 		t.Fatalf("write temporary host manifest: %v", err)
 	}
@@ -443,17 +487,31 @@ depends_on = ["minecraft-resolver", "sessions"]
 
 func evolutionApplicationCellSources(workspace string) map[string]string {
 	return map[string]string{
-		"jvm-jre-detect":     filepath.Join(workspace, "minecraft-resolver", "jvm-jre-detect"),
-		"minecraft-resolver": filepath.Join(workspace, "minecraft-resolver", "pulp-cell"),
-		"sessions":           filepath.Join(workspace, "Sessions-Gene", "pulp-cell"),
-		"commerce":           filepath.Join(workspace, "Evolution", "commerce"),
-		"fleet":              filepath.Join(workspace, "Evolution", "fleet"),
-		"funding":            filepath.Join(workspace, "Evolution", "funding"),
-		"identity":           filepath.Join(workspace, "Evolution", "identity"),
-		"control":            filepath.Join(workspace, "Evolution", "control"),
-		"effects":            filepath.Join(workspace, "Evolution", "effects"),
-		"lua-orchestrator":   filepath.Join(workspace, "Pulp-Lua", "pulp-cell"),
-		"evolution":          filepath.Join(workspace, "Evolution", "pulp-cell"),
+		"jvm-jre-detect":             filepath.Join(workspace, "minecraft-resolver", "jvm-jre-detect"),
+		"minecraft-resolver":         filepath.Join(workspace, "minecraft-resolver", "pulp-cell"),
+		"sessions":                   filepath.Join(workspace, "Sessions-Gene", "composition-cell"),
+		"commerce":                   filepath.Join(workspace, "Evolution", "commerce"),
+		"fleet":                      filepath.Join(workspace, "Evolution", "fleet"),
+		"funding":                    filepath.Join(workspace, "Evolution", "funding"),
+		"identity":                   filepath.Join(workspace, "Evolution", "identity"),
+		"control":                    filepath.Join(workspace, "Evolution", "control"),
+		"effects":                    filepath.Join(workspace, "Evolution", "effects"),
+		"public-upload":              filepath.Join(workspace, "Evolution", "public-upload"),
+		"exact-object-upload":        filepath.Join(workspace, "Evolution", "exact-object-upload"),
+		"artifact-validator":         filepath.Join(workspace, "Evolution", "artifact-validator"),
+		"configuration-registry":     filepath.Join(workspace, "Evolution", "configuration-registry"),
+		"fixed-window-counter":       filepath.Join(workspace, "Evolution", "fixed-window-counter"),
+		"workload-inventory":         filepath.Join(workspace, "Evolution", "workload-inventory"),
+		"capacity-scheduler":         filepath.Join(workspace, "Evolution", "capacity-scheduler"),
+		"workload-provisioning":      filepath.Join(workspace, "Evolution", "workload-provisioning"),
+		"runtime-control":            filepath.Join(workspace, "Evolution", "runtime-control"),
+		"artifact-lifecycle":         filepath.Join(workspace, "Evolution", "artifact-lifecycle"),
+		"archive-lifecycle":          filepath.Join(workspace, "Evolution", "archive-lifecycle"),
+		"observation-registry":       filepath.Join(workspace, "Evolution", "observation-registry"),
+		"notification-outbox":        filepath.Join(workspace, "Evolution", "notification-outbox"),
+		"minecraft-profile-resolver": filepath.Join(workspace, "Evolution", "minecraft-profile-resolver"),
+		"lua-orchestrator":           filepath.Join(workspace, "Pulp-Lua", "pulp-cell"),
+		"evolution":                  filepath.Join(workspace, "Evolution", "pulp-cell"),
 	}
 }
 
@@ -630,6 +688,13 @@ func evolutionAppBackendStubs() []ext.Capability {
 		builder.NewFunctionBuilder().WithFunc(unavailable2).Export("stripe_webhook_verify")
 		return nil
 	}
+	// Effects uses a separate, one-operation Stripe runtime ABI. Do not reuse
+	// the broad payment.stripe fixture because that would conceal a capability
+	// boundary drift in the production composition.
+	stripeEffectRuntime := func(builder wazero.HostModuleBuilder, _ ext.Cell) error {
+		builder.NewFunctionBuilder().WithFunc(unavailable4).Export("stripe_effect_execute")
+		return nil
+	}
 	s3 := func(builder wazero.HostModuleBuilder, _ ext.Cell) error {
 		for _, name := range []string{"s3_presign", "s3_presign_put", "s3_head", "s3_get", "s3_list", "s3_put_multipart_init", "s3_put_multipart_part"} {
 			builder.NewFunctionBuilder().WithFunc(unavailable4).Export(name)
@@ -656,10 +721,903 @@ func evolutionAppBackendStubs() []ext.Capability {
 		builder.NewFunctionBuilder().WithFunc(result).Export("workers_result")
 		return nil
 	}
+	// The public-upload owner itself is SQLite-only. Its companion adapters
+	// declare three distinct exact-object capabilities; expose only their real
+	// narrow import names here, never generic storage.s3. The unavailable result
+	// is intentional in this route/composition harness.
+	exactObjectPublicUpload := func(builder wazero.HostModuleBuilder, _ ext.Cell) error {
+		for _, name := range []string{"s3_exact_object_presign_put", "s3_exact_object_validate_put", "s3_exact_object_delete"} {
+			builder.NewFunctionBuilder().WithFunc(unavailable4).Export(name)
+		}
+		return nil
+	}
+	exactObjectDownloadReference := func(builder wazero.HostModuleBuilder, _ ext.Cell) error {
+		builder.NewFunctionBuilder().WithFunc(unavailable4).Export("s3_exact_object_download_reference")
+		return nil
+	}
+	artifactValidation := func(builder wazero.HostModuleBuilder, _ ext.Cell) error {
+		builder.NewFunctionBuilder().WithFunc(unavailable4).Export("s3_exact_object_validate_artifact_zip")
+		return nil
+	}
+	fleetRuntime := func(builder wazero.HostModuleBuilder, _ ext.Cell) error {
+		execute := func(ctx context.Context, module api.Module, requestPtr, requestLen, responsePtrOut, responseLenOut uint32) uint32 {
+			if module == nil || module.Memory() == nil {
+				return 2
+			}
+			request, ok := module.Memory().Read(requestPtr, requestLen)
+			if !ok {
+				return 2
+			}
+			var intent evolutionAppFleetRuntimeIntent
+			if err := msgpack.Unmarshal(request, &intent); err != nil {
+				return 3
+			}
+			result, ok := evolutionAppFleetRuntimeResult(intent)
+			if !ok {
+				return 4
+			}
+			receipt := evolutionAppFleetRuntimeReceipt{
+				Version:        "pulp.effect.v1",
+				IntentID:       intent.ID,
+				Kind:           intent.Kind,
+				IdempotencyKey: intent.IdempotencyKey,
+				Status:         "completed",
+				Result:         result,
+			}
+			return writeEvolutionAppMsgpack(ctx, module, receipt, responsePtrOut, responseLenOut)
+		}
+		builder.NewFunctionBuilder().WithFunc(execute).Export("fleet_effect_execute")
+		return nil
+	}
+	// Fleet observations are a separate, deliberately narrower host surface
+	// from lifecycle effects. Keep the test host ABI-identical to the declared
+	// capability so application loading cannot silently fall back to a broader
+	// runtime/Docker capability.
+	fleetObservation := func(builder wazero.HostModuleBuilder, _ ext.Cell) error {
+		execute := func(ctx context.Context, module api.Module, requestPtr, requestLen, responsePtrOut, responseLenOut uint32) uint32 {
+			if module == nil || module.Memory() == nil {
+				return 2
+			}
+			request, ok := module.Memory().Read(requestPtr, requestLen)
+			if !ok {
+				return 2
+			}
+			envelope, observation, ok := evolutionAppFleetObservationRequest(request)
+			if !ok {
+				return 3
+			}
+			data, ok := evolutionAppFleetObservationData(observation.Field)
+			if !ok {
+				return 4
+			}
+			result, err := msgpack.Marshal(struct {
+				Contract       string `msgpack:"contract"`
+				ServerID       string `msgpack:"server_id"`
+				NodeID         string `msgpack:"node_id"`
+				ContainerID    string `msgpack:"container_id"`
+				Field          string `msgpack:"field"`
+				Generation     string `msgpack:"generation"`
+				SourceRevision string `msgpack:"source_revision"`
+				ObservedAt     string `msgpack:"observed_at"`
+				Data           any    `msgpack:"data"`
+			}{observation.Contract, observation.ServerID, observation.NodeID, observation.ContainerID, observation.Field, observation.Generation, observation.SourceRevision, "2026-07-26T12:00:00Z", data})
+			if err != nil {
+				return 5
+			}
+			receipt := evolutionAppFleetRuntimeReceipt{Version: envelope.Version, IntentID: envelope.ID, Kind: envelope.Kind, IdempotencyKey: envelope.IdempotencyKey, Status: "completed", Result: result}
+			return writeEvolutionAppMsgpack(ctx, module, receipt, responsePtrOut, responseLenOut)
+		}
+		builder.NewFunctionBuilder().WithFunc(execute).Export("fleet_observation_execute")
+		return nil
+	}
+	statusSignal := func(builder wazero.HostModuleBuilder, _ ext.Cell) error {
+		publish := func(ctx context.Context, module api.Module, requestPtr, requestLen, responsePtrOut, responseLenOut uint32) uint32 {
+			if module == nil || module.Memory() == nil {
+				return 2
+			}
+			request, ok := module.Memory().Read(requestPtr, requestLen)
+			if !ok {
+				return 2
+			}
+			receipt, ok := evolutionAppStatusSignalReceipt(request)
+			if !ok {
+				return 4
+			}
+			return writeEvolutionAppMsgpack(ctx, module, receipt, responsePtrOut, responseLenOut)
+		}
+		builder.NewFunctionBuilder().WithFunc(publish).Export("status_signal_publish")
+		return nil
+	}
+	// Test-only host fixture for the exact authenticated service-observation
+	// ABI. It accepts only Fiber's bounded opaque-definition command and
+	// returns the canonical typed receipt; it owns no URL, credentials, or
+	// generic transport surface.
+	serviceObservation := func(builder wazero.HostModuleBuilder, _ ext.Cell) error {
+		execute := func(ctx context.Context, module api.Module, requestPtr, requestLen, responsePtrOut, responseLenOut uint32) uint32 {
+			if module == nil || module.Memory() == nil {
+				return 2
+			}
+			request, ok := module.Memory().Read(requestPtr, requestLen)
+			if !ok {
+				return 2
+			}
+			receipt, ok := evolutionAppServiceObservationReceipt(request)
+			if !ok {
+				return 4
+			}
+			return writeEvolutionAppMsgpack(ctx, module, receipt, responsePtrOut, responseLenOut)
+		}
+		builder.NewFunctionBuilder().WithFunc(execute).Export("service_observation_execute")
+		return nil
+	}
+	// Test-only host fixture for Fiber's exact fenced HTTP-probe ABI. It
+	// accepts no URL, method, headers, timeout, or body configuration from the
+	// guest and returns deterministic bounded evidence. Production hosts use
+	// the separately configured Pulp-ext-http capability.
+	httpProbe := func(builder wazero.HostModuleBuilder, _ ext.Cell) error {
+		execute := func(ctx context.Context, module api.Module, requestPtr, requestLen, responsePtrOut, responseLenOut uint32) uint32 {
+			if module == nil || module.Memory() == nil {
+				return 2
+			}
+			request, ok := module.Memory().Read(requestPtr, requestLen)
+			if !ok {
+				return 2
+			}
+			receipt, ok := evolutionAppHTTPProbeReceiptFor(request)
+			if !ok {
+				return 4
+			}
+			return writeEvolutionAppMsgpack(ctx, module, receipt, responsePtrOut, responseLenOut)
+		}
+		builder.NewFunctionBuilder().WithFunc(execute).Export("http_probe_execute")
+		return nil
+	}
+	// The server-mutation bridge is a closed deployment-owned host ABI. The
+	// composition fixture exposes its exact import shape but deliberately
+	// returns unavailable: route tests must not acquire mutation authority.
+	serverMutation := func(builder wazero.HostModuleBuilder, _ ext.Cell) error {
+		builder.NewFunctionBuilder().WithFunc(
+			func(context.Context, api.Module, uint32, uint32, uint32, uint32) uint32 { return 99 },
+		).Export("server_mutation_execute_v4")
+		return nil
+	}
+	capacityObservation := func(builder wazero.HostModuleBuilder, _ ext.Cell) error {
+		builder.NewFunctionBuilder().WithFunc(unavailable4).Export("capacity_observation_execute")
+		return nil
+	}
 	return []ext.Capability{
 		{Name: "payment.stripe", Register: stripe, Stub: stripe},
+		{Name: "effect.stripe.runtime", Register: stripeEffectRuntime, Stub: stripeEffectRuntime},
 		{Name: "storage.s3", Register: s3, Stub: s3},
 		{Name: "spawn.docker", Register: docker, Stub: docker},
 		{Name: "workers", Register: workers, Stub: workers},
+		{Name: "storage.s3.public-upload.v1", Register: exactObjectPublicUpload, Stub: exactObjectPublicUpload},
+		{Name: "storage.s3.exact-object-download-reference.v1", Register: exactObjectDownloadReference, Stub: exactObjectDownloadReference},
+		{Name: "storage.s3.artifact-validation.v1", Register: artifactValidation, Stub: artifactValidation},
+		{Name: "effect.fleet.runtime", Register: fleetRuntime, Stub: fleetRuntime},
+		{Name: "effect.fleet.observation", Register: fleetObservation, Stub: fleetObservation},
+		{Name: "effect.capacity.observation", Register: capacityObservation, Stub: capacityObservation},
+		{Name: "effect.status.signal", Register: statusSignal, Stub: statusSignal},
+		{Name: "effect.service.observation", Register: serviceObservation, Stub: serviceObservation},
+		{Name: "effect.http.probe.v1", Register: httpProbe, Stub: httpProbe},
+		{Name: "effect.server-mutation.v4", Register: serverMutation, Stub: serverMutation},
+	}
+}
+
+type evolutionAppFleetRuntimeIntent struct {
+	Version        string             `msgpack:"version"`
+	ID             string             `msgpack:"id"`
+	Kind           string             `msgpack:"kind"`
+	IdempotencyKey string             `msgpack:"idempotency_key"`
+	Payload        msgpack.RawMessage `msgpack:"payload"`
+}
+
+type evolutionAppFleetRuntimeReceipt struct {
+	Version        string             `msgpack:"version"`
+	IntentID       string             `msgpack:"intent_id"`
+	Kind           string             `msgpack:"kind"`
+	IdempotencyKey string             `msgpack:"idempotency_key"`
+	Status         string             `msgpack:"status"`
+	Result         msgpack.RawMessage `msgpack:"result"`
+}
+
+type evolutionAppFleetObservationIntent struct {
+	Contract       string `msgpack:"contract"`
+	ServerID       string `msgpack:"server_id"`
+	NodeID         string `msgpack:"node_id"`
+	ContainerID    string `msgpack:"container_id"`
+	Field          string `msgpack:"field"`
+	Generation     string `msgpack:"generation"`
+	SourceRevision string `msgpack:"source_revision"`
+}
+
+func evolutionAppFleetObservationRequest(raw []byte) (evolutionAppFleetRuntimeIntent, evolutionAppFleetObservationIntent, bool) {
+	var envelopeFields map[string]msgpack.RawMessage
+	if err := msgpack.Unmarshal(raw, &envelopeFields); err != nil || len(envelopeFields) != 5 {
+		return evolutionAppFleetRuntimeIntent{}, evolutionAppFleetObservationIntent{}, false
+	}
+	for name := range envelopeFields {
+		switch name {
+		case "version", "id", "kind", "idempotency_key", "payload":
+		default:
+			return evolutionAppFleetRuntimeIntent{}, evolutionAppFleetObservationIntent{}, false
+		}
+	}
+	var envelope evolutionAppFleetRuntimeIntent
+	if err := msgpack.Unmarshal(raw, &envelope); err != nil || envelope.Version != "pulp.effect.v1" ||
+		envelope.Kind != "pulp.effect.fleet.runtime-observation.execute.v1" ||
+		!evolutionAppCanonicalEffectField(envelope.ID) || !evolutionAppCanonicalEffectField(envelope.IdempotencyKey) {
+		return evolutionAppFleetRuntimeIntent{}, evolutionAppFleetObservationIntent{}, false
+	}
+	var payloadFields map[string]msgpack.RawMessage
+	if err := msgpack.Unmarshal(envelope.Payload, &payloadFields); err != nil || len(payloadFields) != 7 {
+		return evolutionAppFleetRuntimeIntent{}, evolutionAppFleetObservationIntent{}, false
+	}
+	for name := range payloadFields {
+		switch name {
+		case "contract", "server_id", "node_id", "container_id", "field", "generation", "source_revision":
+		default:
+			return evolutionAppFleetRuntimeIntent{}, evolutionAppFleetObservationIntent{}, false
+		}
+	}
+	var observation evolutionAppFleetObservationIntent
+	if err := msgpack.Unmarshal(envelope.Payload, &observation); err != nil || observation.Contract != "fleet.live-observation.v1" ||
+		!evolutionAppCanonicalEffectField(observation.ServerID) || !evolutionAppCanonicalEffectField(observation.NodeID) ||
+		!evolutionAppCanonicalEffectField(observation.ContainerID) || !evolutionAppCanonicalEffectField(observation.Generation) ||
+		observation.SourceRevision != observation.Generation {
+		return evolutionAppFleetRuntimeIntent{}, evolutionAppFleetObservationIntent{}, false
+	}
+	return envelope, observation, true
+}
+
+func evolutionAppFleetObservationData(field string) (map[string]any, bool) {
+	switch field {
+	case "settings":
+		return map[string]any{"settings": map[string]string{}}, true
+	case "gamerules":
+		return map[string]any{"gamerules": map[string]string{}}, true
+	case "player_history":
+		return map[string]any{"player_history": []any{}}, true
+	case "access_snapshot":
+		return map[string]any{"access_snapshot": map[string]any{"whitelist": []any{}, "operators": []any{}, "bans": []any{}}}, true
+	case "artifacts":
+		return map[string]any{"artifacts": []any{}}, true
+	default:
+		return nil, false
+	}
+}
+
+type evolutionAppStatusSignalPayload struct {
+	Target        string `msgpack:"target"`
+	Signal        string `msgpack:"signal"`
+	Detail        string `msgpack:"detail"`
+	ExpiresAtUnix int64  `msgpack:"expires_at_unix"`
+}
+
+type evolutionAppStatusSignalResult struct {
+	Target        string `msgpack:"target"`
+	Signal        string `msgpack:"signal"`
+	ExpiresAtUnix int64  `msgpack:"expires_at_unix"`
+}
+
+type evolutionAppServiceObservationFence struct {
+	LeaseID        string `msgpack:"lease_id"`
+	Attempt        uint32 `msgpack:"attempt"`
+	LeaseExpiresAt string `msgpack:"lease_expires_at"`
+}
+
+type evolutionAppServiceObservationCommand struct {
+	Contract            string                              `msgpack:"contract"`
+	ServiceDefinitionID string                              `msgpack:"service_definition_id"`
+	CommandID           string                              `msgpack:"command_id"`
+	IdempotencyKey      string                              `msgpack:"idempotency_key"`
+	Fence               evolutionAppServiceObservationFence `msgpack:"fence"`
+	ObservedAt          string                              `msgpack:"observed_at"`
+}
+
+type evolutionAppServiceObservationValue struct {
+	Status     string `msgpack:"status"`
+	Message    string `msgpack:"message,omitempty"`
+	HTTPStatus uint16 `msgpack:"http_status,omitempty"`
+	Evidence   string `msgpack:"evidence"`
+	ObservedAt string `msgpack:"observed_at"`
+}
+
+type evolutionAppServiceObservationResult struct {
+	Contract            string                              `msgpack:"contract"`
+	ServiceDefinitionID string                              `msgpack:"service_definition_id"`
+	CommandID           string                              `msgpack:"command_id"`
+	IdempotencyKey      string                              `msgpack:"idempotency_key"`
+	Fence               evolutionAppServiceObservationFence `msgpack:"fence"`
+	Observation         evolutionAppServiceObservationValue `msgpack:"observation"`
+}
+
+type evolutionAppHTTPProbeIntent struct {
+	Version        string `msgpack:"version"`
+	IntentID       string `msgpack:"intent_id"`
+	IdempotencyKey string `msgpack:"idempotency_key"`
+	Fence          string `msgpack:"fence"`
+	Destination    string `msgpack:"destination"`
+}
+
+type evolutionAppHTTPProbeReceipt struct {
+	Version        string `msgpack:"version"`
+	IntentID       string `msgpack:"intent_id"`
+	IdempotencyKey string `msgpack:"idempotency_key"`
+	Fence          string `msgpack:"fence"`
+	Destination    string `msgpack:"destination"`
+	Transport      string `msgpack:"transport"`
+	HTTPStatus     uint16 `msgpack:"http_status"`
+	BodyBytes      uint32 `msgpack:"body_bytes"`
+	BodySHA256     string `msgpack:"body_sha256,omitempty"`
+}
+
+func evolutionAppFleetRuntimeResult(intent evolutionAppFleetRuntimeIntent) (msgpack.RawMessage, bool) {
+	if intent.Version != "pulp.effect.v1" || strings.TrimSpace(intent.ID) == "" ||
+		strings.TrimSpace(intent.IdempotencyKey) == "" {
+		return nil, false
+	}
+	var fields map[string]msgpack.RawMessage
+	if err := msgpack.Unmarshal(intent.Payload, &fields); err != nil {
+		return nil, false
+	}
+	allowed := map[string]bool{"server_id": true, "node_id": true, "container_id": true, "reason": true}
+	status := "deprovisioned"
+	switch intent.Kind {
+	case "pulp.effect.fleet.server.deprovision.v1":
+	case "pulp.effect.fleet.extension.apply.v1":
+		allowed["extension"] = true
+		allowed["rcon_action"] = true
+		status = "save_flushed"
+	default:
+		return nil, false
+	}
+	values := make(map[string]string, len(fields))
+	for name, raw := range fields {
+		if !allowed[name] {
+			return nil, false
+		}
+		var value string
+		if err := msgpack.Unmarshal(raw, &value); err != nil {
+			return nil, false
+		}
+		values[name] = value
+	}
+	for _, name := range []string{"server_id", "node_id", "container_id"} {
+		if value := values[name]; strings.TrimSpace(value) == "" || value != strings.TrimSpace(value) {
+			return nil, false
+		}
+	}
+	if intent.Kind == "pulp.effect.fleet.extension.apply.v1" &&
+		(values["extension"] != "rcon" || values["rcon_action"] != "save_flush") {
+		return nil, false
+	}
+	result, err := msgpack.Marshal(map[string]string{
+		"server_id": values["server_id"], "node_id": values["node_id"], "container_id": values["container_id"], "status": status,
+	})
+	if err != nil {
+		return nil, false
+	}
+	return result, true
+}
+
+func evolutionAppStatusSignalReceipt(request []byte) (evolutionAppFleetRuntimeReceipt, bool) {
+	var intent evolutionAppFleetRuntimeIntent
+	decoder := msgpack.NewDecoder(bytes.NewReader(request))
+	decoder.DisallowUnknownFields(true)
+	if err := decoder.Decode(&intent); err != nil ||
+		intent.Version != "pulp.effect.v1" ||
+		intent.Kind != "pulp.effect.status.signal.publish.v1" ||
+		!evolutionAppCanonicalEffectField(intent.ID) ||
+		!evolutionAppCanonicalEffectField(intent.IdempotencyKey) {
+		return evolutionAppFleetRuntimeReceipt{}, false
+	}
+	var payload evolutionAppStatusSignalPayload
+	decoder = msgpack.NewDecoder(bytes.NewReader(intent.Payload))
+	decoder.DisallowUnknownFields(true)
+	if err := decoder.Decode(&payload); err != nil ||
+		!evolutionAppStatusTarget(payload.Target) ||
+		!evolutionAppStatusState(payload.Signal) ||
+		strings.TrimSpace(payload.Detail) != payload.Detail ||
+		payload.Detail == "" ||
+		len(payload.Detail) > 512 ||
+		!evolutionAppNoControlCharacters(payload.Detail) ||
+		payload.ExpiresAtUnix <= 0 ||
+		time.Unix(payload.ExpiresAtUnix, 0).UTC().Year() > 9999 {
+		return evolutionAppFleetRuntimeReceipt{}, false
+	}
+	result, err := msgpack.Marshal(evolutionAppStatusSignalResult{
+		Target: payload.Target, Signal: payload.Signal, ExpiresAtUnix: payload.ExpiresAtUnix,
+	})
+	if err != nil {
+		return evolutionAppFleetRuntimeReceipt{}, false
+	}
+	return evolutionAppFleetRuntimeReceipt{
+		Version:        intent.Version,
+		IntentID:       intent.ID,
+		Kind:           intent.Kind,
+		IdempotencyKey: intent.IdempotencyKey,
+		Status:         "completed",
+		Result:         result,
+	}, true
+}
+
+func evolutionAppServiceObservationReceipt(request []byte) (evolutionAppFleetRuntimeReceipt, bool) {
+	var intent evolutionAppFleetRuntimeIntent
+	reader := bytes.NewReader(request)
+	decoder := msgpack.NewDecoder(reader)
+	decoder.DisallowUnknownFields(true)
+	if err := decoder.Decode(&intent); err != nil || reader.Len() != 0 ||
+		intent.Version != "pulp.effect.v1" ||
+		intent.Kind != "pulp.effect.service-observation.execute.v1" ||
+		!evolutionAppCanonicalEffectField(intent.ID) ||
+		!evolutionAppCanonicalEffectField(intent.IdempotencyKey) {
+		return evolutionAppFleetRuntimeReceipt{}, false
+	}
+	var command evolutionAppServiceObservationCommand
+	reader = bytes.NewReader(intent.Payload)
+	decoder = msgpack.NewDecoder(reader)
+	decoder.DisallowUnknownFields(true)
+	if err := decoder.Decode(&command); err != nil || reader.Len() != 0 ||
+		command.Contract != "service-observation.v1" ||
+		!evolutionAppCanonicalEffectField(command.ServiceDefinitionID) ||
+		!evolutionAppCanonicalEffectField(command.CommandID) ||
+		!evolutionAppCanonicalEffectField(command.IdempotencyKey) ||
+		!evolutionAppCanonicalEffectField(command.Fence.LeaseID) ||
+		command.Fence.Attempt == 0 ||
+		command.CommandID != intent.ID ||
+		command.IdempotencyKey != intent.IdempotencyKey {
+		return evolutionAppFleetRuntimeReceipt{}, false
+	}
+	observedAt, observedErr := time.Parse(time.RFC3339Nano, command.ObservedAt)
+	expiresAt, expiresErr := time.Parse(time.RFC3339Nano, command.Fence.LeaseExpiresAt)
+	if observedErr != nil || expiresErr != nil || !observedAt.Before(expiresAt) {
+		return evolutionAppFleetRuntimeReceipt{}, false
+	}
+	result := evolutionAppServiceObservationResult{
+		Contract:            command.Contract,
+		ServiceDefinitionID: command.ServiceDefinitionID,
+		CommandID:           command.CommandID,
+		IdempotencyKey:      command.IdempotencyKey,
+		Fence:               command.Fence,
+		Observation: evolutionAppServiceObservationValue{
+			Status:     "operational",
+			HTTPStatus: http.StatusOK,
+			Evidence:   "authenticated",
+			ObservedAt: command.ObservedAt,
+		},
+	}
+	resultWire, err := msgpack.Marshal(result)
+	if err != nil {
+		return evolutionAppFleetRuntimeReceipt{}, false
+	}
+	return evolutionAppFleetRuntimeReceipt{
+		Version: intent.Version, IntentID: intent.ID, Kind: intent.Kind,
+		IdempotencyKey: intent.IdempotencyKey, Status: "completed", Result: resultWire,
+	}, true
+}
+
+func evolutionAppHTTPProbeReceiptFor(request []byte) (evolutionAppHTTPProbeReceipt, bool) {
+	var intent evolutionAppHTTPProbeIntent
+	reader := bytes.NewReader(request)
+	decoder := msgpack.NewDecoder(reader)
+	decoder.DisallowUnknownFields(true)
+	if err := decoder.Decode(&intent); err != nil || reader.Len() != 0 ||
+		intent.Version != "http-probe.v1" ||
+		!evolutionAppCanonicalEffectField(intent.IntentID) ||
+		!evolutionAppCanonicalEffectField(intent.IdempotencyKey) ||
+		!evolutionAppCanonicalEffectField(intent.Fence) ||
+		!evolutionAppHTTPProbeDestination(intent.Destination) {
+		return evolutionAppHTTPProbeReceipt{}, false
+	}
+	bodyDigest := sha256.Sum256(nil)
+	return evolutionAppHTTPProbeReceipt{
+		Version: intent.Version, IntentID: intent.IntentID,
+		IdempotencyKey: intent.IdempotencyKey, Fence: intent.Fence,
+		Destination: intent.Destination, Transport: "observed",
+		HTTPStatus: http.StatusNoContent, BodySHA256: hex.EncodeToString(bodyDigest[:]),
+	}, true
+}
+
+func evolutionAppHTTPProbeDestination(value string) bool {
+	return value == "status.website.6227748c2fbaff8f"
+}
+
+func evolutionAppCanonicalEffectField(value string) bool {
+	return value != "" && len(value) <= 256 && strings.TrimSpace(value) == value && evolutionAppNoControlCharacters(value)
+}
+
+func evolutionAppNoControlCharacters(value string) bool {
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
+}
+
+func evolutionAppStatusTarget(target string) bool {
+	switch target {
+	case "payments", "provisioner", "email":
+		return true
+	default:
+		return false
+	}
+}
+
+func evolutionAppStatusState(state string) bool {
+	switch state {
+	case "ok", "degraded", "down":
+		return true
+	default:
+		return false
+	}
+}
+
+func writeEvolutionAppMsgpack(ctx context.Context, module api.Module, value any, ptrOut, sizeOut uint32) uint32 {
+	encoded, err := msgpack.Marshal(value)
+	if err != nil {
+		return 5
+	}
+	allocator := module.ExportedFunction("pulp_alloc")
+	if allocator == nil {
+		return 7
+	}
+	result, err := allocator.Call(ctx, uint64(len(encoded)))
+	if err != nil || len(result) == 0 || result[0] == 0 {
+		return 7
+	}
+	ptr := uint32(result[0])
+	if !module.Memory().Write(ptr, encoded) ||
+		!module.Memory().WriteUint32Le(ptrOut, ptr) ||
+		!module.Memory().WriteUint32Le(sizeOut, uint32(len(encoded))) {
+		return 8
+	}
+	return 0
+}
+
+func TestEvolutionAppFleetRuntimeCapabilityIsNarrow(t *testing.T) {
+	payload, err := msgpack.Marshal(map[string]string{
+		"server_id": "server-1", "node_id": "node-1", "container_id": "container-1",
+		"extension": "rcon", "rcon_action": "save_flush",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := evolutionAppFleetRuntimeIntent{
+		Version: "pulp.effect.v1", ID: "intent-1", Kind: "pulp.effect.fleet.extension.apply.v1",
+		IdempotencyKey: "intent-1:effect", Payload: payload,
+	}
+	if _, ok := evolutionAppFleetRuntimeResult(valid); !ok {
+		t.Fatal("allowed Fleet save-flush intent was rejected")
+	}
+	valid.Kind = "pulp.effect.fleet.extension.apply.v2"
+	if _, ok := evolutionAppFleetRuntimeResult(valid); ok {
+		t.Fatal("unsupported Fleet effect kind was accepted")
+	}
+	valid.Kind = "pulp.effect.fleet.extension.apply.v1"
+	invalidPayload, err := msgpack.Marshal(map[string]string{
+		"server_id": "server-1", "node_id": "node-1", "container_id": "container-1",
+		"extension": "rcon", "rcon_action": "restart",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid.Payload = invalidPayload
+	if _, ok := evolutionAppFleetRuntimeResult(valid); ok {
+		t.Fatal("non-save-flush Fleet extension was accepted")
+	}
+}
+
+func TestEvolutionAppFleetObservationCapabilityUsesExactABI(t *testing.T) {
+	capability, ok := evolutionAppCapabilities()["effect.fleet.observation"]
+	if !ok || capability.Register == nil || capability.Stub == nil {
+		t.Fatalf("effect.fleet.observation capability = %#v", capability)
+	}
+	payload, err := msgpack.Marshal(evolutionAppFleetObservationIntent{
+		Contract: "fleet.live-observation.v1", ServerID: "server-1", NodeID: "node-1", ContainerID: "container-1",
+		Field: "settings", Generation: "revision-1", SourceRevision: "revision-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := msgpack.Marshal(evolutionAppFleetRuntimeIntent{
+		Version: "pulp.effect.v1", ID: "observation-1", Kind: "pulp.effect.fleet.runtime-observation.execute.v1",
+		IdempotencyKey: "observation-1:settings", Payload: payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, observation, ok := evolutionAppFleetObservationRequest(request); !ok || observation.Field != "settings" {
+		t.Fatalf("exact Fleet observation ABI rejected: %#v, %t", observation, ok)
+	}
+	var widened map[string]any
+	if err := msgpack.Unmarshal(payload, &widened); err != nil {
+		t.Fatal(err)
+	}
+	widened["command"] = "attacker-controlled"
+	payload, err = msgpack.Marshal(widened)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err = msgpack.Marshal(evolutionAppFleetRuntimeIntent{
+		Version: "pulp.effect.v1", ID: "observation-1", Kind: "pulp.effect.fleet.runtime-observation.execute.v1",
+		IdempotencyKey: "observation-1:settings", Payload: payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := evolutionAppFleetObservationRequest(request); ok {
+		t.Fatal("widened Fleet observation payload was accepted")
+	}
+}
+
+func TestEvolutionAppStatusSignalCapabilityIsNarrowAndDeterministic(t *testing.T) {
+	payload, err := msgpack.Marshal(evolutionAppStatusSignalPayload{
+		Target: "payments", Signal: "degraded", Detail: "payment authority is slow", ExpiresAtUnix: 1_800_000_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := evolutionAppFleetRuntimeIntent{
+		Version: "pulp.effect.v1", ID: "status-1", Kind: "pulp.effect.status.signal.publish.v1",
+		IdempotencyKey: "status-1:publish", Payload: payload,
+	}
+	request, err := msgpack.Marshal(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, ok := evolutionAppStatusSignalReceipt(request)
+	if !ok {
+		t.Fatal("canonical status signal was rejected")
+	}
+	second, ok := evolutionAppStatusSignalReceipt(request)
+	if !ok ||
+		first.Version != second.Version ||
+		first.IntentID != second.IntentID ||
+		first.Kind != second.Kind ||
+		first.IdempotencyKey != second.IdempotencyKey ||
+		first.Status != second.Status ||
+		!bytes.Equal(first.Result, second.Result) {
+		t.Fatalf("status receipt is not deterministic: first=%#v second=%#v", first, second)
+	}
+	var result evolutionAppStatusSignalResult
+	if err := msgpack.Unmarshal(first.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Target != "payments" || result.Signal != "degraded" || result.ExpiresAtUnix != 1_800_000_000 {
+		t.Fatalf("status receipt result = %#v", result)
+	}
+
+	intent.Kind = "pulp.effect.notification.email.send.v1"
+	otherEffect, err := msgpack.Marshal(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := evolutionAppStatusSignalReceipt(otherEffect); ok {
+		t.Fatal("non-status host effect was accepted")
+	}
+	unsafePayload, err := msgpack.Marshal(map[string]any{
+		"target": "payments", "signal": "ok", "detail": "healthy", "expires_at_unix": int64(1_800_000_000),
+		"url": "https://guest.example/escape",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent.Kind, intent.Payload = "pulp.effect.status.signal.publish.v1", unsafePayload
+	unsafeRequest, err := msgpack.Marshal(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := evolutionAppStatusSignalReceipt(unsafeRequest); ok {
+		t.Fatal("guest-controlled HTTP field was accepted")
+	}
+}
+
+func TestEvolutionAppServiceObservationFixtureIsExactStrictAndDeterministic(t *testing.T) {
+	command := evolutionAppServiceObservationCommand{
+		Contract:            "service-observation.v1",
+		ServiceDefinitionID: "sessions.stripe.primary",
+		CommandID:           "service-observation-1",
+		IdempotencyKey:      "service-observation-1",
+		Fence: evolutionAppServiceObservationFence{
+			LeaseID: "service-observation-lease-1", Attempt: 1,
+			LeaseExpiresAt: "2026-07-26T12:01:00Z",
+		},
+		ObservedAt: "2026-07-26T12:00:00Z",
+	}
+	payload, err := msgpack.Marshal(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := evolutionAppFleetRuntimeIntent{
+		Version: "pulp.effect.v1", ID: command.CommandID,
+		Kind:           "pulp.effect.service-observation.execute.v1",
+		IdempotencyKey: command.IdempotencyKey, Payload: payload,
+	}
+	request, err := msgpack.Marshal(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, ok := evolutionAppServiceObservationReceipt(request)
+	if !ok {
+		t.Fatal("canonical service observation was rejected")
+	}
+	second, ok := evolutionAppServiceObservationReceipt(request)
+	if !ok {
+		t.Fatal("canonical service observation replay was rejected")
+	}
+	firstWire, err := msgpack.Marshal(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondWire, err := msgpack.Marshal(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(firstWire, secondWire) {
+		t.Fatal("service observation receipt is not deterministic")
+	}
+	var result evolutionAppServiceObservationResult
+	if err := msgpack.Unmarshal(first.Result, &result); err != nil ||
+		result.Contract != command.Contract ||
+		result.ServiceDefinitionID != command.ServiceDefinitionID ||
+		result.CommandID != command.CommandID ||
+		result.IdempotencyKey != command.IdempotencyKey ||
+		result.Fence != command.Fence ||
+		result.Observation.Status != "operational" ||
+		result.Observation.Evidence != "authenticated" ||
+		result.Observation.HTTPStatus != http.StatusOK ||
+		result.Observation.ObservedAt != command.ObservedAt {
+		t.Fatalf("service observation result = %#v, %v", result, err)
+	}
+
+	widened := command
+	widenedPayload, err := msgpack.Marshal(map[string]any{
+		"contract": command.Contract, "service_definition_id": command.ServiceDefinitionID,
+		"command_id": command.CommandID, "idempotency_key": command.IdempotencyKey,
+		"fence": command.Fence, "observed_at": command.ObservedAt,
+		"url": "https://guest.example/escape",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent.Payload = widenedPayload
+	widenedWire, err := msgpack.Marshal(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := evolutionAppServiceObservationReceipt(widenedWire); ok {
+		t.Fatal("guest-controlled service observation transport field was accepted")
+	}
+	widened.CommandID = "different-command"
+	mismatchedPayload, err := msgpack.Marshal(widened)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent.Payload = mismatchedPayload
+	mismatchedWire, err := msgpack.Marshal(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := evolutionAppServiceObservationReceipt(mismatchedWire); ok {
+		t.Fatal("service observation command/envelope identity mismatch was accepted")
+	}
+	if _, ok := evolutionAppServiceObservationReceipt(append(request, 0xc0)); ok {
+		t.Fatal("service observation trailing wire data was accepted")
+	}
+
+	var fixture *ext.Capability
+	for _, capability := range evolutionAppBackendStubs() {
+		if capability.Name == "effect.service.observation" {
+			copyOfCapability := capability
+			fixture = &copyOfCapability
+			break
+		}
+	}
+	if fixture == nil {
+		t.Fatal("service observation fixture capability is missing")
+	}
+	ctx := context.Background()
+	runtime := wazero.NewRuntime(ctx)
+	defer runtime.Close(ctx)
+	builder := runtime.NewHostModuleBuilder("service_observation_fixture")
+	if err := fixture.Register(builder, nil); err != nil {
+		t.Fatal(err)
+	}
+	compiled, err := builder.Compile(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer compiled.Close(ctx)
+	exports := compiled.ExportedFunctions()
+	execute := exports["service_observation_execute"]
+	if len(exports) != 1 || execute == nil ||
+		len(execute.ParamTypes()) != 4 || len(execute.ResultTypes()) != 1 {
+		t.Fatal("service observation fixture ABI drifted or widened")
+	}
+	for _, valueType := range append(execute.ParamTypes(), execute.ResultTypes()...) {
+		if valueType != api.ValueTypeI32 {
+			t.Fatalf("service observation ABI contains non-i32 type %v", valueType)
+		}
+	}
+}
+
+func TestEvolutionAppHTTPProbeFixtureIsExactStrictAndDeterministic(t *testing.T) {
+	intent := evolutionAppHTTPProbeIntent{
+		Version: "http-probe.v1", IntentID: "probe-1",
+		IdempotencyKey: "probe-1", Fence: "status-probe.v1.fixture",
+		Destination: "status.website.6227748c2fbaff8f",
+	}
+	request, err := msgpack.Marshal(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, ok := evolutionAppHTTPProbeReceiptFor(request)
+	if !ok {
+		t.Fatal("canonical HTTP probe was rejected")
+	}
+	second, ok := evolutionAppHTTPProbeReceiptFor(request)
+	if !ok || first != second || first.Transport != "observed" ||
+		first.HTTPStatus != http.StatusNoContent || len(first.BodySHA256) != 64 {
+		t.Fatalf("HTTP probe receipt is not exact and deterministic: %#v / %#v", first, second)
+	}
+	widened, err := msgpack.Marshal(map[string]any{
+		"version": intent.Version, "intent_id": intent.IntentID,
+		"idempotency_key": intent.IdempotencyKey, "fence": intent.Fence,
+		"destination": intent.Destination, "url": "https://guest.example/escape",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := evolutionAppHTTPProbeReceiptFor(widened); ok {
+		t.Fatal("guest-controlled HTTP probe URL was accepted")
+	}
+	invalidDestination := intent
+	invalidDestination.Destination = "guest-selected"
+	invalidWire, err := msgpack.Marshal(invalidDestination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := evolutionAppHTTPProbeReceiptFor(invalidWire); ok {
+		t.Fatal("unbounded HTTP probe destination was accepted")
+	}
+	if _, ok := evolutionAppHTTPProbeReceiptFor(append(request, 0xc0)); ok {
+		t.Fatal("HTTP probe trailing wire data was accepted")
+	}
+
+	var fixture *ext.Capability
+	for _, capability := range evolutionAppBackendStubs() {
+		if capability.Name == "effect.http.probe.v1" {
+			copyOfCapability := capability
+			fixture = &copyOfCapability
+			break
+		}
+	}
+	if fixture == nil {
+		t.Fatal("HTTP probe fixture capability is missing")
+	}
+	ctx := context.Background()
+	runtime := wazero.NewRuntime(ctx)
+	defer runtime.Close(ctx)
+	builder := runtime.NewHostModuleBuilder("http_probe_fixture")
+	if err := fixture.Register(builder, nil); err != nil {
+		t.Fatal(err)
+	}
+	compiled, err := builder.Compile(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer compiled.Close(ctx)
+	exports := compiled.ExportedFunctions()
+	execute := exports["http_probe_execute"]
+	if len(exports) != 1 || execute == nil ||
+		len(execute.ParamTypes()) != 4 || len(execute.ResultTypes()) != 1 {
+		t.Fatal("HTTP probe fixture ABI drifted or widened")
+	}
+	for _, valueType := range append(execute.ParamTypes(), execute.ResultTypes()...) {
+		if valueType != api.ValueTypeI32 {
+			t.Fatalf("HTTP probe ABI contains non-i32 type %v", valueType)
+		}
 	}
 }

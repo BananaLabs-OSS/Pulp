@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 
@@ -21,18 +22,19 @@ type applicationRuntime struct {
 	application HostedApplication
 	config      ScopedApplicationRuntimeFactoryConfig
 
-	mu             sync.Mutex
-	ctx            context.Context
-	cancel         context.CancelFunc
-	runtimes       map[string]*cellRuntime
-	eventTargets   map[string]*cellRuntime
-	allCaps        []ext.Capability
-	declaredUnion  map[string]bool
-	setupCaps      map[string]bool
-	registry       *host.Registry
-	ops            *runtimeOps
-	started        bool
-	providerAccess *applicationProviderAccess
+	mu                sync.Mutex
+	ctx               context.Context
+	cancel            context.CancelFunc
+	runtimes          map[string]*cellRuntime
+	eventTargets      map[string]*cellRuntime
+	allCaps           []ext.Capability
+	declaredUnion     map[string]bool
+	capabilityConfigs map[string]map[string]any
+	setupCaps         map[string]bool
+	registry          *host.Registry
+	ops               *runtimeOps
+	started           bool
+	providerAccess    *applicationProviderAccess
 }
 
 // ApplicationLifecycleObserver is the narrow host-effect seam around one
@@ -161,13 +163,18 @@ func (r *applicationRuntime) Start(parent context.Context) error {
 		return fmt.Errorf("load application %s: %w", r.application.Identity, err)
 	}
 	r.ctx, r.cancel = context.WithCancel(parent)
-	r.allCaps = ext.All()
+	r.allCaps, err = selectedRuntimeCapabilities()
+	if err != nil {
+		r.reset()
+		return err
+	}
 	r.declaredUnion, r.setupCaps = map[string]bool{}, map[string]bool{}
 	for _, spec := range loaded.Cells.Order {
 		for _, name := range spec.Capabilities {
 			r.declaredUnion[name] = true
 		}
 	}
+	r.resolveCapabilityConfigs(loaded.Placements)
 	if err := r.setupCapabilities(); err != nil {
 		r.reset()
 		return err
@@ -274,6 +281,7 @@ func (r *applicationRuntime) setupCapabilities() error {
 	env := ext.SetupEnv{Scope: scope, Endpoints: r.config.Endpoints, StorageRoot: storageRoot, Logger: r.config.Logger}
 	for _, c := range r.allCaps {
 		if r.declaredUnion[c.Name] {
+			env.Config = r.capabilityConfigs[c.Name]
 			if err := safe.CallSetup(c, env, r.config.Logger); err != nil {
 				return fmt.Errorf("setup capability %s: %w", c.Name, err)
 			}
@@ -281,6 +289,92 @@ func (r *applicationRuntime) setupCapabilities() error {
 		}
 	}
 	return nil
+}
+
+// resolveCapabilityConfigs captures the already-resolved config of the first
+// placement that declares each application-scoped capability. Setup remains a
+// once-per-application lifecycle: repeated declarations therefore reuse the
+// first deterministic placement in manifest order instead of merging unrelated
+// cell config tables.
+//
+// Each capability receives its own deep copy. An extension may normalize its
+// setup input without changing the guest config later encoded for pulp_init,
+// another capability's input, or another application instance.
+func (r *applicationRuntime) resolveCapabilityConfigs(placements []manifest.CellPlacement) {
+	r.capabilityConfigs = make(map[string]map[string]any)
+	for _, placement := range placements {
+		if placement.Spec == nil {
+			continue
+		}
+		for _, capability := range placement.Spec.Capabilities {
+			if _, resolved := r.capabilityConfigs[capability]; resolved {
+				continue
+			}
+			r.capabilityConfigs[capability] = cloneCapabilitySetupConfig(placement.Spec.Config)
+		}
+	}
+}
+
+func cloneCapabilitySetupConfig(config map[string]any) map[string]any {
+	if len(config) == 0 {
+		return nil
+	}
+	cloned := make(map[string]any, len(config))
+	for key, value := range config {
+		cloned[key] = cloneCapabilitySetupValue(value)
+	}
+	return cloned
+}
+
+func cloneCapabilitySetupValue(value any) any {
+	cloned := cloneCapabilitySetupReflect(reflect.ValueOf(value))
+	if !cloned.IsValid() {
+		return nil
+	}
+	return cloned.Interface()
+}
+
+func cloneCapabilitySetupReflect(value reflect.Value) reflect.Value {
+	if !value.IsValid() {
+		return reflect.Value{}
+	}
+	switch value.Kind() {
+	case reflect.Interface:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		cloned := cloneCapabilitySetupReflect(value.Elem())
+		result := reflect.New(value.Type()).Elem()
+		result.Set(cloned)
+		return result
+	case reflect.Map:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		result := reflect.MakeMapWithSize(value.Type(), value.Len())
+		iterator := value.MapRange()
+		for iterator.Next() {
+			result.SetMapIndex(iterator.Key(), cloneCapabilitySetupReflect(iterator.Value()))
+		}
+		return result
+	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		result := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		for index := 0; index < value.Len(); index++ {
+			result.Index(index).Set(cloneCapabilitySetupReflect(value.Index(index)))
+		}
+		return result
+	case reflect.Array:
+		result := reflect.New(value.Type()).Elem()
+		for index := 0; index < value.Len(); index++ {
+			result.Index(index).Set(cloneCapabilitySetupReflect(value.Index(index)))
+		}
+		return result
+	default:
+		return value
+	}
 }
 
 func (r *applicationRuntime) validateCapabilityLifecycle() error {
@@ -401,6 +495,7 @@ func (r *applicationRuntime) reset() {
 	r.ops = nil
 	r.registry = nil
 	r.providerAccess = nil
+	r.capabilityConfigs = nil
 	r.setupCaps = nil
 	r.started = false
 }

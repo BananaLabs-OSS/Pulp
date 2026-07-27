@@ -37,7 +37,9 @@ var capacityFullCfg = map[string]any{
 	"memory_budget": 1.0,
 }
 
-// orderStatusFor reads the status the cell wrote for a claim token's order.
+// orderStatusByEmail remains for legacy-poller compatibility tests that seed
+// and drive Evolution-owned rows. New composed checkout assertions should use
+// commerceOrderForID instead.
 func orderStatusByEmail(t *testing.T, db *sql.DB, email string) string {
 	t.Helper()
 	var status string
@@ -83,10 +85,11 @@ func TestEvolution_Checkout_CapacityFull_PaidOrderReserves(t *testing.T) {
 	h, db := startEvolutionDowntimeExtra(t, "", capacityFullCfg)
 	seedDowntimeCatalog(t, db)
 
-	status, body := postCheckout(t, h, map[string]any{
+	const idempotencyKey = "capacity-full-paid-reserve"
+	status, body := postCheckoutWithHeaders(t, h, map[string]any{
 		"server_type": "minecraft",
 		"email":       "reserved@example.com",
-	})
+	}, map[string]string{"Idempotency-Key": idempotencyKey})
 
 	if status == 503 {
 		t.Fatalf("full fleet REFUSED a paying customer with 503 (%v) — a full "+
@@ -110,7 +113,8 @@ func TestEvolution_Checkout_CapacityFull_PaidOrderReserves(t *testing.T) {
 	}
 	// `reserved`, not `pending`: no Stripe webhook is coming for a SetupIntent,
 	// so a pending order would sit unfulfilled forever.
-	if got := orderStatusByEmail(t, db, "reserved@example.com"); got != "reserved" {
+	orderID := deterministicHarnessIdentifier("order", idempotencyKey)
+	if got := commerceOrderForID(t, h, orderID).Status; got != "reserved" {
 		t.Errorf("order status = %q, want \"reserved\"", got)
 	}
 }

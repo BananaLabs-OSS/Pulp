@@ -38,7 +38,10 @@ package ext
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/tetratelabs/wazero"
@@ -127,7 +130,17 @@ type StepEvent struct {
 // Setup/Teardown manage host-side resources (servers, connections).
 // Poll/Finalize let the extension feed events into the step loop.
 type Capability struct {
-	Name     string
+	Name string
+	// Provider is the stable, deployment-selectable identity of the extension
+	// implementation, normally its canonical Go module path (for example,
+	// "github.com/BananaLabs-OSS/Pulp-ext-gin"). It must not be derived from
+	// callback symbols or package initialization order.
+	//
+	// Empty preserves compatibility for a single unpinned legacy provider.
+	// Pinned capabilities and duplicate capability names require explicit
+	// Provider values.
+	Provider string
+
 	Register func(builder wazero.HostModuleBuilder, cell Cell) error
 	Stub     func(builder wazero.HostModuleBuilder, cell Cell) error
 
@@ -189,6 +202,77 @@ func All() []Capability {
 	out := make([]Capability, len(globals))
 	copy(out, globals)
 	return out
+}
+
+// SelectCapabilities resolves exactly one registered provider for every
+// capability name. A provider pin is an exact stable Provider match; callback
+// symbols and registration order are never used as provider identity.
+//
+// Unique, unpinned legacy capabilities remain compatible even when Provider is
+// empty. Duplicate names require a pin, and pinned names fail closed when the
+// provider is missing, unidentified, substituted, or registered more than once.
+func SelectCapabilities(registered []Capability, providers map[string]string) ([]Capability, error) {
+	byName := make(map[string][]Capability, len(registered))
+	order := make([]string, 0, len(registered))
+	for _, capability := range registered {
+		if _, seen := byName[capability.Name]; !seen {
+			order = append(order, capability.Name)
+		}
+		byName[capability.Name] = append(byName[capability.Name], capability)
+	}
+
+	pinnedNames := make([]string, 0, len(providers))
+	for name, provider := range providers {
+		if strings.TrimSpace(name) == "" {
+			return nil, fmt.Errorf("capability provider selection contains an empty capability name")
+		}
+		if strings.TrimSpace(provider) == "" {
+			return nil, fmt.Errorf("capability %q has an empty provider selection", name)
+		}
+		pinnedNames = append(pinnedNames, name)
+	}
+	sort.Strings(pinnedNames)
+	for _, name := range pinnedNames {
+		if len(byName[name]) == 0 {
+			return nil, fmt.Errorf("pinned capability %q is not registered", name)
+		}
+	}
+
+	selected := make([]Capability, 0, len(byName))
+	for _, name := range order {
+		candidates := byName[name]
+		want, pinned := providers[name]
+		if !pinned {
+			if len(candidates) != 1 {
+				return nil, fmt.Errorf("capability %q has %d registered providers and requires explicit selection", name, len(candidates))
+			}
+			selected = append(selected, candidates[0])
+			continue
+		}
+
+		var matches []Capability
+		available := make([]string, 0, len(candidates))
+		for _, candidate := range candidates {
+			provider := candidate.Provider
+			if provider == "" {
+				provider = "<legacy-unidentified>"
+			}
+			available = append(available, provider)
+			if candidate.Provider == want {
+				matches = append(matches, candidate)
+			}
+		}
+		sort.Strings(available)
+		switch len(matches) {
+		case 0:
+			return nil, fmt.Errorf("capability %q provider is %q, want exact provider %q", name, strings.Join(available, ", "), want)
+		case 1:
+			selected = append(selected, matches[0])
+		default:
+			return nil, fmt.Errorf("capability %q has %d registrations for pinned provider %q", name, len(matches), want)
+		}
+	}
+	return selected, nil
 }
 
 var (

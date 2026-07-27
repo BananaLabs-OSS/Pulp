@@ -12,16 +12,41 @@ package host
 // weakened assertion.
 
 import (
+	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/vmihailenco/msgpack/v5"
 )
+
+type commerceOrderQuery struct {
+	OrderID string `msgpack:"order_id"`
+}
+
+type commerceOrderResult struct {
+	OK    bool               `msgpack:"ok"`
+	Value commerceOrderValue `msgpack:"value"`
+}
+
+type commerceOrderValue struct {
+	AmountCents     int64  `msgpack:"amount_cents"`
+	Status          string `msgpack:"status"`
+	PaymentStatus   string `msgpack:"payment_status"`
+	StripePaymentID string `msgpack:"stripe_payment_id"`
+}
 
 // postCheckout posts a checkout body with the compliance flags set, letting the
 // caller override server_type / promo_code / mods_json / email.
 func postCheckout(t *testing.T, h *CellHarness, fields map[string]any) (int, map[string]any) {
+	t.Helper()
+	return postCheckoutWithHeaders(t, h, fields, nil)
+}
+
+func postCheckoutWithHeaders(t *testing.T, h *CellHarness, fields map[string]any, headers map[string]string) (int, map[string]any) {
 	t.Helper()
 	body := map[string]any{
 		"email":         "buyer@example.com",
@@ -33,8 +58,11 @@ func postCheckout(t *testing.T, h *CellHarness, fields map[string]any) (int, map
 		body[k] = v
 	}
 	raw, _ := json.Marshal(body)
-	status, b := h.Do("POST", "/api/checkout",
-		map[string]string{"Content-Type": "application/json"}, raw)
+	requestHeaders := map[string]string{"Content-Type": "application/json"}
+	for key, value := range headers {
+		requestHeaders[key] = value
+	}
+	status, b := h.Do("POST", "/api/checkout", requestHeaders, raw)
 	var out map[string]any
 	_ = json.Unmarshal(b, &out)
 	return status, out
@@ -165,21 +193,53 @@ func TestEvolution_Checkout_HappyPath(t *testing.T) {
 	h, db := startEvolutionDowntime(t)
 	seedDowntimeCatalog(t, db)
 
-	status, out := postCheckout(t, h, map[string]any{
+	const idempotencyKey = "checkout-happy-owner-assertion"
+	status, out := postCheckoutWithHeaders(t, h, map[string]any{
 		"email":       "happy@example.com",
 		"server_type": "minecraft",
-	})
+	}, map[string]string{"Idempotency-Key": idempotencyKey})
 	if status != 200 {
 		t.Fatalf("happy path: want 200, got %d (%v)", status, out)
 	}
-	// A pending order was created at the standard price (1400) for this email.
-	var amount int
-	if err := db.QueryRow(
-		`SELECT amount_cents FROM orders WHERE email = 'happy@example.com' AND status = 'pending'`,
-	).Scan(&amount); err != nil {
-		t.Fatalf("expected a pending order for the checkout: %v", err)
+	// Commerce is the authoritative state owner. Assert through its package
+	// contract rather than Evolution's now-read-only legacy order table.
+	orderID := deterministicHarnessIdentifier("order", idempotencyKey)
+	result := commerceOrderForID(t, h, orderID)
+	if result.AmountCents != 1400 || result.Status != "checkout_pending" {
+		t.Fatalf("unexpected commerce order: %#v", result)
 	}
-	if amount != 1400 {
-		t.Fatalf("expected order amount 1400 (minecraft price), got %d", amount)
+}
+
+func commerceOrderForID(t *testing.T, h *CellHarness, orderID string) commerceOrderValue {
+	t.Helper()
+	commerceCell := h.cellsByName["commerce"]
+	if commerceCell == nil {
+		t.Fatal("composed application has no commerce owner")
 	}
+	args, err := msgpack.Marshal(commerceOrderQuery{OrderID: orderID})
+	if err != nil {
+		t.Fatalf("encode commerce order query: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	response, err := commerceCell.Call(ctx, "commerce.order.get.v1", args)
+	if err != nil {
+		t.Fatalf("query commerce order owner: %v", err)
+	}
+	var result commerceOrderResult
+	if err := msgpack.Unmarshal(response, &result); err != nil {
+		t.Fatalf("decode commerce order: %v", err)
+	}
+	if !result.OK {
+		t.Fatalf("commerce owner did not return checkout order: %#v", result)
+	}
+	return result.Value
+}
+
+func deterministicHarnessIdentifier(namespace, key string) string {
+	sum := sha256.Sum256([]byte(namespace + ":" + key))
+	value := sum[:16]
+	value[6] = (value[6] & 0x0f) | 0x40
+	value[8] = (value[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", value[0:4], value[4:6], value[6:8], value[8:10], value[10:16])
 }

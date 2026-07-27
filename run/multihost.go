@@ -41,6 +41,16 @@ func (id ApplicationIdentity) validate() error {
 // intentionally opaque to the supervisor: a loader can resolve a TOML entry,
 // a test fixture, or a future registry reference before it reaches the
 // runtime factory.
+//
+// The ownership hierarchy is:
+//
+//	host process -> application -> application instance -> cell -> cell instance
+//
+// Package bytes sit outside that hierarchy and may be reused at every level.
+// Mutable WASM memory and extension resources sit inside it and must use the
+// complete identity. This is why one worker.wasm can back Evolution and
+// Sessions, and why Sessions can place worker@b1 and worker@b2, without any
+// implicit state sharing.
 type HostedApplication struct {
 	Identity         ApplicationIdentity
 	ManifestPath     string

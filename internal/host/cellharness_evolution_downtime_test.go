@@ -70,6 +70,7 @@ import (
 	"github.com/BananaLabs-OSS/Pulp/ext"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 const downtimeCompSubject = "We Added Time Back for Downtime"
@@ -321,7 +322,7 @@ func startEvolutionDowntimeExtra(t *testing.T, internalSecret string, extra map[
 		cellCfg[k] = v
 	}
 
-	h := StartCellHTTP(t, CellHarnessConfig{
+	h := StartEvolutionApplicationHTTP(t, CellHarnessConfig{
 		SourceDir: evolutionSourceDir(),
 		Name:      "evolution",
 		Capabilities: []string{
@@ -339,6 +340,24 @@ func startEvolutionDowntimeExtra(t *testing.T, internalSecret string, extra map[
 		CapabilityOverrides: evoDowntimeOverrides(),
 	})
 	warmEvolution(t, h)
+	// The composed checkout path reads capacity from Fleet, not Evolution's
+	// retired node table. Seed one deterministic Fleet node for the harness;
+	// capacity-specific tests can override its budgets through extra config.
+	if fleet := h.cellsByName["fleet"]; fleet != nil {
+		cpu := int64(8)
+		memory := int64(16384)
+		if v, ok := extra["cpu_budget"].(float64); ok && v > 0 { cpu = int64(v) }
+		if v, ok := extra["memory_budget"].(float64); ok && v > 0 { memory = int64(v) }
+		args, err := msgpack.Marshal(map[string]any{
+			"id": "harness-fleet-node-upsert",
+			"node": map[string]any{"id": "node-1", "name": "Harness Fleet Node", "cpu_capacity": cpu, "cpu_capacity_millis": cpu * 1000, "memory_capacity": memory, "status": "active"},
+		})
+		if err != nil { t.Fatalf("encode Fleet harness node: %v", err) }
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, err = fleet.Call(ctx, "fleet.v1.command.node.upsert", args)
+		cancel()
+		if err != nil { t.Fatalf("seed Fleet harness node: %v", err) }
+	}
 
 	// Match ext-sqlite's path byte-for-byte (filepath.Join). SQLite keys the
 	// WAL shared-memory region on the path string, so a "/" vs "\" mismatch on
@@ -353,6 +372,23 @@ func startEvolutionDowntimeExtra(t *testing.T, internalSecret string, extra map[
 	for _, p := range []string{"PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=5000"} {
 		if _, err := db.Exec(p); err != nil {
 			t.Fatalf("db pragma %q: %v", p, err)
+		}
+	}
+	cpuBudget, cpuBudgetSet := extra["cpu_budget"].(float64)
+	memoryBudget, memoryBudgetSet := extra["memory_budget"].(float64)
+	if cpuBudgetSet || memoryBudgetSet {
+		now := time.Now().UTC()
+		if _, err := db.Exec(
+			`INSERT INTO nodes (id, name, bananagine_url, region, cpu_budget, memory_budget, state, registered_at, reported_at, last_seen_at)
+			 VALUES ('node-1','Harness capacity node','http://bananagine.invalid','test',?,?,'active',?,?,?)
+			 ON CONFLICT(id) DO UPDATE SET
+			   cpu_budget=excluded.cpu_budget,
+			   memory_budget=excluded.memory_budget,
+			   reported_at=excluded.reported_at,
+			   last_seen_at=excluded.last_seen_at`,
+			cpuBudget, memoryBudget, now, now, now,
+		); err != nil {
+			t.Fatalf("seed capacity node: %v", err)
 		}
 	}
 	t.Cleanup(func() { _ = db.Close() })
@@ -379,6 +415,18 @@ func seedDowntimeCatalog(t *testing.T, db *sql.DB) {
 		 VALUES ('standard','session','Session',1400,'336h',1,0,2.0,4096,?)`, now,
 	); err != nil {
 		t.Fatalf("seed tier: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO games (id, name, price_cents, duration, config_json, primary_template, visible)
+		 VALUES ('minecraft','Minecraft',1400,'336h','{}','minecraft',1)`,
+	); err != nil {
+		t.Fatalf("seed game: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO game_version_state (game, state_json, image_tag, auto_deploy)
+		 VALUES ('minecraft','{}','paper-server:1.21@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1)`,
+	); err != nil {
+		t.Fatalf("seed game version: %v", err)
 	}
 	if _, err := db.Exec(
 		`INSERT INTO game_visibility (template, tier_id, game_id, enabled)
@@ -553,118 +601,143 @@ func countOpenWindows(t *testing.T, db *sql.DB, serverID string) int {
 	return n
 }
 
+func ownerDowntimeFixture(
+	t *testing.T, h *CellHarness, key, email string, now time.Time, age time.Duration,
+) (string, time.Time) {
+	t.Helper()
+	orderID, order := ownerCheckoutPending(t, h, key, email, nil)
+	settleOwnerCheckout(t, h, "evt-"+key, order)
+	serverID := orderID + "-server"
+	expires := now.Add(30 * 24 * time.Hour).UTC()
+	upsertFleetServerValue(t, h, map[string]any{
+		"id": serverID, "order_id": orderID, "template": "minecraft",
+		"display_name": "Realm " + key, "status": "active", "health": "unhealthy",
+		"last_health_at": now.Add(-age).UTC().Format(time.RFC3339Nano),
+		"expires_at":     expires.Format(time.RFC3339Nano),
+	})
+	return serverID, expires
+}
+
+func dispatchDowntimePolicy(t *testing.T, h *CellHarness, requestID string, now time.Time) {
+	t.Helper()
+	dispatchFleetMaintenanceRequest(t, h, map[string]any{
+		"request_id":                      requestID,
+		"now":                             now.UTC().Format(time.RFC3339Nano),
+		"limit":                           uint32(100),
+		"max_downtime_credit_seconds":     int64(7 * 24 * 60 * 60),
+		"min_downtime_credit_seconds":     int64(60 * 60),
+		"downtime_credit_quantum_seconds": int64(60 * 60),
+	})
+}
+
+type notificationEmailValue struct {
+	Recipients []string `msgpack:"recipients"`
+	Subject    string   `msgpack:"subject"`
+	HTML       string   `msgpack:"html"`
+}
+
+func claimedNotificationEmail(t *testing.T, h *CellHarness, consumer string) notificationEmailValue {
+	t.Helper()
+	intents := claimNotifications(t, h, consumer)
+	if len(intents) != 1 {
+		t.Fatalf("notification intents = %d, want 1: %#v", len(intents), intents)
+	}
+	if intents[0].Kind != "pulp.effect.notification.email.send.v1" {
+		t.Fatalf("notification kind = %q", intents[0].Kind)
+	}
+	var email notificationEmailValue
+	if err := msgpack.Unmarshal(intents[0].Payload, &email); err != nil {
+		t.Fatalf("decode notification email: %v", err)
+	}
+	return email
+}
+
 // ===========================================================================
 // THE PROOF
 // ===========================================================================
 
 func TestEvolution_DowntimeCompensation_CreditsRoundedUpHourOnce(t *testing.T) {
 	h, db := startEvolutionDowntime(t)
-
+	seedDowntimeCatalog(t, db)
 	const email = "player2h@example.com"
-	srvID, _, display, origStored := provisionActiveServer(t, h, db, email)
+	now := time.Now().UTC()
+	serverID, originalExpiry := ownerDowntimeFixture(t, h, "downtime-rounded", email, now, 90*time.Minute)
+	dispatchDowntimePolicy(t, h, "maintenance-downtime-rounded", now)
 
-	// ~90-minute outage: above the 1h floor, rounds UP to exactly 2h.
-	openBackdatedWindow(t, h, db, srvID, 90*60)
-
-	// A running-container tick settles the window: +2h and one email.
-	driveUntil(t, h, db, "expires_at extended by the downtime credit", func() bool {
-		return readExpiresAt(t, db, srvID).Sub(origStored) > time.Minute
-	})
-
-	added := readExpiresAt(t, db, srvID).Sub(origStored)
-	if added < 2*time.Hour-time.Minute || added > 2*time.Hour+time.Minute {
-		t.Fatalf("expected ~2h credit for a ~90m outage, got %s", added)
+	server := fleetServerForID(t, h, serverID)
+	creditedExpiry, err := time.Parse(time.RFC3339Nano, server.ExpiresAt)
+	if err != nil {
+		t.Fatalf("parse Fleet credited expiry: %v", err)
 	}
-	if n := countOpenWindows(t, db, srvID); n != 0 {
-		t.Fatalf("expected outage window resolved, %d still open", n)
+	if added := creditedExpiry.Sub(originalExpiry); added != 2*time.Hour ||
+		server.DowntimeCreditSeconds != int64((2*time.Hour)/time.Second) {
+		t.Fatalf("expected exact 2h Fleet credit, got expiry delta=%s server=%#v", added, server)
 	}
 
-	driveUntil(t, h, db, "compensation email captured", func() bool {
-		return len(evoCompEmailsFor(email)) >= 1
-	})
-	emails := evoCompEmailsFor(email)
-	if len(emails) != 1 {
-		t.Fatalf("expected exactly 1 compensation email to %s, got %d: %+v", email, len(emails), emails)
+	notification := claimedNotificationEmail(t, h, "downtime-rounded-consumer")
+	if len(notification.Recipients) != 1 || notification.Recipients[0] != email {
+		t.Fatalf("downtime notification recipients = %#v", notification.Recipients)
 	}
-	got := emails[0]
-	if !strings.Contains(got.subject, display) {
-		t.Fatalf("subject = %q, want it to carry display name %q", got.subject, display)
-	}
-	if !strings.Contains(got.html, "2 hours") {
-		t.Fatalf("email body should render \"2 hours\", got:\n%s", got.html)
+	if !strings.Contains(notification.Subject, "Realm downtime-rounded") ||
+		!strings.Contains(notification.HTML, "2 hours") {
+		t.Fatalf("downtime notification lost owner facts: %#v", notification)
 	}
 
-	// Repeat recovery ticks must NOT double-credit and send no 2nd email.
-	afterCredit := readExpiresAt(t, db, srvID)
-	for i := 0; i < 8; i++ { // several running-container settle ticks
-		driveTick(h, db)
-		time.Sleep(50 * time.Millisecond)
+	dispatchDowntimePolicy(t, h, "maintenance-downtime-rounded-retry", now)
+	replayed := fleetServerForID(t, h, serverID)
+	if replayed.ExpiresAt != server.ExpiresAt ||
+		replayed.DowntimeCreditSeconds != server.DowntimeCreditSeconds {
+		t.Fatalf("downtime credit replay changed Fleet state: first=%#v replay=%#v", server, replayed)
 	}
-	if again := readExpiresAt(t, db, srvID); again.Sub(afterCredit) > time.Second {
-		t.Fatalf("double-credit on repeat tick: %s -> %s", afterCredit, again)
-	}
-	if n := len(evoCompEmailsFor(email)); n != 1 {
-		t.Fatalf("second compensation email on repeat tick: total to %s = %d", email, n)
+	if intents := claimNotifications(t, h, "downtime-rounded-replay-consumer"); len(intents) != 0 {
+		t.Fatalf("downtime replay enqueued another notification: %#v", intents)
 	}
 }
 
 func TestEvolution_DowntimeCompensation_BelowHourFloorNoCredit(t *testing.T) {
 	h, db := startEvolutionDowntime(t)
-
+	seedDowntimeCatalog(t, db)
 	const email = "player40m@example.com"
-	srvID, _, _, origStored := provisionActiveServer(t, h, db, email)
-
-	// 40-minute outage: below the 1h meaningful-downtime floor.
-	openBackdatedWindow(t, h, db, srvID, 40*60)
-
-	// The window is settled (resolved) on recovery even below the floor.
-	driveUntil(t, h, db, "outage window resolved even below floor", func() bool {
-		return countOpenWindows(t, db, srvID) == 0
-	})
-
-	// Below-floor: no credit, no email.
-	if added := readExpiresAt(t, db, srvID).Sub(origStored); added > time.Second {
-		t.Fatalf("below-floor outage must not credit; expiry moved by %s", added)
+	now := time.Now().UTC()
+	serverID, originalExpiry := ownerDowntimeFixture(t, h, "downtime-floor", email, now, 40*time.Minute)
+	dispatchDowntimePolicy(t, h, "maintenance-downtime-floor", now)
+	server := fleetServerForID(t, h, serverID)
+	if server.ExpiresAt != originalExpiry.Format(time.RFC3339Nano) ||
+		server.DowntimeCreditSeconds != 0 {
+		t.Fatalf("below-floor outage changed Fleet credit: %#v", server)
 	}
-	for i := 0; i < 6; i++ { // give any (erroneous) email time to land
-		driveTick(h, db)
-		time.Sleep(50 * time.Millisecond)
-	}
-	if n := len(evoCompEmailsFor(email)); n != 0 {
-		t.Fatalf("below-floor outage must not send a compensation email; captured %d", n)
+	if intents := claimNotifications(t, h, "downtime-floor-consumer"); len(intents) != 0 {
+		t.Fatalf("below-floor outage enqueued notification: %#v", intents)
 	}
 }
 
 func TestEvolution_DowntimeCompensation_DayWording(t *testing.T) {
 	h, db := startEvolutionDowntime(t)
-
+	seedDowntimeCatalog(t, db)
 	const email = "playerday@example.com"
-	srvID, _, _, origStored := provisionActiveServer(t, h, db, email)
-
-	// 24.5h outage: rounds up to exactly 25h -> ">=24h renders in DAYS".
-	openBackdatedWindow(t, h, db, srvID, 24*3600+30*60)
-
-	driveUntil(t, h, db, "expires_at extended by the day-scale credit", func() bool {
-		return readExpiresAt(t, db, srvID).Sub(origStored) > 20*time.Hour
-	})
-	added := readExpiresAt(t, db, srvID).Sub(origStored)
-	if added < 25*time.Hour-time.Minute || added > 25*time.Hour+time.Minute {
-		t.Fatalf("expected ~25h credit for a 24.5h outage, got %s", added)
+	now := time.Now().UTC()
+	serverID, originalExpiry := ownerDowntimeFixture(t, h, "downtime-day", email, now, 24*time.Hour+30*time.Minute)
+	dispatchDowntimePolicy(t, h, "maintenance-downtime-day", now)
+	server := fleetServerForID(t, h, serverID)
+	creditedExpiry, err := time.Parse(time.RFC3339Nano, server.ExpiresAt)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	driveUntil(t, h, db, "day-wording email captured", func() bool {
-		return len(evoCompEmailsFor(email)) >= 1
-	})
-	got := evoCompEmailsFor(email)[0]
-	if !strings.Contains(got.html, "1 day") {
-		t.Fatalf("email body should render days (\"1 day\"), got:\n%s", got.html)
+	if added := creditedExpiry.Sub(originalExpiry); added != 25*time.Hour {
+		t.Fatalf("expected exact 25h Fleet credit, got %s", added)
 	}
-	if strings.Contains(got.html, "24 hours") || strings.Contains(got.html, "25 hours") {
-		t.Fatalf("email must not render a >=24h credit in hours, got:\n%s", got.html)
+	notification := claimedNotificationEmail(t, h, "downtime-day-consumer")
+	if !strings.Contains(notification.HTML, "1 day") ||
+		strings.Contains(notification.HTML, "24 hours") ||
+		strings.Contains(notification.HTML, "25 hours") {
+		t.Fatalf("day-scale notification wording = %#v", notification)
 	}
 }
 
-// TestEvolution_DowntimeHarness_Smoke proves the harness INFRASTRUCTURE works
+// TestEvolution_DowntimeHarness_Smoke proves the composed harness reaches
+// Commerce and Fleet owner state through the real application route.
+/*
+Legacy harness history:
 // end-to-end:
 //
 //  1. the Evolution cell builds to wasm, Inits under the Pulp host (real
@@ -677,34 +750,27 @@ func TestEvolution_DowntimeCompensation_DayWording(t *testing.T) {
 //     mainTick is actually driven (an inbound request runs OnStep -> tickIfDue;
 //     the idle step-pump does not, which is what made the earlier settle proofs
 //     appear "blocked"). driveTick supplies that drive.
+*/
 func TestEvolution_DowntimeHarness_Smoke(t *testing.T) {
 	h, db := startEvolutionDowntime(t)
 
 	// (2) The cell booted and seeded baseline config on ITS connection; the test
 	// connection observes it — cross-connection reads work in both directions.
-	var nsc int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM site_config`).Scan(&nsc); err != nil || nsc == 0 {
-		t.Fatalf("cell->test visibility broken: site_config=%d err=%v", nsc, err)
+	seedDowntimeCatalog(t, db)
+	orderID, order := ownerCheckoutPending(t, h, "downtime-owner-smoke", "smoke@example.test", nil)
+	settleOwnerCheckout(t, h, "evt-downtime-owner-smoke", order)
+	settled := commerceOrderForID(t, h, orderID)
+	if settled.Status != "paid" || settled.PaymentStatus != "succeeded" {
+		t.Fatalf("Commerce smoke order did not settle: %#v", settled)
+	}
+	server := fleetServerForID(t, h, orderID+"-server")
+	if server.OrderID != orderID || server.NodeID == "" ||
+		(server.Status != "provisioning" && server.Status != "ready") {
+		t.Fatalf("owner smoke order did not reach Fleet: %#v", server)
 	}
 
 	// (3) A paid order this connection commits (with the catalog reference rows
 	// the enqueue path needs) is enqueued + provisioned by the poller ONCE ticks
 	// are driven — refuting the old "the cell never observes external commits"
 	// conclusion. This is the corrective infra guard.
-	seedDowntimeCatalog(t, db)
-	now := time.Now().UTC()
-	if _, err := db.Exec(
-		`INSERT INTO orders (id, stripe_session_id, server_type, tier_id, email, status, auto_redeem, created_at)
-		 VALUES ('smoke-ord','ss_smoke','minecraft','standard','s@e.com','paid',0,?)`, now,
-	); err != nil {
-		t.Fatalf("seed paid order: %v", err)
-	}
-	checkpoint(db)
-
-	driveUntil(t, h, db, "poller enqueues + provisions the committed paid order", func() bool {
-		var n int
-		_ = db.QueryRow(`SELECT COUNT(*) FROM servers WHERE order_id='smoke-ord'`).Scan(&n)
-		return n > 0
-	})
-	t.Log("confirmed: the poller observes this connection's committed order and provisions it once mainTick is driven (no cross-connection blocker)")
 }

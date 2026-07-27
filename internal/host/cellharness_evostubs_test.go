@@ -282,6 +282,22 @@ func stripeStubCapability() ext.Capability {
 		okObj := func(ctx context.Context, m api.Module, _, _, op, ol uint32) uint32 {
 			return writeStubMsgpack(ctx, m, map[string]any{}, op, ol)
 		}
+		invoiceItemCreate := func(ctx context.Context, m api.Module, _, _, op, ol uint32) uint32 {
+			return writeStubMsgpack(ctx, m, map[string]any{"id": "ii_stub_1"}, op, ol)
+		}
+		invoiceMutation := func(ctx context.Context, m api.Module, reqPtr, reqLen, op, ol uint32) uint32 {
+			var req struct {
+				ID string `msgpack:"id"`
+			}
+			_ = readStubMsgpack(m, reqPtr, reqLen, &req)
+			id := req.ID
+			if id == "" {
+				id = "in_stub_1"
+			}
+			return writeStubMsgpack(ctx, m, map[string]any{
+				"id": id, "status": "paid", "amount_due": int64(0), "amount_paid": int64(0),
+			}, op, ol)
+		}
 		// webhook_verify is a 2-arg fn returning a bare code (0=valid,
 		// 6=ErrStripeSignatureInvalid). Default: always valid so existing
 		// proofs can drive the webhook with a placeholder signature. When a
@@ -350,6 +366,8 @@ func stripeStubCapability() ext.Capability {
 
 		b.NewFunctionBuilder().WithFunc(piCreate).Export("stripe_payment_intent_create")
 		b.NewFunctionBuilder().WithFunc(piGet).Export("stripe_payment_intent_get")
+		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_checkout_session_create")
+		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_checkout_session_get")
 		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_payment_intent_capture")
 		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_payment_intent_cancel")
 		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_refund_create")
@@ -364,17 +382,64 @@ func stripeStubCapability() ext.Capability {
 		// take down every Evolution proof at once, not just the reserve ones.
 		b.NewFunctionBuilder().WithFunc(seCreate).Export("stripe_setup_intent_create")
 		b.NewFunctionBuilder().WithFunc(seGet).Export("stripe_setup_intent_get")
-		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_invoice_create")
-		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_invoice_finalize")
-		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_invoice_item_create")
+		b.NewFunctionBuilder().WithFunc(invoiceMutation).Export("stripe_invoice_create")
+		b.NewFunctionBuilder().WithFunc(invoiceMutation).Export("stripe_invoice_finalize")
+		b.NewFunctionBuilder().WithFunc(invoiceMutation).Export("stripe_invoice_mark_paid_out_of_band")
+		b.NewFunctionBuilder().WithFunc(invoiceItemCreate).Export("stripe_invoice_item_create")
 		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_balance_get")
 		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_coupon_create")
 		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_promotion_code_create")
 		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_promotion_code_lookup")
+		b.NewFunctionBuilder().WithFunc(okObj).Export("stripe_promotion_code_update")
 		b.NewFunctionBuilder().WithFunc(verify).Export("stripe_webhook_verify")
 		return nil
 	}
 	return ext.Capability{Name: "payment.stripe", Register: bind, Stub: bind}
+}
+
+// stripeRuntimeStubCapability is the deterministic owner-backed fixture for
+// the narrow effect.stripe.runtime ABI. Legacy Evolution HTTP tests use the
+// same Lua->Effects boundary as production; returning unavailable here would
+// make every checkout test fail before exercising its behavior.
+func stripeRuntimeStubCapability() ext.Capability {
+	bind := func(b wazero.HostModuleBuilder, _ ext.Cell) error {
+		execute := func(ctx context.Context, m api.Module, reqPtr, reqLen, op, ol uint32) uint32 {
+			var intent struct {
+				Version string             `msgpack:"version"`
+				ID      string             `msgpack:"id"`
+				Kind    string             `msgpack:"kind"`
+				Key     string             `msgpack:"idempotency_key"`
+				Payload msgpack.RawMessage `msgpack:"payload"`
+			}
+			if !readStubMsgpack(m, reqPtr, reqLen, &intent) || intent.Version != "pulp.effect.v1" || intent.ID == "" || intent.Key == "" {
+				return 3
+			}
+			result := map[string]any{}
+			switch {
+			case strings.Contains(intent.Kind, "payment-intent.create"):
+				result = map[string]any{"id": "pi_stub_1200", "payment_intent": "pi_stub_1200", "client_secret": "pi_stub_secret", "status": "requires_capture"}
+			case strings.Contains(intent.Kind, "payment-intent.capture"):
+				result = map[string]any{"id": "pi_stub_1200", "payment_intent": "pi_stub_1200", "status": "succeeded"}
+			case strings.Contains(intent.Kind, "customer.create"):
+				result = map[string]any{"customer_id": "cus_stub_1"}
+			case strings.Contains(intent.Kind, "setup-intent.create"):
+				result = map[string]any{"id": "seti_stub_1", "client_secret": "seti_stub_secret", "customer": "cus_stub_1", "status": "requires_payment_method"}
+			case strings.Contains(intent.Kind, "invoice-item.create"):
+				result = map[string]any{"invoice_item_id": "ii_stub_1"}
+			case strings.Contains(intent.Kind, "invoice.create"):
+				result = map[string]any{"invoice_id": "in_stub_1", "status": "draft", "amount_due": int64(0), "amount_paid": int64(0)}
+			case strings.Contains(intent.Kind, "invoice.finalize"):
+				result = map[string]any{"invoice_id": "in_stub_1", "status": "open", "amount_due": int64(0), "amount_paid": int64(0)}
+			case strings.Contains(intent.Kind, "invoice.mark-paid"):
+				result = map[string]any{"invoice_id": "in_stub_1", "status": "paid", "amount_due": int64(0), "amount_paid": int64(0)}
+			}
+			receipt := map[string]any{"version": intent.Version, "intent_id": intent.ID, "kind": intent.Kind, "idempotency_key": intent.Key, "status": "completed", "result": result}
+			return writeStubMsgpack(ctx, m, receipt, op, ol)
+		}
+		b.NewFunctionBuilder().WithFunc(execute).Export("stripe_effect_execute")
+		return nil
+	}
+	return ext.Capability{Name: "effect.stripe.runtime", Register: bind, Stub: bind}
 }
 
 // ---- s3 stub -------------------------------------------------------------
@@ -430,6 +495,307 @@ func dockerStubCapability() ext.Capability {
 		return nil
 	}
 	return ext.Capability{Name: "spawn.docker", Register: bind, Stub: bind}
+}
+
+// ---- fleet runtime effect stub -------------------------------------------
+//
+// effect.fleet.runtime is deliberately narrower than spawn.docker. The real
+// extension is covered by the deployment host tests; this hermetic harness
+// acknowledges only the two exact Fleet intents that the effects cell may
+// bridge, returning a canonical completed receipt. Every malformed or broader
+// request fails closed before it can become a test-only Docker escape hatch.
+
+const (
+	fleetRuntimeEffectCapability  = "effect.fleet.runtime"
+	fleetRuntimeEffectDeprovision = "pulp.effect.fleet.server.deprovision.v1"
+	fleetRuntimeEffectExtension   = "pulp.effect.fleet.extension.apply.v1"
+)
+
+type fleetRuntimeEffectIntent struct {
+	Version        string             `msgpack:"version"`
+	ID             string             `msgpack:"id"`
+	Kind           string             `msgpack:"kind"`
+	IdempotencyKey string             `msgpack:"idempotency_key"`
+	Payload        msgpack.RawMessage `msgpack:"payload"`
+}
+
+type fleetRuntimeEffectReceipt struct {
+	Version        string             `msgpack:"version"`
+	IntentID       string             `msgpack:"intent_id"`
+	Kind           string             `msgpack:"kind"`
+	IdempotencyKey string             `msgpack:"idempotency_key"`
+	Status         string             `msgpack:"status"`
+	Result         msgpack.RawMessage `msgpack:"result"`
+}
+
+func fleetRuntimeEffectStubCapability() ext.Capability {
+	bind := func(builder wazero.HostModuleBuilder, _ ext.Cell) error {
+		execute := func(ctx context.Context, module api.Module, requestPtr, requestLen, responsePtrOut, responseLenOut uint32) uint32 {
+			if module == nil || module.Memory() == nil {
+				return 2
+			}
+			request, ok := module.Memory().Read(requestPtr, requestLen)
+			if !ok {
+				return 2
+			}
+			var intent fleetRuntimeEffectIntent
+			if err := msgpack.Unmarshal(request, &intent); err != nil {
+				return 3
+			}
+			result, ok := fleetRuntimeEffectStubResult(intent)
+			if !ok {
+				return 4
+			}
+			receipt := fleetRuntimeEffectReceipt{
+				Version:        "pulp.effect.v1",
+				IntentID:       intent.ID,
+				Kind:           intent.Kind,
+				IdempotencyKey: intent.IdempotencyKey,
+				Status:         "completed",
+				Result:         result,
+			}
+			return writeStubMsgpack(ctx, module, receipt, responsePtrOut, responseLenOut)
+		}
+		builder.NewFunctionBuilder().WithFunc(execute).Export("fleet_effect_execute")
+		return nil
+	}
+	return ext.Capability{Name: fleetRuntimeEffectCapability, Register: bind, Stub: bind}
+}
+
+func fleetRuntimeEffectStubResult(intent fleetRuntimeEffectIntent) (msgpack.RawMessage, bool) {
+	if intent.Version != "pulp.effect.v1" || strings.TrimSpace(intent.ID) == "" ||
+		strings.TrimSpace(intent.IdempotencyKey) == "" {
+		return nil, false
+	}
+	var fields map[string]msgpack.RawMessage
+	if err := msgpack.Unmarshal(intent.Payload, &fields); err != nil {
+		return nil, false
+	}
+	allowed := map[string]bool{"server_id": true, "node_id": true, "container_id": true, "reason": true}
+	status := "deprovisioned"
+	switch intent.Kind {
+	case fleetRuntimeEffectDeprovision:
+	case fleetRuntimeEffectExtension:
+		allowed["extension"] = true
+		allowed["rcon_action"] = true
+		status = "save_flushed"
+	default:
+		return nil, false
+	}
+	values := make(map[string]string, len(fields))
+	for name, raw := range fields {
+		if !allowed[name] {
+			return nil, false
+		}
+		var value string
+		if err := msgpack.Unmarshal(raw, &value); err != nil {
+			return nil, false
+		}
+		values[name] = value
+	}
+	for _, name := range []string{"server_id", "node_id", "container_id"} {
+		if value := values[name]; strings.TrimSpace(value) == "" || value != strings.TrimSpace(value) {
+			return nil, false
+		}
+	}
+	if intent.Kind == fleetRuntimeEffectExtension &&
+		(values["extension"] != "rcon" || values["rcon_action"] != "save_flush") {
+		return nil, false
+	}
+	result, err := msgpack.Marshal(map[string]string{
+		"server_id": values["server_id"], "node_id": values["node_id"], "container_id": values["container_id"], "status": status,
+	})
+	if err != nil {
+		return nil, false
+	}
+	return result, true
+}
+
+func TestFleetRuntimeEffectStubCapabilityIsNarrow(t *testing.T) {
+	payload, err := msgpack.Marshal(map[string]string{
+		"server_id": "server-1", "node_id": "node-1", "container_id": "container-1", "reason": "admin_force_destroy",
+	})
+	if err != nil {
+		t.Fatalf("marshal valid Fleet effect payload: %v", err)
+	}
+	intent := fleetRuntimeEffectIntent{
+		Version: "pulp.effect.v1", ID: "effect-1", Kind: fleetRuntimeEffectDeprovision, IdempotencyKey: "destroy:server-1", Payload: payload,
+	}
+	result, ok := fleetRuntimeEffectStubResult(intent)
+	if !ok {
+		t.Fatal("valid Fleet deprovision was rejected")
+	}
+	var decoded map[string]string
+	if err := msgpack.Unmarshal(result, &decoded); err != nil {
+		t.Fatalf("decode deterministic result: %v", err)
+	}
+	if decoded["server_id"] != "server-1" || decoded["node_id"] != "node-1" || decoded["container_id"] != "container-1" || decoded["status"] != "deprovisioned" {
+		t.Fatalf("deterministic result = %#v", decoded)
+	}
+
+	intent.Kind = "pulp.effect.fleet.server.provision.v1"
+	if _, ok := fleetRuntimeEffectStubResult(intent); ok {
+		t.Fatal("broader Fleet provision intent was accepted")
+	}
+	intent.Kind = fleetRuntimeEffectExtension
+	payload, err = msgpack.Marshal(map[string]string{
+		"server_id": "server-1", "node_id": "node-1", "container_id": "container-1", "extension": "rcon", "rcon_action": "stop",
+	})
+	if err != nil {
+		t.Fatalf("marshal rejected extension payload: %v", err)
+	}
+	intent.Payload = payload
+	if _, ok := fleetRuntimeEffectStubResult(intent); ok {
+		t.Fatal("non-save_flush RCON intent was accepted")
+	}
+}
+
+// ---- status signal effect stub -------------------------------------------
+//
+// effect.status.signal accepts one typed status publication. The hermetic
+// harness echoes its bounded identity into a canonical receipt; it never
+// accepts a URL, headers, credentials, or another effect kind.
+
+const (
+	statusSignalEffectCapability = "effect.status.signal"
+	statusSignalEffectKind       = "pulp.effect.status.signal.publish.v1"
+)
+
+type statusSignalEffectPayload struct {
+	Target        string `msgpack:"target"`
+	Signal        string `msgpack:"signal"`
+	Detail        string `msgpack:"detail"`
+	ExpiresAtUnix int64  `msgpack:"expires_at_unix"`
+}
+
+type statusSignalEffectResult struct {
+	Target        string `msgpack:"target"`
+	Signal        string `msgpack:"signal"`
+	ExpiresAtUnix int64  `msgpack:"expires_at_unix"`
+}
+
+func statusSignalEffectStubCapability() ext.Capability {
+	bind := func(builder wazero.HostModuleBuilder, _ ext.Cell) error {
+		publish := func(ctx context.Context, module api.Module, requestPtr, requestLen, responsePtrOut, responseLenOut uint32) uint32 {
+			if module == nil || module.Memory() == nil {
+				return 2
+			}
+			request, ok := module.Memory().Read(requestPtr, requestLen)
+			if !ok {
+				return 2
+			}
+			var intent fleetRuntimeEffectIntent
+			if err := msgpack.Unmarshal(request, &intent); err != nil {
+				return 3
+			}
+			result, ok := statusSignalEffectStubResult(intent)
+			if !ok {
+				return 4
+			}
+			receipt := fleetRuntimeEffectReceipt{
+				Version: "pulp.effect.v1", IntentID: intent.ID, Kind: intent.Kind,
+				IdempotencyKey: intent.IdempotencyKey, Status: "completed", Result: result,
+			}
+			return writeStubMsgpack(ctx, module, receipt, responsePtrOut, responseLenOut)
+		}
+		builder.NewFunctionBuilder().WithFunc(publish).Export("status_signal_publish")
+		return nil
+	}
+	return ext.Capability{Name: statusSignalEffectCapability, Register: bind, Stub: bind}
+}
+
+func statusSignalEffectStubResult(intent fleetRuntimeEffectIntent) (msgpack.RawMessage, bool) {
+	if intent.Version != "pulp.effect.v1" || intent.Kind != statusSignalEffectKind ||
+		strings.TrimSpace(intent.ID) == "" || strings.TrimSpace(intent.IdempotencyKey) == "" {
+		return nil, false
+	}
+	var fields map[string]msgpack.RawMessage
+	if err := msgpack.Unmarshal(intent.Payload, &fields); err != nil || len(fields) != 4 {
+		return nil, false
+	}
+	for name := range fields {
+		switch name {
+		case "target", "signal", "detail", "expires_at_unix":
+		default:
+			return nil, false
+		}
+	}
+	var payload statusSignalEffectPayload
+	if err := msgpack.Unmarshal(intent.Payload, &payload); err != nil {
+		return nil, false
+	}
+	switch payload.Target {
+	case "payments", "provisioner", "email":
+	default:
+		return nil, false
+	}
+	switch payload.Signal {
+	case "ok", "degraded", "down":
+	default:
+		return nil, false
+	}
+	if payload.Detail == "" || payload.Detail != strings.TrimSpace(payload.Detail) || len(payload.Detail) > 512 || payload.ExpiresAtUnix <= 0 {
+		return nil, false
+	}
+	for _, value := range payload.Detail {
+		if value < 0x20 || value == 0x7f {
+			return nil, false
+		}
+	}
+	result, err := msgpack.Marshal(statusSignalEffectResult{
+		Target: payload.Target, Signal: payload.Signal, ExpiresAtUnix: payload.ExpiresAtUnix,
+	})
+	if err != nil {
+		return nil, false
+	}
+	return result, true
+}
+
+func TestStatusSignalEffectStubCapabilityIsNarrow(t *testing.T) {
+	payload, err := msgpack.Marshal(statusSignalEffectPayload{
+		Target: "payments", Signal: "degraded", Detail: "payment provider latency", ExpiresAtUnix: 1_800_000_000,
+	})
+	if err != nil {
+		t.Fatalf("marshal valid status signal: %v", err)
+	}
+	intent := fleetRuntimeEffectIntent{
+		Version: "pulp.effect.v1", ID: "status-1", Kind: statusSignalEffectKind, IdempotencyKey: "status:payments:1", Payload: payload,
+	}
+	result, ok := statusSignalEffectStubResult(intent)
+	if !ok {
+		t.Fatal("valid status signal was rejected")
+	}
+	var decoded statusSignalEffectResult
+	if err := msgpack.Unmarshal(result, &decoded); err != nil {
+		t.Fatalf("decode status signal receipt result: %v", err)
+	}
+	if decoded.Target != "payments" || decoded.Signal != "degraded" || decoded.ExpiresAtUnix != 1_800_000_000 {
+		t.Fatalf("deterministic status result = %#v", decoded)
+	}
+
+	intent.Kind = "pulp.effect.notification.email.send.v1"
+	if _, ok := statusSignalEffectStubResult(intent); ok {
+		t.Fatal("non-status effect was accepted")
+	}
+	intent.Kind = statusSignalEffectKind
+	intent.Payload, err = msgpack.Marshal(map[string]any{
+		"target": "payments", "signal": "ok", "detail": "healthy", "expires_at_unix": int64(1_800_000_000), "url": "https://arbitrary.invalid",
+	})
+	if err != nil {
+		t.Fatalf("marshal arbitrary HTTP payload: %v", err)
+	}
+	if _, ok := statusSignalEffectStubResult(intent); ok {
+		t.Fatal("status signal with an arbitrary HTTP field was accepted")
+	}
+	intent.Payload, err = msgpack.Marshal(statusSignalEffectPayload{
+		Target: "arbitrary", Signal: "ok", Detail: "healthy", ExpiresAtUnix: 1_800_000_000,
+	})
+	if err != nil {
+		t.Fatalf("marshal invalid target payload: %v", err)
+	}
+	if _, ok := statusSignalEffectStubResult(intent); ok {
+		t.Fatal("status signal with an arbitrary target was accepted")
+	}
 }
 
 // ---- workers stub --------------------------------------------------------
@@ -604,6 +970,7 @@ func evolutionStubOverrides() []ext.Capability {
 		stripeStubCapability(),
 		s3StubCapability(),
 		dockerStubCapability(),
+		fleetRuntimeEffectStubCapability(),
 		workersStubCapability(),
 		siblingStubCapability(),
 		crossApplicationHarnessStubCapability(),

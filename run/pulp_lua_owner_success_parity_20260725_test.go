@@ -1,12 +1,11 @@
 package run
 
 import (
+	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
 	"net/http"
 	"path/filepath"
@@ -53,6 +52,7 @@ func TestPulpLuaOwnerSuccessfulParity20260725(t *testing.T) {
 	recorder := &pulpLuaOwnerStripeRecorder{}
 	capabilities := evolutionAppCapabilities()
 	capabilities["payment.stripe"] = pulpLuaOwnerStripeCapability(recorder)
+	capabilities["effect.stripe.runtime"] = pulpLuaOwnerStripeRuntimeCapability(recorder)
 	storageRoot := t.TempDir()
 	endpoints := NewEndpointRegistry()
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
@@ -64,8 +64,6 @@ func TestPulpLuaOwnerSuccessfulParity20260725(t *testing.T) {
 	t.Cleanup(func() { started.close(context.Background()) })
 
 	seedPulpLuaOwnerControl(t, ctx, started.cells["control"].cell)
-	legacy := openPulpLuaOwnerSessionsDB(t, storageRoot, application)
-	seedPulpLuaOwnerSessionsCatalog(t, legacy)
 	seedPulpLuaOwnerFleetNode(t, ctx, started.cells["fleet"].cell, "initial", 8, 0)
 
 	baseAddress, ok := endpoints.ApplicationAddress(
@@ -87,7 +85,6 @@ func TestPulpLuaOwnerSuccessfulParity20260725(t *testing.T) {
 			"server_type": "minecraft",
 			"tier_id":     "standard",
 		}
-		assertPulpLuaOwnerCheckoutPreflight(t, ctx, started.cells["sessions"].cell, fields)
 		response := dispatchPulpLuaOwnerCheckout(t, baseURL, fields)
 		if response.Status != http.StatusOK ||
 			response.JSON["client_secret"] != "pi_owner_parity_secret" ||
@@ -157,7 +154,6 @@ func TestPulpLuaOwnerSuccessfulParity20260725(t *testing.T) {
 		// notification/deploy actions. The real Evolution HTTP adapter must
 		// execute those ordered actions, reread terminal Commerce state, and
 		// only then preserve the legacy 200 response.
-		seedPulpLuaOwnerCoupon(t, legacy, "FREEPARITY", 1400)
 		seedPulpLuaOwnerCommerceCoupon(t, ctx, started.cells["commerce"].cell, "FREEPARITY", 1400)
 		before := recorder.snapshot()
 		response := dispatchPulpLuaOwnerCheckout(t, baseURL, map[string]any{
@@ -284,47 +280,6 @@ func dispatchPulpLuaOwnerCheckout(t *testing.T, baseURL string, fields map[strin
 	return pulpLuaOwnerHTTPResponse{Status: response.StatusCode, Body: raw, JSON: decoded}
 }
 
-func pulpLuaOwnerCheckoutRequestWire(t *testing.T, fields map[string]any) []byte {
-	t.Helper()
-	body := map[string]any{
-		"age_confirmed": true,
-		"tos_accepted":  true,
-		"eula_accepted": true,
-	}
-	for key, value := range fields {
-		body[key] = value
-	}
-	bodyWire, err := json.Marshal(body)
-	if err != nil {
-		t.Fatalf("encode checkout: %v", err)
-	}
-	requestWire, err := msgpack.Marshal(map[string]any{
-		"method": "POST", "path": "/api/checkout", "client_ip": "198.51.100.25",
-		"headers": map[string]string{"Content-Type": "application/json"},
-		"body":    bodyWire,
-	})
-	if err != nil {
-		t.Fatalf("encode checkout gene request: %v", err)
-	}
-	return requestWire
-}
-
-func assertPulpLuaOwnerCheckoutPreflight(t *testing.T, ctx context.Context, sessions *host.Cell, fields map[string]any) map[string]any {
-	t.Helper()
-	response, err := sessions.Call(ctx, "sessions.checkout.preflight.v1", pulpLuaOwnerCheckoutRequestWire(t, fields))
-	if err != nil {
-		t.Fatalf("Sessions checkout preflight: %v", err)
-	}
-	var plan map[string]any
-	if err := msgpack.Unmarshal(response, &plan); err != nil {
-		t.Fatalf("decode Sessions checkout preflight: %v", err)
-	}
-	if fmt.Sprint(plan["http_status"]) != "200" {
-		t.Fatalf("Sessions checkout preflight = %#v", plan)
-	}
-	return plan
-}
-
 func dispatchPulpLuaOwnerEvent(t *testing.T, ctx context.Context, orchestrator *host.Cell, event string, payload any) luaDispatchResult {
 	t.Helper()
 	request, err := msgpack.Marshal(luaDispatchRequest{Event: event, Payload: payload})
@@ -416,137 +371,6 @@ func seedPulpLuaOwnerControl(t *testing.T, ctx context.Context, control *host.Ce
 	}
 	if _, err := control.Call(ctx, "control.v1.import_legacy_projection", request); err != nil {
 		t.Fatalf("seed Control owner: %v", err)
-	}
-}
-
-func openPulpLuaOwnerSessionsDB(t *testing.T, storageRoot string, application HostedApplication) *sql.DB {
-	t.Helper()
-	root := evolutionHostedStorageRoot(storageRoot, application)
-	var path string
-	err := filepath.WalkDir(root, func(candidate string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() || entry.Name() != "data.db" {
-			return nil
-		}
-		normalized := filepath.ToSlash(candidate)
-		if strings.Contains(normalized, "/cells/sessions/") {
-			path = candidate
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("find scoped Sessions reference database: %v", err)
-	}
-	if path == "" {
-		t.Fatalf("scoped Sessions reference database is absent under %s", root)
-	}
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatalf("open Sessions reference database: %v", err)
-	}
-	db.SetMaxOpenConns(1)
-	for _, pragma := range []string{"PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=5000"} {
-		if _, err := db.Exec(pragma); err != nil {
-			_ = db.Close()
-			t.Fatalf("Sessions reference database %s: %v", pragma, err)
-		}
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
-}
-
-func seedPulpLuaOwnerSessionsCatalog(t *testing.T, db *sql.DB) {
-	t.Helper()
-	const schema = `
-CREATE TABLE IF NOT EXISTS user_bans (
-	id TEXT PRIMARY KEY,
-	email TEXT NOT NULL UNIQUE,
-	expires_at TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS servers (
-	id TEXT PRIMARY KEY,
-	state TEXT NOT NULL,
-	cpu_weight REAL NOT NULL DEFAULT 0,
-	memory_weight REAL NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS game_visibility (
-	template TEXT NOT NULL,
-	tier_id TEXT NOT NULL DEFAULT '',
-	game_id TEXT NOT NULL,
-	label TEXT,
-	enabled BOOLEAN NOT NULL DEFAULT FALSE,
-	hidden BOOLEAN NOT NULL DEFAULT FALSE,
-	engine TEXT NOT NULL DEFAULT '',
-	price_override INTEGER,
-	duration_override TEXT,
-	max_players_override INTEGER,
-	tagline_override TEXT,
-	tags_override_json TEXT,
-	description_override TEXT,
-	max_instances INTEGER,
-	extend_instant_pct INTEGER,
-	extend_queued_pct INTEGER,
-	config_json TEXT,
-	PRIMARY KEY (template, tier_id)
-);
-CREATE TABLE IF NOT EXISTS tiers (
-	id TEXT PRIMARY KEY,
-	name TEXT NOT NULL UNIQUE,
-	label TEXT NOT NULL,
-	price_cents INTEGER NOT NULL DEFAULT 0,
-	duration TEXT NOT NULL,
-	extend_instant_pct INTEGER NOT NULL DEFAULT 75,
-	extend_queued_pct INTEGER NOT NULL DEFAULT 50,
-	max_cpu REAL NOT NULL DEFAULT 0,
-	max_ram_mb INTEGER NOT NULL DEFAULT 0,
-	enabled BOOLEAN NOT NULL DEFAULT TRUE,
-	sort_order INTEGER NOT NULL DEFAULT 0,
-	created_at TIMESTAMP NOT NULL
-);
-CREATE TABLE IF NOT EXISTS coupons (
-	id TEXT PRIMARY KEY,
-	code TEXT NOT NULL UNIQUE,
-	discount_cents INTEGER NOT NULL DEFAULT 0,
-	max_uses INTEGER NOT NULL DEFAULT 0,
-	uses INTEGER NOT NULL DEFAULT 0,
-	note TEXT NOT NULL DEFAULT '',
-	expires_at TIMESTAMP,
-	created_at TIMESTAMP NOT NULL
-);`
-	if _, err := db.Exec(schema); err != nil {
-		t.Fatalf("create Sessions checkout reference schema: %v", err)
-	}
-	now := time.Now().UTC()
-	if _, err := db.Exec(
-		`INSERT INTO tiers (id, name, label, price_cents, duration, enabled, sort_order, max_cpu, max_ram_mb, created_at)
-		 VALUES ('standard','session','Standard',1400,'336h',1,0,2.0,4096,?)`, now,
-	); err != nil {
-		t.Fatalf("seed Sessions tier: %v", err)
-	}
-	if _, err := db.Exec(
-		`INSERT INTO game_visibility (template, tier_id, game_id, label, enabled)
-		 VALUES ('minecraft','standard','minecraft','Minecraft',1)`,
-	); err != nil {
-		t.Fatalf("seed Sessions visibility: %v", err)
-	}
-	if _, err := db.Exec("PRAGMA wal_checkpoint(PASSIVE)"); err != nil {
-		t.Fatalf("checkpoint Sessions catalog: %v", err)
-	}
-}
-
-func seedPulpLuaOwnerCoupon(t *testing.T, db *sql.DB, code string, discountCents int64) {
-	t.Helper()
-	if _, err := db.Exec(
-		`INSERT INTO coupons (id, code, discount_cents, max_uses, uses, created_at)
-		 VALUES (?, ?, ?, 0, 0, ?)`,
-		"coupon-"+strings.ToLower(code), code, discountCents, time.Now().UTC(),
-	); err != nil {
-		t.Fatalf("seed Sessions coupon %s: %v", code, err)
-	}
-	if _, err := db.Exec("PRAGMA wal_checkpoint(PASSIVE)"); err != nil {
-		t.Fatalf("checkpoint Sessions coupon: %v", err)
 	}
 }
 
@@ -754,6 +578,123 @@ func pulpLuaOwnerStripeCapability(recorder *pulpLuaOwnerStripeRecorder) ext.Capa
 		return nil
 	}
 	return ext.Capability{Name: "payment.stripe", Register: bind, Stub: bind}
+}
+
+// pulpLuaOwnerStripeRuntimeCapability mirrors the production narrow Stripe
+// runtime ABI: it receives one canonical effect intent and returns its exact
+// completed receipt. Keep it distinct from payment.stripe so this fixture does
+// not accidentally conceal a capability-boundary regression.
+func pulpLuaOwnerStripeRuntimeCapability(recorder *pulpLuaOwnerStripeRecorder) ext.Capability {
+	bind := func(builder wazero.HostModuleBuilder, _ ext.Cell) error {
+		execute := func(ctx context.Context, module api.Module, requestPtr, requestLen, responsePtr, responseLen uint32) uint32 {
+			if requestLen == 0 {
+				return 1
+			}
+			wire, ok := module.Memory().Read(requestPtr, requestLen)
+			if !ok {
+				return 2
+			}
+			var intent pulpLuaOwnerStripeEffectIntent
+			decoder := msgpack.NewDecoder(bytes.NewReader(wire))
+			decoder.DisallowUnknownFields(true)
+			if err := decoder.Decode(&intent); err != nil || !intent.valid() {
+				return 3
+			}
+
+			var result any
+			switch intent.Kind {
+			case pulpLuaOwnerStripePaymentIntentCreate:
+				recorder.record("stripe_payment_intent_create")
+				result = map[string]any{"id": "pi_owner_parity", "payment_intent": "pi_owner_parity", "client_secret": "pi_owner_parity_secret", "status": "requires_payment_method"}
+			case pulpLuaOwnerStripeCustomerCreate:
+				recorder.record("stripe_customer_create")
+				var payload struct {
+					Email string `msgpack:"email"`
+				}
+				if err := msgpack.Unmarshal(intent.Payload, &payload); err != nil {
+					return 3
+				}
+				result = map[string]any{"customer_id": "cus_owner_parity", "email": payload.Email}
+			case pulpLuaOwnerStripeSetupIntentCreate:
+				recorder.record("stripe_setup_intent_create")
+				result = map[string]any{"id": "seti_owner_parity", "setup_intent": "seti_owner_parity", "client_secret": "seti_owner_parity_secret", "status": "requires_payment_method"}
+			case pulpLuaOwnerStripeInvoiceItemCreate:
+				recorder.record("stripe_invoice_item_create")
+				result = map[string]any{"invoice_item_id": "ii_owner_parity"}
+			case pulpLuaOwnerStripeInvoiceCreate:
+				recorder.record("stripe_invoice_create")
+				result = map[string]any{"invoice_id": "in_owner_parity", "status": "draft", "amount_due": int64(0), "amount_paid": int64(0)}
+			case pulpLuaOwnerStripeInvoiceFinalize, pulpLuaOwnerStripeInvoiceMarkPaid:
+				var payload struct {
+					InvoiceID string `msgpack:"invoice_id"`
+				}
+				if err := msgpack.Unmarshal(intent.Payload, &payload); err != nil || payload.InvoiceID == "" {
+					return 3
+				}
+				if intent.Kind == pulpLuaOwnerStripeInvoiceFinalize {
+					recorder.record("stripe_invoice_finalize")
+					result = map[string]any{"invoice_id": payload.InvoiceID, "status": "open", "amount_due": int64(0), "amount_paid": int64(0)}
+				} else {
+					recorder.record("stripe_invoice_mark_paid_out_of_band")
+					result = map[string]any{"invoice_id": payload.InvoiceID, "status": "paid", "amount_due": int64(0), "amount_paid": int64(0)}
+				}
+			default:
+				return 3
+			}
+
+			encodedResult, err := msgpack.Marshal(result)
+			if err != nil {
+				return 4
+			}
+			receipt := pulpLuaOwnerStripeEffectReceipt{
+				Version:        intent.Version,
+				IntentID:       intent.ID,
+				Kind:           intent.Kind,
+				IdempotencyKey: intent.IdempotencyKey,
+				Status:         "completed",
+				Result:         encodedResult,
+			}
+			return writePulpLuaOwnerStripeMsgpack(ctx, module, receipt, responsePtr, responseLen)
+		}
+		builder.NewFunctionBuilder().WithFunc(execute).Export("stripe_effect_execute")
+		return nil
+	}
+	return ext.Capability{Name: "effect.stripe.runtime", Register: bind, Stub: bind}
+}
+
+const (
+	pulpLuaOwnerStripeEffectVersion       = "pulp.effect.v1"
+	pulpLuaOwnerStripePaymentIntentCreate = "pulp.effect.stripe.payment-intent.create.v1"
+	pulpLuaOwnerStripeCustomerCreate      = "pulp.effect.stripe.customer.create.v1"
+	pulpLuaOwnerStripeSetupIntentCreate   = "pulp.effect.stripe.setup-intent.create.v1"
+	pulpLuaOwnerStripeInvoiceItemCreate   = "pulp.effect.stripe.invoice-item.create.v1"
+	pulpLuaOwnerStripeInvoiceCreate       = "pulp.effect.stripe.invoice.create.v1"
+	pulpLuaOwnerStripeInvoiceFinalize     = "pulp.effect.stripe.invoice.finalize.v1"
+	pulpLuaOwnerStripeInvoiceMarkPaid     = "pulp.effect.stripe.invoice.mark-paid.v1"
+)
+
+// These mirror Fiber's canonical effect intent/receipt wire fields without
+// adding Fiber as a Pulp test-module dependency.
+type pulpLuaOwnerStripeEffectIntent struct {
+	Version        string             `msgpack:"version"`
+	ID             string             `msgpack:"id"`
+	Kind           string             `msgpack:"kind"`
+	IdempotencyKey string             `msgpack:"idempotency_key"`
+	Payload        msgpack.RawMessage `msgpack:"payload"`
+}
+
+func (intent pulpLuaOwnerStripeEffectIntent) valid() bool {
+	return intent.Version == pulpLuaOwnerStripeEffectVersion && intent.ID != "" &&
+		intent.IdempotencyKey != "" && len(intent.Payload) != 0
+}
+
+type pulpLuaOwnerStripeEffectReceipt struct {
+	Version        string             `msgpack:"version"`
+	IntentID       string             `msgpack:"intent_id"`
+	Kind           string             `msgpack:"kind"`
+	IdempotencyKey string             `msgpack:"idempotency_key"`
+	Status         string             `msgpack:"status"`
+	Result         msgpack.RawMessage `msgpack:"result"`
 }
 
 func readPulpLuaOwnerStripeMsgpack(module api.Module, ptr, size uint32, out any) {

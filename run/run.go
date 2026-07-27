@@ -210,7 +210,7 @@ func (h *directApplicationHost) startPollsters(logger *slog.Logger) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	for _, capability := range ext.All() {
+	for _, capability := range h.runtime.allCaps {
 		if capability.Poll == nil || !h.runtime.declaredUnion[capability.Name] {
 			continue
 		}
@@ -398,7 +398,11 @@ func (h *hostedApplicationHost) startPollsters(logger *slog.Logger) error {
 		}
 	}
 	h.pollStop = make(chan struct{})
-	for _, capability := range ext.All() {
+	allCaps, err := selectedRuntimeCapabilities()
+	if err != nil {
+		return err
+	}
+	for _, capability := range allCaps {
 		if capability.Poll == nil || !declared[capability.Name] {
 			continue
 		}
@@ -682,7 +686,11 @@ func Main() {
 	// Union of capabilities declared across all cells — each gets its
 	// Setup called at most once regardless of how many cells declared
 	// it. The registry is shared across cell Loads.
-	allCaps := ext.All()
+	allCaps, err := selectedRuntimeCapabilities()
+	if err != nil {
+		logger.Error("capability provider selection failed", "err", err)
+		os.Exit(1)
+	}
 	capByName := map[string]ext.Capability{}
 	for _, c := range allCaps {
 		capByName[c.Name] = c

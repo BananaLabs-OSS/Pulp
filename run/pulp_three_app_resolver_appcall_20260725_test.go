@@ -68,8 +68,8 @@ func TestPulpThreeApplicationResolverAppCall20260725(t *testing.T) {
 		t.Fatalf("load hosted applications: %v", err)
 	}
 	if len(applications) != 3 ||
-		applications[0].Identity != (ApplicationIdentity{ApplicationID: "minecraft-resolver", InstanceID: "primary"}) ||
-		applications[1].Identity != (ApplicationIdentity{ApplicationID: "sessions", InstanceID: "primary"}) ||
+		applications[0].Identity != (ApplicationIdentity{ApplicationID: "sessions", InstanceID: "primary"}) ||
+		applications[1].Identity != (ApplicationIdentity{ApplicationID: "minecraft-resolver", InstanceID: "primary"}) ||
 		applications[2].Identity != (ApplicationIdentity{ApplicationID: "evolution", InstanceID: "primary"}) ||
 		len(applications[2].DependsOn) != 2 ||
 		applications[2].DependsOn[0] != "minecraft-resolver" ||

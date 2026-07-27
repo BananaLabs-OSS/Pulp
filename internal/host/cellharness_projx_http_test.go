@@ -31,7 +31,7 @@ func TestProjxCell_HTTP_EditorOverExtHTTP(t *testing.T) {
 	// --- POST /api/mutate: reorder + rename through real HTTP ---
 	reqBody, _ := json.Marshal(map[string]any{
 		"src": string(src), "old": "ErrExtensionPanic", "new": "PanicError",
-		"func_a": "HostFunc", "func_b": "RecoverHost",
+		"func_a": "HostFunc2", "func_b": "RecoverHost",
 	})
 	resp, err := http.Post(h.URL+"/api/mutate", "application/json", bytes.NewReader(reqBody))
 	if err != nil {
@@ -72,7 +72,7 @@ func TestProjxCell_HTTP_EditorOverExtHTTP(t *testing.T) {
 		out.Lossless, out.Reordered, out.RenamedIdents, out.CommentsBefore, out.CommentsAfter, len(out.Source))
 
 	// --- POST /api/project: read side ---
-	pBody, _ := json.Marshal(map[string]any{"name": "safe.go", "src": string(src), "func": "HostFunc"})
+	pBody, _ := json.Marshal(map[string]any{"name": "safe.go", "src": string(src), "func": "HostFunc2"})
 	pResp, err := http.Post(h.URL+"/api/project", "application/json", bytes.NewReader(pBody))
 	if err != nil {
 		t.Fatalf("POST /api/project: %v", err)

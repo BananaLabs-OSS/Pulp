@@ -107,7 +107,7 @@ func TestProjxCell_MutateLosslessInRealHost(t *testing.T) {
 	}
 
 	args, err := msgpack.Marshal(projxMutateReq{
-		Src: src, Old: "ErrExtensionPanic", New: "PanicError", FuncA: "HostFunc", FuncB: "RecoverHost",
+		Src: src, Old: "ErrExtensionPanic", New: "PanicError", FuncA: "HostFunc2", FuncB: "RecoverHost",
 	})
 	if err != nil {
 		t.Fatalf("marshal mutate req: %v", err)
@@ -153,7 +153,7 @@ func TestProjxCell_ProjectReadSideInRealHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read safe.go: %v", err)
 	}
-	args, err := msgpack.Marshal(projxProjectReq{Name: "safe.go", Src: src, Func: "HostFunc"})
+	args, err := msgpack.Marshal(projxProjectReq{Name: "safe.go", Src: src, Func: "HostFunc2"})
 	if err != nil {
 		t.Fatalf("marshal project req: %v", err)
 	}
@@ -169,5 +169,5 @@ func TestProjxCell_ProjectReadSideInRealHost(t *testing.T) {
 	if resp.Nodes < 1 {
 		t.Fatalf("projection returned no nodes: %+v", resp)
 	}
-	t.Logf("real-host editor.project HostFunc: nodes=%d control=%d depth=%d", resp.Nodes, resp.Control, resp.Depth)
+	t.Logf("real-host editor.project HostFunc2: nodes=%d control=%d depth=%d", resp.Nodes, resp.Control, resp.Depth)
 }

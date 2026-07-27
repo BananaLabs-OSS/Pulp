@@ -23,6 +23,8 @@ package host
 
 import (
 	"database/sql"
+	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -66,19 +68,12 @@ func serverCountForOrder(t *testing.T, db *sql.DB, orderID string) int {
 func TestEvolution_Enqueue_CreatesServerForPaidOrder(t *testing.T) {
 	h, db := startEvolutionDowntime(t)
 	seedDowntimeCatalog(t, db)
-	seedOrderRow(t, db, "ord-paid", "paid", false, false)
-
-	var template, shareToken string
-	driveUntil(t, h, db, "paid order enqueued to a server", func() bool {
-		return db.QueryRow(
-			`SELECT template, share_token FROM servers WHERE order_id = 'ord-paid'`,
-		).Scan(&template, &shareToken) == nil
-	})
-	if template != "minecraft" {
-		t.Fatalf("server template = %q, want minecraft", template)
-	}
-	if shareToken == "" {
-		t.Fatal("expected a generated share_token on the enqueued server")
+	orderID, order := ownerCheckoutPending(t, h, "enqueue-paid-owner", "paid@example.test", nil)
+	settleOwnerCheckout(t, h, "evt-enqueue-paid-owner", order)
+	server := fleetServerForID(t, h, orderID+"-server")
+	if server.OrderID != orderID || server.NodeID == "" ||
+		(server.Status != "provisioning" && server.Status != "ready") {
+		t.Fatalf("paid Commerce order did not reach Fleet provisioning: %#v", server)
 	}
 }
 
@@ -87,15 +82,9 @@ func TestEvolution_Enqueue_CreatesServerForPaidOrder(t *testing.T) {
 func TestEvolution_Enqueue_SkipsNonPaidOrders(t *testing.T) {
 	h, db := startEvolutionDowntime(t)
 	seedDowntimeCatalog(t, db)
-	seedOrderRow(t, db, "ord-pending", "pending", false, false)
-
-	// Pump several ticks; a pending order must NOT produce a server.
-	for i := 0; i < 12; i++ {
-		driveTick(h, db)
-		time.Sleep(20 * time.Millisecond)
-	}
-	if n := serverCountForOrder(t, db, "ord-pending"); n != 0 {
-		t.Fatalf("pending order must not be enqueued, got %d servers", n)
+	orderID, _ := ownerCheckoutPending(t, h, "enqueue-pending-owner", "pending@example.test", nil)
+	if fleetServerExists(t, h, orderID+"-server") {
+		t.Fatal("pending Commerce order must not create a Fleet server")
 	}
 }
 
@@ -104,14 +93,12 @@ func TestEvolution_Enqueue_SkipsNonPaidOrders(t *testing.T) {
 func TestEvolution_Enqueue_SkipsUnclaimedGifts(t *testing.T) {
 	h, db := startEvolutionDowntime(t)
 	seedDowntimeCatalog(t, db)
-	seedOrderRow(t, db, "ord-gift-unclaimed", "paid", true, false)
-
-	for i := 0; i < 12; i++ {
-		driveTick(h, db)
-		time.Sleep(20 * time.Millisecond)
-	}
-	if n := serverCountForOrder(t, db, "ord-gift-unclaimed"); n != 0 {
-		t.Fatalf("unclaimed gift must not be enqueued, got %d servers", n)
+	orderID, order := ownerCheckoutPending(t, h, "enqueue-gift-unclaimed-owner", "buyer@example.test", map[string]any{
+		"is_gift": true,
+	})
+	settleOwnerCheckout(t, h, "evt-enqueue-gift-unclaimed-owner", order)
+	if fleetServerExists(t, h, orderID+"-server") {
+		t.Fatal("unclaimed Commerce gift must not create a Fleet server")
 	}
 }
 
@@ -120,11 +107,77 @@ func TestEvolution_Enqueue_SkipsUnclaimedGifts(t *testing.T) {
 func TestEvolution_Enqueue_EnqueuesClaimedGifts(t *testing.T) {
 	h, db := startEvolutionDowntime(t)
 	seedDowntimeCatalog(t, db)
-	seedOrderRow(t, db, "ord-gift-claimed", "paid", true, true)
+	const key = "enqueue-gift-claimed-owner"
+	setStripeStubPIStatus("requires_capture")
+	status, response := postCheckoutWithHeaders(t, h, map[string]any{
+		"server_type": "minecraft", "email": "buyer@example.test", "is_gift": true,
+	}, map[string]string{"Idempotency-Key": key})
+	if status != 200 {
+		t.Fatalf("gift checkout: want 200, got %d (%v)", status, response)
+	}
+	orderID := deterministicHarnessIdentifier("order", key)
+	order := commerceOrderForID(t, h, orderID)
+	settleOwnerCheckout(t, h, "evt-enqueue-gift-claimed-owner", order)
+	giftToken := fmt.Sprint(response["gift_token"])
+	if giftToken == "" || giftToken == "<nil>" {
+		t.Fatalf("gift checkout returned no token: %v", response)
+	}
 
-	driveUntil(t, h, db, "claimed gift enqueued to a server", func() bool {
-		return serverCountForOrder(t, db, "ord-gift-claimed") > 0
+	giftStatus, giftBody := h.Do("GET", "/api/gift/"+giftToken, nil, nil)
+	var giftResponse map[string]any
+	_ = json.Unmarshal(giftBody, &giftResponse)
+	if giftStatus != 200 || giftResponse["status"] != "unclaimed" {
+		t.Fatalf("gift HTTP read through Pulp -> Lua -> Commerce = %d %#v", giftStatus, giftResponse)
+	}
+
+	claimRequest, _ := json.Marshal(map[string]any{
+		"username": "Recipient", "email": "recipient@example.test",
 	})
+	claimStatus, claimBody := h.Do(
+		"POST", "/api/gift/"+giftToken+"/claim",
+		map[string]string{"Content-Type": "application/json"}, claimRequest,
+	)
+	var claimResponse map[string]any
+	_ = json.Unmarshal(claimBody, &claimResponse)
+	if claimStatus != 200 || claimResponse["order_id"] != orderID ||
+		fmt.Sprint(claimResponse["claim_token"]) == "" {
+		t.Fatalf("gift HTTP claim through Pulp -> Lua -> owners = %d %#v", claimStatus, claimResponse)
+	}
+	server := fleetServerForID(t, h, orderID+"-server")
+	if server.OrderID != orderID || server.NodeID == "" ||
+		(server.Status != "provisioning" && server.Status != "ready") {
+		t.Fatalf("claimed gift did not reach Fleet through Lua: %#v", server)
+	}
+}
+
+func TestEvolution_GiftCancellation_UsesLuaCommerceOwner(t *testing.T) {
+	h, db := startEvolutionDowntime(t)
+	seedDowntimeCatalog(t, db)
+	const key = "gift-cancel-owner"
+	setStripeStubPIStatus("requires_capture")
+	status, response := postCheckoutWithHeaders(t, h, map[string]any{
+		"server_type": "minecraft", "email": "buyer@example.test", "is_gift": true,
+	}, map[string]string{"Idempotency-Key": key})
+	if status != 200 {
+		t.Fatalf("gift checkout: want 200, got %d (%v)", status, response)
+	}
+	orderID := deterministicHarnessIdentifier("order", key)
+	settleOwnerCheckout(t, h, "evt-gift-cancel-owner", commerceOrderForID(t, h, orderID))
+	giftToken := fmt.Sprint(response["gift_token"])
+
+	cancelRequest, _ := json.Marshal(map[string]any{"email": "buyer@example.test"})
+	cancelStatus, cancelBody := h.Do(
+		"POST", "/api/gift/"+giftToken+"/cancel",
+		map[string]string{"Content-Type": "application/json"}, cancelRequest,
+	)
+	var cancelResponse map[string]any
+	_ = json.Unmarshal(cancelBody, &cancelResponse)
+	if cancelStatus != 200 || cancelResponse["refunded"] != true {
+		t.Fatalf("gift cancellation through Pulp -> Lua -> Commerce = %d %#v", cancelStatus, cancelResponse)
+	}
+	if got := commerceOrderForID(t, h, orderID).Status; got != "refund_pending" && got != "refunded" {
+		t.Fatalf("Commerce did not own gift cancellation state: %q", got)
+	}
 }
 
 // TestEvolution_CheckExpirations_ActiveServerExpires ports the
@@ -133,34 +186,12 @@ func TestEvolution_Enqueue_EnqueuesClaimedGifts(t *testing.T) {
 // now leaves the active state on a driven tick — the cell's own checkExpirations
 // runs the active->expiring->expired transition.
 func TestEvolution_CheckExpirations_ActiveServerExpires(t *testing.T) {
-	h, db := startEvolutionDowntime(t)
-
-	srvID, _, _, _ := provisionActiveServer(t, h, db, "expire@example.com")
-
-	// Backdate promoted_at + expires_at so the server is well past its term.
-	past := time.Now().UTC().Add(-24 * time.Hour)
-	if _, err := db.Exec(
-		`UPDATE servers SET promoted_at = ?, expires_at = ? WHERE id = ?`,
-		time.Now().UTC().Add(-30*24*time.Hour), past, srvID,
-	); err != nil {
-		t.Fatalf("backdate expiry for %s: %v", srvID, err)
-	}
-	checkpoint(db)
-
-	driveUntil(t, h, db, "active server past expiry leaves active state", func() bool {
-		var state string
-		if db.QueryRow(`SELECT state FROM servers WHERE id = ?`, srvID).Scan(&state) != nil {
-			return false
-		}
-		return state != "active"
-	})
-
-	var state string
-	if err := db.QueryRow(`SELECT state FROM servers WHERE id = ?`, srvID).Scan(&state); err != nil {
-		t.Fatalf("read final state: %v", err)
-	}
-	// The native fallback path fires both transitions in one tick -> expired.
-	if state != "expired" && state != "expiring" {
-		t.Fatalf("expected expiring/expired after backdated expiry, got %q", state)
+	h, _ := startEvolutionDowntime(t)
+	now := time.Now().UTC()
+	const serverID = "fleet-expired-server"
+	upsertFleetServer(t, h, serverID, "active", now.Add(-24*time.Hour).Format(time.RFC3339Nano))
+	dispatchFleetMaintenance(t, h, "maintenance-expired-server", now)
+	if state := fleetServerForID(t, h, serverID).Status; state != "destroyed" {
+		t.Fatalf("expired Fleet server without a runtime should be destroyed, got %q", state)
 	}
 }

@@ -20,25 +20,131 @@ package host
 // native unit tests pin, reached through the cell's real step loop.
 
 import (
-	"database/sql"
+	"context"
+	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/vmihailenco/msgpack/v5"
 )
 
-// seedServerRow inserts a server row directly on the cell's connection (the
-// same reference-data pattern seedOrderRow uses), so the enqueue path can see
-// an order that already owns a server.
-func seedServerRow(t *testing.T, db *sql.DB, id, orderID, state string) {
+type fleetQueueValue struct {
+	OrderID  string `msgpack:"order_id"`
+	ServerID string `msgpack:"server_id"`
+	Sequence int64  `msgpack:"sequence"`
+	Position int    `msgpack:"position"`
+}
+
+func fleetQueue(t *testing.T, h *CellHarness) []fleetQueueValue {
 	t.Helper()
-	now := time.Now().UTC()
-	if _, err := db.Exec(
-		`INSERT INTO servers (id, order_id, template, state, created_at, cpu_weight, memory_weight, restart_count)
-		 VALUES (?, ?, 'minecraft', ?, ?, 0.33, 3, 0)`,
-		id, orderID, state, now,
-	); err != nil {
-		t.Fatalf("seed server %s: %v", id, err)
+	request, err := msgpack.Marshal(map[string]any{})
+	if err != nil {
+		t.Fatalf("encode Fleet queue query: %v", err)
 	}
-	checkpoint(db)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	response, err := h.cellsByName["fleet"].Call(ctx, "fleet.v1.query.queue.list", request)
+	if err != nil {
+		t.Fatalf("query Fleet queue: %v", err)
+	}
+	var queue []fleetQueueValue
+	if err := msgpack.Unmarshal(response, &queue); err != nil {
+		t.Fatalf("decode Fleet queue: %v", err)
+	}
+	return queue
+}
+
+func upsertFleetServer(t *testing.T, h *CellHarness, serverID, status, expiresAt string) {
+	t.Helper()
+	upsertFleetServerValue(t, h, map[string]any{
+		"id": serverID, "order_id": "order-" + serverID,
+		"template": "minecraft", "status": status, "expires_at": expiresAt,
+	})
+}
+
+func upsertFleetServerValue(t *testing.T, h *CellHarness, server map[string]any) {
+	t.Helper()
+	serverID, _ := server["id"].(string)
+	if serverID == "" {
+		t.Fatal("Fleet server fixture requires id")
+	}
+	request, err := msgpack.Marshal(map[string]any{
+		"id":     "test-upsert:" + serverID,
+		"server": server,
+	})
+	if err != nil {
+		t.Fatalf("encode Fleet server upsert: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := h.cellsByName["fleet"].Call(ctx, "fleet.v1.command.server.upsert", request); err != nil {
+		t.Fatalf("upsert Fleet server %s: %v", serverID, err)
+	}
+}
+
+func dispatchFleetMaintenance(t *testing.T, h *CellHarness, requestID string, now time.Time) {
+	t.Helper()
+	dispatchFleetMaintenanceRequest(t, h, map[string]any{
+		"request_id": requestID,
+		"now":        now.UTC().Format(time.RFC3339Nano),
+		"limit":      uint32(100),
+	})
+}
+
+func dispatchFleetMaintenanceRequest(t *testing.T, h *CellHarness, maintenance map[string]any) {
+	t.Helper()
+	request := struct {
+		Event   string `msgpack:"event"`
+		Payload any    `msgpack:"payload"`
+	}{
+		Event:   "fleet.workflow.maintenance.sweep.v1",
+		Payload: map[string]any{"request": maintenance},
+	}
+	wire, err := msgpack.Marshal(request)
+	if err != nil {
+		t.Fatalf("encode Fleet maintenance workflow: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := h.cellsByName["lua-orchestrator"].Call(ctx, "orchestrator.dispatch", wire); err != nil {
+		t.Fatalf("dispatch Fleet maintenance through Lua: %v", err)
+	}
+}
+
+type notificationIntentValue struct {
+	ID      string             `msgpack:"id"`
+	Kind    string             `msgpack:"kind"`
+	Payload msgpack.RawMessage `msgpack:"payload"`
+}
+
+func claimNotifications(t *testing.T, h *CellHarness, consumer string) []notificationIntentValue {
+	t.Helper()
+	request, err := msgpack.Marshal(map[string]any{
+		"version": "pulp.effect.outbox.v1", "owner": "sessions.notifications",
+		"consumer_id": consumer, "limit": uint32(100), "lease_duration_millis": int64(60_000),
+	})
+	if err != nil {
+		t.Fatalf("encode notification claim: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	raw, err := h.cellsByName["effects"].Call(ctx, "effect.outbox.claim.v1", request)
+	if err != nil {
+		t.Fatalf("claim notification outbox: %v", err)
+	}
+	var result struct {
+		Leases []struct {
+			Intent notificationIntentValue `msgpack:"intent"`
+		} `msgpack:"leases"`
+	}
+	if err := msgpack.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("decode notification claim: %v", err)
+	}
+	intents := make([]notificationIntentValue, len(result.Leases))
+	for i, lease := range result.Leases {
+		intents[i] = lease.Intent
+	}
+	return intents
 }
 
 // TestEvolution_Enqueue_SkipsOrdersWithExistingServers ports
@@ -47,17 +153,16 @@ func seedServerRow(t *testing.T, db *sql.DB, id, orderID, state string) {
 func TestEvolution_Enqueue_SkipsOrdersWithExistingServers(t *testing.T) {
 	h, db := startEvolutionDowntime(t)
 	seedDowntimeCatalog(t, db)
-	seedOrderRow(t, db, "ord-has-srv", "paid", false, false)
-	seedServerRow(t, db, "srv-existing", "ord-has-srv", "active")
+	orderID, order := ownerCheckoutPending(t, h, "enqueue-existing-owner", "existing@example.test", nil)
+	settleOwnerCheckout(t, h, "evt-enqueue-existing-owner", order)
+	first := fleetServerForID(t, h, orderID+"-server")
 
-	// Pump several ticks; the order already has a server, so enqueue must
-	// not create a second one.
-	for i := 0; i < 12; i++ {
-		driveTick(h, db)
-		time.Sleep(20 * time.Millisecond)
-	}
-	if n := serverCountForOrder(t, db, "ord-has-srv"); n != 1 {
-		t.Fatalf("order with existing server must not be re-enqueued, got %d servers", n)
+	// Stripe retries the same durable event. Commerce and Fleet must replay the
+	// owner commands without creating a second server or changing its identity.
+	settleOwnerCheckout(t, h, "evt-enqueue-existing-owner", order)
+	replayed := fleetServerForID(t, h, orderID+"-server")
+	if replayed.ID != first.ID || replayed.OrderID != orderID || replayed.NodeID != first.NodeID {
+		t.Fatalf("duplicate payment delivery changed Fleet ownership: first=%#v replay=%#v", first, replayed)
 	}
 }
 
@@ -74,21 +179,33 @@ func TestEvolution_Enqueue_SkipsOrdersWithExistingServers(t *testing.T) {
 // provision (already-active orders are skipped by enqueue) while still proving
 // each paid order lands its own distinct server.
 func TestEvolution_Enqueue_AssignsServersFIFO(t *testing.T) {
-	h, db := startEvolutionDowntime(t)
+	setStripeStubSetupPM(t, "pm_stub_card")
+	h, db := startEvolutionDowntimeExtra(t, "", capacityFullCfg)
 	seedDowntimeCatalog(t, db)
 
-	for _, id := range []string{"ord-f1", "ord-f2", "ord-f3"} {
-		orderID := id
-		seedOrderRow(t, db, orderID, "paid", false, false)
-		driveUntil(t, h, db, "paid order "+orderID+" enqueued to a server", func() bool {
-			return serverCountForOrder(t, db, orderID) > 0
-		})
+	queuedOrders := make([]string, 0, 3)
+	for index, key := range []string{"enqueue-fifo-1", "enqueue-fifo-2", "enqueue-fifo-3"} {
+		queuedOrders = append(queuedOrders, reservedOwnerCheckout(
+			t, h, db, key, key+"@example.test",
+		))
+		if index < 2 {
+			// Commerce's portable FIFO fact is second-granularity. Distinct
+			// creation instants make this compatibility proof deterministic.
+			time.Sleep(1100 * time.Millisecond)
+		}
 	}
 
-	// All three orders own exactly one server each.
-	for _, id := range []string{"ord-f1", "ord-f2", "ord-f3"} {
-		if n := serverCountForOrder(t, db, id); n != 1 {
-			t.Fatalf("order %s should own exactly 1 server, got %d", id, n)
+	var queue []fleetQueueValue
+	driveUntil(t, h, db, "reserved orders to enter the Fleet queue", func() bool {
+		queue = fleetQueue(t, h)
+		return len(queue) == len(queuedOrders)
+	})
+	for i, orderID := range queuedOrders {
+		if queue[i].OrderID != orderID || queue[i].ServerID != orderID+"-server" {
+			t.Fatalf("Fleet queue lost checkout order at position %d: got %#v want order %s", i+1, queue[i], orderID)
+		}
+		if i > 0 && queue[i].Sequence <= queue[i-1].Sequence {
+			t.Fatalf("Fleet queue sequence is not FIFO: %#v", queue)
 		}
 	}
 }
@@ -99,24 +216,65 @@ func TestEvolution_Enqueue_AssignsServersFIFO(t *testing.T) {
 func TestEvolution_Enqueue_PreservesExtendServerID(t *testing.T) {
 	h, db := startEvolutionDowntime(t)
 	seedDowntimeCatalog(t, db)
-
+	const (
+		originalOrderID = "extension-original-order"
+		serverID        = "extension-original-server"
+		ownerEmail      = "extension-original-order@e.com"
+	)
+	seedOrderRow(t, db, originalOrderID, "fulfilled", false, false)
 	now := time.Now().UTC()
 	if _, err := db.Exec(
-		`INSERT INTO orders (id, stripe_session_id, server_type, tier_id, email, status, auto_redeem, extend_server_id, created_at)
-		 VALUES ('ord-ext','ss_ord-ext','minecraft','standard','ext@e.com','paid',0,'orig-server-1',?)`, now,
+		`INSERT INTO servers (id, order_id, template, state, created_at, expires_at, cpu_weight, memory_weight, restart_count)
+		 VALUES (?, ?, 'minecraft', 'expiring', ?, ?, 0.33, 3, 0)`,
+		serverID, originalOrderID, now, now.Add(30*24*time.Hour),
 	); err != nil {
-		t.Fatalf("seed extend order: %v", err)
+		t.Fatalf("seed extension target server: %v", err)
 	}
 	checkpoint(db)
 
-	var extends string
-	driveUntil(t, h, db, "extend order enqueued to a server", func() bool {
-		return db.QueryRow(
-			`SELECT extends_server_id FROM servers WHERE order_id = 'ord-ext'`,
-		).Scan(&extends) == nil
+	const key = "enqueue-preserve-extension-owner"
+	body, err := json.Marshal(map[string]any{
+		"server_id": serverID,
+		"email":     ownerEmail,
 	})
-	if extends != "orig-server-1" {
-		t.Fatalf("extends_server_id = %q, want orig-server-1", extends)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, response := h.Do("POST", "/api/extend-checkout", map[string]string{
+		"Content-Type": "application/json", "Idempotency-Key": key,
+	}, body)
+	if status != 200 {
+		t.Fatalf("extension checkout: want 200, got %d (%s)", status, response)
+	}
+
+	request, err := msgpack.Marshal(map[string]any{
+		"request_id": deterministicHarnessIdentifier("request", key),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	raw, err := h.cellsByName["commerce"].Call(ctx, "commerce.extension.get.v1", request)
+	if err != nil {
+		t.Fatalf("query Commerce extension saga: %v", err)
+	}
+	var result struct {
+		OK    bool `msgpack:"ok"`
+		Value struct {
+			Order struct {
+				ExtendServerID string `msgpack:"extend_server_id"`
+			} `msgpack:"order"`
+			Server struct {
+				ID string `msgpack:"id"`
+			} `msgpack:"server"`
+		} `msgpack:"value"`
+	}
+	if err := msgpack.Unmarshal(raw, &result); err != nil || !result.OK {
+		t.Fatalf("decode Commerce extension saga: result=%#v err=%v", result, err)
+	}
+	if result.Value.Order.ExtendServerID != serverID || result.Value.Server.ID != serverID {
+		t.Fatalf("extension lost target server identity: saga=%#v want=%s", result.Value, serverID)
 	}
 }
 
@@ -125,22 +283,13 @@ func TestEvolution_Enqueue_PreservesExtendServerID(t *testing.T) {
 // term remaining) stays active across driven ticks — checkExpirations does NOT
 // prematurely move it out of the active state.
 func TestEvolution_CheckExpirations_ActiveNotYetExpiring(t *testing.T) {
-	h, db := startEvolutionDowntime(t)
-
-	srvID, _, _, _ := provisionActiveServer(t, h, db, "fresh@example.com")
-
-	// The server was just provisioned with a full term; drive several ticks
-	// and confirm it never leaves active.
-	for i := 0; i < 12; i++ {
-		driveTick(h, db)
-		time.Sleep(20 * time.Millisecond)
-	}
-	var state string
-	if err := db.QueryRow(`SELECT state FROM servers WHERE id = ?`, srvID).Scan(&state); err != nil {
-		t.Fatalf("read state: %v", err)
-	}
-	if state != "active" {
-		t.Fatalf("fresh server should stay active, got %q", state)
+	h, _ := startEvolutionDowntime(t)
+	now := time.Now().UTC()
+	const serverID = "fleet-fresh-server"
+	upsertFleetServer(t, h, serverID, "active", now.Add(30*24*time.Hour).Format(time.RFC3339Nano))
+	dispatchFleetMaintenance(t, h, "maintenance-fresh-server", now)
+	if state := fleetServerForID(t, h, serverID).Status; state != "active" {
+		t.Fatalf("fresh Fleet server should stay active, got %q", state)
 	}
 }
 
@@ -148,22 +297,12 @@ func TestEvolution_CheckExpirations_ActiveNotYetExpiring(t *testing.T) {
 // with no servers present, driven ticks make no server-state changes and the
 // cell stays healthy.
 func TestEvolution_CheckExpirations_NoChange(t *testing.T) {
-	h, db := startEvolutionDowntime(t)
-	seedDowntimeCatalog(t, db)
-
-	for i := 0; i < 10; i++ {
-		driveTick(h, db)
-		time.Sleep(15 * time.Millisecond)
+	h, _ := startEvolutionDowntime(t)
+	dispatchFleetMaintenance(t, h, "maintenance-empty-fleet", time.Now().UTC())
+	if queue := fleetQueue(t, h); len(queue) != 0 {
+		t.Fatalf("empty Fleet maintenance created queue state: %#v", queue)
 	}
-	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM servers`).Scan(&n); err != nil {
-		t.Fatalf("count servers: %v", err)
-	}
-	if n != 0 {
-		t.Fatalf("no orders seeded, expected 0 servers, got %d", n)
-	}
-	// The cell still serves requests (healthy) after the empty ticks.
 	if s, _ := h.Do("GET", "/health", nil, nil); s != 200 {
-		t.Fatalf("cell unhealthy after empty ticks: /health = %d", s)
+		t.Fatalf("cell unhealthy after empty owner maintenance: /health = %d", s)
 	}
 }

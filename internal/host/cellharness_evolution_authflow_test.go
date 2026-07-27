@@ -7,19 +7,26 @@ package host
 // seeding claim_tokens / orders on the cell's own SQLite.
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 func seedClaimToken(t *testing.T, db *sql.DB, token, email string, claimed bool, expiresAt time.Time) {
 	t.Helper()
 	now := time.Now().UTC()
+	createdAt := now
+	if !expiresAt.After(createdAt) {
+		createdAt = expiresAt.Add(-time.Hour)
+	}
 	if _, err := db.Exec(
 		`INSERT INTO claim_tokens (id, email, token, claimed, expires_at, created_at, ip_address)
 		 VALUES (?, ?, ?, ?, ?, ?, '')`,
-		"ct-"+token, email, token, boolInt(claimed), expiresAt, now,
+		"ct-"+token, email, token, boolInt(claimed), expiresAt, createdAt,
 	); err != nil {
 		t.Fatalf("seed claim token %s: %v", token, err)
 	}
@@ -48,13 +55,33 @@ func postMagicLink(t *testing.T, h *CellHarness, email string) (int, map[string]
 	return status, out
 }
 
-func claimTokenCountForEmail(t *testing.T, db *sql.DB, email string) int {
+func claimTokenCountForEmail(t *testing.T, h *CellHarness, email string) int {
 	t.Helper()
-	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM claim_tokens WHERE LOWER(email) = LOWER(?)`, email).Scan(&n); err != nil {
-		t.Fatalf("count claim tokens for %s: %v", email, err)
+	identity := h.cellsByName["identity"]
+	if identity == nil {
+		t.Fatal("Evolution harness did not load Identity")
 	}
-	return n
+	request, err := msgpack.Marshal(map[string]any{"email": email, "purpose": "login"})
+	if err != nil {
+		t.Fatalf("encode Identity claim-list request: %v", err)
+	}
+	response, err := identity.Call(context.Background(), "identity.v1.claim.list", request)
+	if err != nil {
+		t.Fatalf("query Identity claims for %s: %v", email, err)
+	}
+	var result struct {
+		OK    bool `msgpack:"ok"`
+		Value []struct {
+			Email string `msgpack:"email"`
+		} `msgpack:"value"`
+	}
+	if err := msgpack.Unmarshal(response, &result); err != nil {
+		t.Fatalf("decode Identity claim-list response for %s: %v", email, err)
+	}
+	if !result.OK {
+		t.Fatalf("Identity claim-list failed for %s", email)
+	}
+	return len(result.Value)
 }
 
 // --- /api/claim ---
@@ -137,12 +164,12 @@ func TestEvolution_MagicLink_MissingEmail(t *testing.T) {
 // TestMagicLink_UnknownEmailSilentSuccess: an email with no footprint returns
 // {sent:true} (anti-enumeration) but creates NO token.
 func TestEvolution_MagicLink_UnknownEmailSilentSuccess(t *testing.T) {
-	h, db := startEvolutionDowntime(t)
+	h, _ := startEvolutionDowntime(t)
 	status, out := postMagicLink(t, h, "nobody@example.com")
 	if status != 200 || out["sent"] != true {
 		t.Fatalf("unknown email: want 200 {sent:true}, got %d (%v)", status, out)
 	}
-	if n := claimTokenCountForEmail(t, db, "nobody@example.com"); n != 0 {
+	if n := claimTokenCountForEmail(t, h, "nobody@example.com"); n != 0 {
 		t.Fatalf("no token should be created for an unknown email, got %d", n)
 	}
 }
@@ -165,7 +192,7 @@ func TestEvolution_MagicLink_CreatesTokenForKnownUser(t *testing.T) {
 	if status != 200 || out["sent"] != true {
 		t.Fatalf("known user: want 200 {sent:true}, got %d (%v)", status, out)
 	}
-	if n := claimTokenCountForEmail(t, db, "known@example.com"); n != 1 {
+	if n := claimTokenCountForEmail(t, h, "known@example.com"); n != 1 {
 		t.Fatalf("expected exactly 1 token minted for a known user, got %d", n)
 	}
 }
@@ -187,7 +214,7 @@ func TestEvolution_MagicLink_CaseInsensitive(t *testing.T) {
 	if status != 200 || out["sent"] != true {
 		t.Fatalf("case-insensitive: want 200 {sent:true}, got %d (%v)", status, out)
 	}
-	if n := claimTokenCountForEmail(t, db, "user@example.com"); n != 1 {
+	if n := claimTokenCountForEmail(t, h, "user@example.com"); n != 1 {
 		t.Fatalf("expected a token minted for the case-insensitive match, got %d", n)
 	}
 }

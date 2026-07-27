@@ -43,11 +43,8 @@ func TestEvolution_Checkout_LargeDiscountMakesFree(t *testing.T) {
 	if orderID == "" {
 		t.Fatalf("expected order_id on a free checkout, got %v", out)
 	}
-	var amount int
-	if err := db.QueryRow(`SELECT amount_cents FROM orders WHERE id = ?`, orderID).Scan(&amount); err != nil {
-		t.Fatalf("read free order amount: %v", err)
-	}
-	if amount != 0 {
-		t.Fatalf("large discount should clamp order amount to 0, got %d", amount)
+	order := commerceOrderForID(t, h, orderID)
+	if order.AmountCents != 0 {
+		t.Fatalf("large discount should clamp order amount to 0, got %d", order.AmountCents)
 	}
 }

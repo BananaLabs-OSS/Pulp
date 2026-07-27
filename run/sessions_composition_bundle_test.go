@@ -243,11 +243,17 @@ func exerciseStagedSessionsComposition(t *testing.T, set *manifest.Set) {
 func stageSessionsCompositionWASM(t *testing.T, spec *manifest.CellSpec, cache string) string {
 	t.Helper()
 	sourceDir := filepath.Dir(spec.ManifestPath)
-	// The application owns the Lua *manifest* beside evolution.lua, but the
-	// reusable Lua cell's Go source lives in its own package. All other current
-	// cells keep their manifest and source together.
-	if spec.Name == "lua-orchestrator" {
+	// The application owns the Lua *manifest* beside evolution.lua, while the
+	// reusable Lua cell's Go source lives in its own package. Likewise, the
+	// compatibility manifest for minecraft-resolver lives beside Evolution but
+	// deliberately pins the production resolver artifact. Build the owner
+	// sources in both cases so staging cannot substitute Evolution's WASM under
+	// the resolver's narrower manifest and capability declaration.
+	switch spec.Name {
+	case "lua-orchestrator":
 		sourceDir = filepath.Join(sourceDir, "..", "..", "Pulp-Lua", "pulp-cell")
+	case "minecraft-resolver":
+		sourceDir = filepath.Join(sourceDir, "..", "..", "minecraft-resolver", "pulp-cell")
 	}
 	goSources, err := filepath.Glob(filepath.Join(sourceDir, "*.go"))
 	if err != nil {

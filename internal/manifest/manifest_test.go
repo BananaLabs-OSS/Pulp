@@ -100,6 +100,36 @@ name = "hill-alpha"
 	}
 }
 
+func TestLoad_NestedConfigRemainsFreeForm(t *testing.T) {
+	path := writeManifest(t, `
+name = "http-probe"
+version = "1"
+
+[config]
+http_probe = { destinations = { "status.website.6227748c2fbaff8f" = { url = "https://sessions.gg/", method = "GET", timeout_ms = 5000 } } }
+`)
+	spec, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	probe, ok := spec.Config["http_probe"].(map[string]any)
+	if !ok {
+		t.Fatalf("http_probe config = %#v", spec.Config["http_probe"])
+	}
+	destinations, ok := probe["destinations"].(map[string]any)
+	if !ok {
+		t.Fatalf("destinations config = %#v", probe["destinations"])
+	}
+	destination, ok := destinations["status.website.6227748c2fbaff8f"].(map[string]any)
+	if !ok {
+		t.Fatalf("destination config = %#v", destinations["status.website.6227748c2fbaff8f"])
+	}
+	if destination["url"] != "https://sessions.gg/" || destination["method"] != "GET" || destination["timeout_ms"] != int64(5000) {
+		t.Fatalf("destination config = %#v", destination)
+	}
+}
+
 func TestLoadNormalizesWASMSHA256(t *testing.T) {
 	digest := sha256.Sum256([]byte("package bytes"))
 	path := writeManifest(t, fmt.Sprintf("\nname = \"pinned\"\nversion = \"1\"\nwasm_sha256 = \"%X\"\n", digest))
