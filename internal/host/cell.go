@@ -35,6 +35,12 @@ const (
 	// pinning a core and the cell mutex; override via `call_timeout_ms`.
 	DefaultCallTimeout = 30 * time.Second
 
+	// DefaultMaxMessageBytes bounds one event payload, sibling-call argument,
+	// or sibling-call response. A cell has a fixed linear-memory budget and
+	// guest allocators intentionally retain their high-water mark, so allowing
+	// an unbounded message lets one request permanently consume a cell.
+	DefaultMaxMessageBytes = 8 * 1024 * 1024
+
 	// reentrantCallGrace bounds how long Call waits for the cell mutex before
 	// declaring a (likely re-entrant / loopback) busy condition. A legitimate
 	// concurrent step releases the mutex in microseconds; a re-entrant
@@ -51,23 +57,18 @@ type Limits struct {
 	// CallTimeout bounds a single WASM entry point. 0 => default.
 	CallTimeout time.Duration
 
-	// Interruptible OPTS THIS CELL INTO wazero's WithCloseOnContextDone so a
-	// runaway guest (an infinite loop / hang inside pulp_step / pulp_on_call)
-	// is TERMINATED when its call context reaches its deadline, instead of
-	// pinning a goroutine (and the cell mutex) forever. This is the primitive
-	// the cell Supervisor's runaway guard stands on (see supervisor.go).
-	//
-	// It is OFF BY DEFAULT and purely additive: a cell loaded without it keeps
-	// the exact behaviour documented on Load below (no per-call termination
-	// checks, runaway loops unbounded), so Call/CallTyped/Step for every
-	// existing cell are byte-for-byte unchanged. When a supervised cell trips
-	// its deadline wazero closes the MODULE (per WithCloseOnContextDone's
-	// contract), so the terminated cell is dead and must be re-instantiated —
-	// exactly the kill-then-restart shape the crash supervisor already handles.
+	// Interruptible is retained for source compatibility. Calls are interruptible
+	// by default; use DisableInterruptible only for a deliberately trusted,
+	// externally-supervised compatibility cell.
 	Interruptible bool
+	// DisableInterruptible opts a cell out of wazero's WithCloseOnContextDone.
+	// It should be exceptional: without interruption, a guest infinite loop can
+	// hold the cell mutex forever and no restart policy can recover it.
+	DisableInterruptible bool
+
 }
 
-func (l *Limits) interruptible() bool { return l != nil && l.Interruptible }
+func (l *Limits) interruptible() bool { return l == nil || !l.DisableInterruptible }
 
 func (l *Limits) maxMemoryPages() uint32 {
 	if l != nil && l.MaxMemoryPages != 0 {
@@ -403,6 +404,9 @@ func (p *Cell) Step(ctx context.Context, env abi.StepEnvelope) (outputHandle int
 	defer cancel()
 
 	input := env.Encode()
+	if len(input) > DefaultMaxMessageBytes {
+		return 0, ErrMessageTooLarge
+	}
 	var ptr uint32
 	if len(env.Payload) == 0 && p.idleInputPtr != 0 && p.idleInputSize >= uint32(len(input)) {
 		if !p.module.Memory().Write(p.idleInputPtr, input) {
@@ -462,6 +466,8 @@ func (p *Cell) HasProvider() bool {
 // the cell author sees a clear "cycle" signal instead of a hung host.
 var ErrReentrantCall = errors.New("re-entrant / loopback sibling call rejected (cell already executing)")
 
+var ErrMessageTooLarge = fmt.Errorf("cell message exceeds %d-byte limit", DefaultMaxMessageBytes)
+
 func (p *Cell) Call(ctx context.Context, funcName string, args []byte) ([]byte, error) {
 	// Do NOT block indefinitely on p.mu: a sibling call cycle (A->B->A) or
 	// a self-targeted call re-enters this method on the same goroutine that
@@ -476,6 +482,9 @@ func (p *Cell) Call(ctx context.Context, funcName string, args []byte) ([]byte, 
 
 	if p.onCallFn == nil {
 		return nil, fmt.Errorf("cell %q does not export pulp_on_call (or is closed)", p.name)
+	}
+	if len(funcName) > DefaultMaxMessageBytes || len(args) > DefaultMaxMessageBytes {
+		return nil, ErrMessageTooLarge
 	}
 
 	callCtx, cancel := p.callContext(ctx)
@@ -527,16 +536,20 @@ func (p *Cell) Call(ctx context.Context, funcName string, args []byte) ([]byte, 
 	if respLen == 0 {
 		return nil, nil
 	}
+	if respLen > DefaultMaxMessageBytes {
+		return nil, ErrMessageTooLarge
+	}
 	resp, ok := p.module.Memory().Read(respPtr, respLen)
 	if !ok {
 		return nil, errors.New("read response bytes failed")
 	}
 	out := make([]byte, len(resp))
 	copy(out, resp)
-	// The cell's pulp_on_call allocated the response via pulp_alloc;
-	// the cell is responsible for its own cleanup via pulp_free-like
-	// semantics. We do NOT free it here because the cell might be
-	// holding a reference. If the cell wants to pool, it will.
+	// Fiber's legacy sibling dispatcher pins this response in the same
+	// allocTable as pulp_alloc specifically until the host has copied it.
+	// Release it now: retaining it leaks one guest buffer per successful
+	// cross-cell call and eventually exhausts the fixed WASM memory cap.
+	p.free(callCtx, respPtr, respLen)
 	return out, nil
 }
 
@@ -590,6 +603,9 @@ func (p *Cell) CallTyped(ctx context.Context, funcName string, args []byte,
 	if p.postReturnFn == nil {
 		return ErrNoPostReturn
 	}
+	if len(funcName) > DefaultMaxMessageBytes || len(args) > DefaultMaxMessageBytes {
+		return ErrMessageTooLarge
+	}
 
 	callCtx, cancel := p.callContext(ctx)
 	defer cancel()
@@ -636,6 +652,9 @@ func (p *Cell) CallTyped(ctx context.Context, funcName string, args []byte,
 	respLen, ok := p.module.Memory().ReadUint32Le(outPtr + 4)
 	if !ok {
 		return errors.New("read respLen failed")
+	}
+	if respLen > DefaultMaxMessageBytes {
+		return ErrMessageTooLarge
 	}
 
 	// Lift the typed value while the tree is still pinned (pulp_post_return has

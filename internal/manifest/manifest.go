@@ -92,7 +92,7 @@ type CellSpec struct {
 	// runaway wasm loop requires an out-of-band supervisor.
 	CallTimeoutMS uint32
 
-	// Restart is the post-exit policy: "never" (default), "on_crash", or
+	// Restart is the post-exit policy: "on_crash" (default), "never", or
 	// "always". Parsed + validated now; the supervisor that honors it ships
 	// in a later Pulp version.
 	Restart string
@@ -222,7 +222,12 @@ func normalize(r *raw, manifestPath string) (*CellSpec, error) {
 
 	restart := strings.TrimSpace(r.Restart)
 	if restart == "" {
-		restart = RestartNever
+		// A cell is an independently recoverable unit. Leaving the default at
+		// "never" turns one guest OOM or trap into a permanent application
+		// outage until the whole host is restarted. The runtime's supervisor has
+		// a bounded five-restarts-per-30-seconds circuit breaker, so on_crash is
+		// both the safe default and still protects the host from crash loops.
+		restart = RestartOnCrash
 	}
 	switch restart {
 	case RestartNever, RestartOnCrash, RestartAlways:
