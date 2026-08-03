@@ -1156,7 +1156,13 @@ func reinstantiateCell(rt *cellRuntime, logger *slog.Logger) bool {
 func stepLoop(rt *cellRuntime, capByName map[string]ext.Capability, logger *slog.Logger) {
 	const (
 		idleMin     = 200 * time.Microsecond
-		idleMax     = 10 * time.Millisecond
+		// An idle step allocates a StepEnvelope inside each WASM cell.  WASM
+		// linear memory can grow but does not shrink, so a 10ms ceiling turns an
+		// otherwise idle cell into a permanent ~100 allocations/second memory
+		// fuse.  Event delivery still wakes the loop immediately; this ceiling
+		// governs only the no-work path and keeps autonomous cell ticks timely
+		// without exhausting every long-lived cell in a few days.
+		idleMax     = time.Second
 		idleRampAge = time.Second
 	)
 	idleSleep := idleMin

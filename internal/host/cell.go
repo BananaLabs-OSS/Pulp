@@ -112,6 +112,14 @@ type Cell struct {
 	// ExportsPostReturn / CallTyped.
 	postReturnFn api.Function
 
+	// idleInputPtr is a host-owned reusable StepEnvelope buffer for idle
+	// polling. Idle envelopes are always the fixed header size, and no guest
+	// code receives a payload from them, so the same allocation is safe to
+	// overwrite after pulp_step returns. Keeping it avoids growing guest linear
+	// memory on every no-work scheduler tick.
+	idleInputPtr  uint32
+	idleInputSize uint32
+
 	// mu serializes entry points that execute WASM code. wazero modules
 	// are not goroutine-safe, and sibling calls can enter the cell
 	// concurrently with its own step loop — the mutex prevents race
@@ -395,11 +403,25 @@ func (p *Cell) Step(ctx context.Context, env abi.StepEnvelope) (outputHandle int
 	defer cancel()
 
 	input := env.Encode()
-	ptr, err := p.writeBytes(callCtx, input)
-	if err != nil {
-		return 0, fmt.Errorf("write envelope: %w", err)
+	var ptr uint32
+	if len(env.Payload) == 0 && p.idleInputPtr != 0 && p.idleInputSize >= uint32(len(input)) {
+		if !p.module.Memory().Write(p.idleInputPtr, input) {
+			return 0, fmt.Errorf("write idle envelope out of range at %d", p.idleInputPtr)
+		}
+		ptr = p.idleInputPtr
+	} else {
+		var err error
+		ptr, err = p.writeBytes(callCtx, input)
+		if err != nil {
+			return 0, fmt.Errorf("write envelope: %w", err)
+		}
+		if len(env.Payload) == 0 {
+			p.idleInputPtr = ptr
+			p.idleInputSize = uint32(len(input))
+		} else {
+			defer p.free(callCtx, ptr, uint32(len(input)))
+		}
 	}
-	defer p.free(callCtx, ptr, uint32(len(input)))
 
 	results, err := p.stepFn.Call(callCtx, uint64(ptr), uint64(len(input)))
 	if err != nil {
