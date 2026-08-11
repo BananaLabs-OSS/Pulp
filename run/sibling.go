@@ -108,6 +108,11 @@ func siblingCapabilityWithCrossApplication(reg *siblingRegistry, crossApplicatio
 
 					// Permission check against the caller's manifest.
 					if !allowedToCall(reg, caller, target, funcName) {
+						slog.Default().Warn("pulp_call denied by manifest",
+							"caller", caller,
+							"target", target,
+							"provider", funcName,
+						)
 						return 11 // "not allowed"
 					}
 
