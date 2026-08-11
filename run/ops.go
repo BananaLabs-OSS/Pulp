@@ -84,9 +84,11 @@ func (o *runtimeOps) shutdownCell(name string) error {
 
 	// 1. Cancel the cell's context — its step goroutine exits.
 	rt.cancel()
+	if rt.stepDone != nil {
+		<-rt.stepDone
+	}
 
-	// 2. Shutdown the WASM module. Uses a fresh context because rt.ctx
-	// is already cancelled.
+	// 2. Shutdown the WASM module while its module context is still live.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if rt.cell != nil {
@@ -95,6 +97,9 @@ func (o *runtimeOps) shutdownCell(name string) error {
 		}
 		rt.cell.Close(context.Background())
 		rt.cell = nil
+	}
+	if rt.moduleCancel != nil {
+		rt.moduleCancel()
 	}
 
 	// 3. Call TeardownCell on each capability the cell declared —
@@ -268,6 +273,9 @@ func (o *runtimeOps) reloadCell(name string) error {
 		rt.cell.Close(context.Background())
 		rt.cell = nil
 	}
+	if rt.moduleCancel != nil {
+		rt.moduleCancel()
+	}
 
 	// 3. Drop per-cell host state (routes, sockets, DB handles) so the fresh
 	// Init re-registers cleanly instead of colliding with the old cell's.
@@ -294,8 +302,9 @@ func (o *runtimeOps) reloadCell(name string) error {
 		}
 	}
 
-	// 5. Fresh context + reload the WASM from disk.
-	rt.ctx, rt.cancel = context.WithCancel(o.parentCtx)
+	// 5. Fresh module and step contexts + reload the WASM from disk.
+	rt.ctx, rt.moduleCancel = context.WithCancel(o.parentCtx)
+	rt.stepCtx, rt.cancel = context.WithCancel(rt.ctx)
 	spec := rt.spec
 	configBytes, err := manifest.EncodeConfig(spec.Config)
 	if err != nil {

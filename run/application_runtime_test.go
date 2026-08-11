@@ -1,16 +1,68 @@
 package run
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/BananaLabs-OSS/Pulp/ext"
 	"github.com/BananaLabs-OSS/Pulp/internal/manifest"
 )
+
+// TestApplicationRuntimeShutdownDoesNotSuperviseCancelledIdleStep exercises
+// the production application teardown path while a restartable cell is taking
+// idle steps. Cancellation is the mechanism that wakes that loop, not a WASM
+// crash, so it must never trigger the crash supervisor to re-instantiate a
+// module with its already-cancelled runtime context.
+func TestApplicationRuntimeShutdownDoesNotSuperviseCancelledIdleStep(t *testing.T) {
+	root := t.TempDir()
+	builtWASM := buildLuaHarnessCell(t, filepath.Join("..", "testdata", "lua-math-engine"), "shutdown-idle", t.TempDir())
+	wasmPath := filepath.Join(root, "idle.wasm")
+	wasmBytes, err := os.ReadFile(builtWASM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(wasmPath, wasmBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writePlacementAppFile(t, root, "idle.cell.toml", fmt.Sprintf("name = \"idle\"\nversion = \"1\"\nwasm = %q\nrestart = \"on_crash\"\n", filepath.Base(wasmPath)))
+	script := "return true"
+	digest := sha256.Sum256([]byte(script))
+	appPath := writePlacementAppFile(t, root, "pulp.app.toml", fmt.Sprintf(`
+name = "shutdown-idle"
+version = "1"
+cells = ["idle.cell.toml"]
+[orchestrator]
+manifest = "idle.cell.toml"
+script = "app.lua"
+sha256 = "%x"
+`, digest))
+	writePlacementAppFile(t, root, "app.lua", script)
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	for attempt := 0; attempt < 25; attempt++ {
+		runtime, err := NewDirectApplicationRuntime(appPath, DirectApplicationOptions{Logger: logger})
+		if err != nil {
+			t.Fatalf("new runtime %d: %v", attempt, err)
+		}
+		if err := runtime.Start(context.Background()); err != nil {
+			t.Fatalf("start runtime %d: %v", attempt, err)
+		}
+		if err := runtime.Shutdown(context.Background()); err != nil {
+			t.Fatalf("shutdown runtime %d: %v", attempt, err)
+		}
+	}
+	if got := logs.String(); strings.Contains(got, "RE-INSTANTIATED") || strings.Contains(got, "re-instantiate:") {
+		t.Fatalf("shutdown cancellation unexpectedly triggered crash supervision:\n%s", got)
+	}
+}
 
 func TestApplicationRuntimeSiblingRegistryIsApplicationLocal(t *testing.T) {
 	provider := &cellRuntime{spec: &manifest.CellSpec{Name: "provider", Provides: []string{"math.sum"}}}
@@ -148,6 +200,13 @@ sha256 = "%x"
 	}
 	if got := publicRuntime.Identity(); got != (ApplicationIdentity{ApplicationID: "placement-test", InstanceID: "default"}) {
 		t.Fatalf("public direct identity = %s", got)
+	}
+	namedRuntime, err := NewDirectApplicationRuntime(appPath, DirectApplicationOptions{InstanceID: "named-instance"})
+	if err != nil {
+		t.Fatalf("new named direct runtime: %v", err)
+	}
+	if got := namedRuntime.Identity(); got != (ApplicationIdentity{ApplicationID: "placement-test", InstanceID: "named-instance"}) {
+		t.Fatalf("named direct identity = %s", got)
 	}
 	if err := publicRuntime.Start(ctx); err != nil {
 		t.Fatalf("start public direct runtime: %v", err)

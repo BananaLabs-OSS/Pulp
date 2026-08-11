@@ -51,9 +51,10 @@ const eventChanSize = 64
 // factories must apply the namespace-bearing scope themselves; these options
 // intentionally carry no process-global mutable application state.
 type HostRuntimeOptions struct {
-	StorageRoot string
-	HTTPPort    string
-	Logger      *slog.Logger
+	StorageRoot       string
+	StorageNamespaces map[string]string
+	HTTPPort          string
+	Logger            *slog.Logger
 }
 
 // DirectApplicationOptions configures one monolithic `pulp -app` runtime.
@@ -61,10 +62,14 @@ type HostRuntimeOptions struct {
 // NewDirectApplicationRuntime never reads or mutates the process-global
 // observer registration used by the CLI/deployment binary.
 type DirectApplicationOptions struct {
-	StorageRoot string
-	HTTPPort    string
-	Logger      *slog.Logger
-	Lifecycle   ApplicationLifecycleObserver
+	StorageRoot       string
+	StorageNamespaces map[string]string
+	HTTPPort          string
+	Logger            *slog.Logger
+	Lifecycle         ApplicationLifecycleObserver
+	// InstanceID distinguishes simultaneously hosted direct applications with
+	// the same manifest. An empty value preserves the historical default.
+	InstanceID string
 }
 
 func validateRuntimeInputs(hostPath, appPath string, manifestPaths []string) error {
@@ -141,7 +146,7 @@ func (r *directApplicationRuntime) Identity() ApplicationIdentity {
 	if r == nil || r.app == nil {
 		return ApplicationIdentity{}
 	}
-	return ApplicationIdentity{ApplicationID: r.app.Name, InstanceID: "default"}
+	return ApplicationIdentity{ApplicationID: r.app.Name, InstanceID: directInstanceID(r.options.InstanceID)}
 }
 
 func (r *directApplicationRuntime) Start(ctx context.Context) error {
@@ -154,10 +159,11 @@ func (r *directApplicationRuntime) Start(ctx context.Context) error {
 		return ErrMultiHostStopped
 	}
 	hosted, err := startDirectApplicationWithLifecycle(ctx, r.app, HostRuntimeOptions{
-		StorageRoot: r.options.StorageRoot,
-		HTTPPort:    r.options.HTTPPort,
-		Logger:      r.options.Logger,
-	}, r.options.Lifecycle)
+		StorageRoot:       r.options.StorageRoot,
+		StorageNamespaces: r.options.StorageNamespaces,
+		HTTPPort:          r.options.HTTPPort,
+		Logger:            r.options.Logger,
+	}, r.options.Lifecycle, directInstanceID(r.options.InstanceID))
 	if err != nil {
 		return err
 	}
@@ -178,22 +184,23 @@ func (r *directApplicationRuntime) Shutdown(ctx context.Context) error {
 }
 
 func startDirectApplication(ctx context.Context, app *manifest.Application, options HostRuntimeOptions) (*directApplicationHost, error) {
-	return startDirectApplicationWithLifecycle(ctx, app, options, registeredApplicationLifecycleObserver())
+	return startDirectApplicationWithLifecycle(ctx, app, options, registeredApplicationLifecycleObserver(), "default")
 }
 
-func startDirectApplicationWithLifecycle(ctx context.Context, app *manifest.Application, options HostRuntimeOptions, lifecycle ApplicationLifecycleObserver) (*directApplicationHost, error) {
+func startDirectApplicationWithLifecycle(ctx context.Context, app *manifest.Application, options HostRuntimeOptions, lifecycle ApplicationLifecycleObserver, instanceID string) (*directApplicationHost, error) {
 	if app == nil {
 		return nil, errors.New("application is required")
 	}
 	runtime := newApplicationRuntime(HostedApplication{
-		Identity:     ApplicationIdentity{ApplicationID: app.Name, InstanceID: "default"},
+		Identity:     ApplicationIdentity{ApplicationID: app.Name, InstanceID: directInstanceID(instanceID)},
 		ManifestPath: app.ManifestPath,
 	}, ScopedApplicationRuntimeFactoryConfig{
-		Registry:    host.NewRegistry(),
-		Limits:      &host.Limits{},
-		Logger:      options.Logger,
-		StorageRoot: options.StorageRoot,
-		HTTPPort:    options.HTTPPort,
+		Registry:          host.NewRegistry(),
+		Limits:            &host.Limits{},
+		Logger:            options.Logger,
+		StorageRoot:       options.StorageRoot,
+		StorageNamespaces: options.StorageNamespaces,
+		HTTPPort:          options.HTTPPort,
 		// Deployment-owned template bootstrap and effect pollers register through
 		// this same trusted observer in both monolithic and split modes.
 		Lifecycle: lifecycle,
@@ -204,6 +211,13 @@ func startDirectApplicationWithLifecycle(ctx context.Context, app *manifest.Appl
 	direct := &directApplicationHost{runtime: runtime, pollStop: make(chan struct{})}
 	direct.startPollsters(options.Logger)
 	return direct, nil
+}
+
+func directInstanceID(instanceID string) string {
+	if strings.TrimSpace(instanceID) == "" {
+		return "default"
+	}
+	return instanceID
 }
 
 func (h *directApplicationHost) startPollsters(logger *slog.Logger) {
@@ -468,11 +482,17 @@ type cellRuntime struct {
 	cell        *host.Cell
 	eventTarget string // ext.CellIDOf(cell); legacy cells retain spec.Name
 	events      chan routedEvent
-	ctx         context.Context
-	cancel      context.CancelFunc
-	declared    map[string]bool // capabilities this cell declared
-	readyCh     chan struct{}   // closed after Init returns 0
-	callNumber  atomic.Uint64   // atomic: written by the step loop, read by ctl status
+	// ctx owns the loaded WASM module. It remains live until after the cell's
+	// shutdown export has run; cancelling it closes the wazero module.
+	ctx          context.Context
+	moduleCancel context.CancelFunc
+	// stepCtx only owns the background step loop. Teardown cancels it first,
+	// joins the loop, then invokes pulp_shutdown while the module is live.
+	stepCtx    context.Context
+	cancel     context.CancelFunc
+	declared   map[string]bool // capabilities this cell declared
+	readyCh    chan struct{}   // closed after Init returns 0
+	callNumber atomic.Uint64   // atomic: written by the step loop, read by ctl status
 
 	// stepDone is closed when this cell's step goroutine exits. Recreated
 	// each time a step loop is launched (initial start + every reload) so a
@@ -751,20 +771,23 @@ func Main() {
 			logger.Error("cell scope", "cell", spec.Name, "err", err)
 			os.Exit(1)
 		}
-		pctx, pcancel := context.WithCancel(ctx)
+		moduleCtx, moduleCancel := context.WithCancel(ctx)
+		stepCtx, stepCancel := context.WithCancel(moduleCtx)
 		declared := map[string]bool{}
 		for _, c := range spec.Capabilities {
 			declared[c] = true
 		}
 		runtimes[spec.Name] = &cellRuntime{
-			spec:     spec,
-			scope:    scope,
-			events:   make(chan routedEvent, eventChanSize),
-			ctx:      pctx,
-			cancel:   pcancel,
-			declared: declared,
-			readyCh:  make(chan struct{}),
-			stepDone: make(chan struct{}),
+			spec:         spec,
+			scope:        scope,
+			events:       make(chan routedEvent, eventChanSize),
+			ctx:          moduleCtx,
+			moduleCancel: moduleCancel,
+			stepCtx:      stepCtx,
+			cancel:       stepCancel,
+			declared:     declared,
+			readyCh:      make(chan struct{}),
+			stepDone:     make(chan struct{}),
 		}
 	}
 
@@ -1017,6 +1040,9 @@ func Main() {
 			logger.Error("shutdown failed", "cell", rt.spec.Name, "err", err)
 		}
 		rt.cell.Close(context.Background())
+		if rt.moduleCancel != nil {
+			rt.moduleCancel()
+		}
 	}
 
 	// Capability Teardown — called once per capability, not per cell.
@@ -1151,7 +1177,7 @@ func reinstantiateCell(rt *cellRuntime, logger *slog.Logger) bool {
 
 func stepLoop(rt *cellRuntime, capByName map[string]ext.Capability, logger *slog.Logger) {
 	const (
-		idleMin     = 200 * time.Microsecond
+		idleMin = 200 * time.Microsecond
 		// An idle step allocates a StepEnvelope inside each WASM cell.  WASM
 		// linear memory can grow but does not shrink, so a 10ms ceiling turns an
 		// otherwise idle cell into a permanent ~100 allocations/second memory
@@ -1177,6 +1203,14 @@ func stepLoop(rt *cellRuntime, capByName map[string]ext.Capability, logger *slog
 	restarts := 0
 	restartWindow := time.Time{}
 	superviseTrap := func(callN uint64) {
+		// Shutdown cancels the per-cell context to wake an idle step. A Step
+		// that was already in flight then reports context cancellation, which
+		// is expected teardown rather than a cell crash. Never re-instantiate
+		// against that cancelled context: doing so turns ordinary application
+		// shutdown into a spurious supervisor restart/trap.
+		if rt.stepCtx.Err() != nil {
+			return
+		}
 		if rt.spec.Restart != manifest.RestartOnCrash && rt.spec.Restart != manifest.RestartAlways {
 			return
 		}
@@ -1196,7 +1230,7 @@ func stepLoop(rt *cellRuntime, capByName map[string]ext.Capability, logger *slog
 
 	for {
 		select {
-		case <-rt.ctx.Done():
+		case <-rt.stepCtx.Done():
 			return
 		case re := <-rt.events:
 			// Real event — reset idle pacing so the next idle gap
@@ -1218,6 +1252,9 @@ func stepLoop(rt *cellRuntime, capByName map[string]ext.Capability, logger *slog
 				WallTime:   uint64(time.Now().UnixNano()),
 				Payload:    stepEv,
 			}
+			// Use the module context for the WASM call. Wazero closes a module
+			// when a call context is cancelled, so stepCtx is only a loop-wakeup
+			// signal and must never be passed into guest code.
 			if _, err := rt.cell.Step(rt.ctx, env); err != nil {
 				logger.Error("step failed",
 					"cell", rt.spec.Name,
@@ -1274,7 +1311,7 @@ func stepLoop(rt *cellRuntime, capByName map[string]ext.Capability, logger *slog
 			}
 			idleTimer.Reset(idleSleep)
 			select {
-			case <-rt.ctx.Done():
+			case <-rt.stepCtx.Done():
 				if !idleTimer.Stop() {
 					<-idleTimer.C
 				}

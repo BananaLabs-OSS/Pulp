@@ -190,3 +190,21 @@ func TestSupervisor_Lifecycle(t *testing.T) {
 		t.Fatalf("state = %v, want stopped", sup.State())
 	}
 }
+
+func TestDefaultCellSurvivesCancelledCallerUntilOrderlyShutdown(t *testing.T) {
+	// Provider/poller cancellation is routine during application shutdown. The
+	// default reactor configuration must reject that one call without allowing
+	// wazero to close the module underneath the later pulp_shutdown export.
+	cell := loadUninitedCell(t, "../../testdata/heartbeat", "cancel-safe", &Limits{})
+	if err := cell.Init(context.Background(), nil); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	callCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// Non-interruptible wazero may either reject before entry or let this tiny
+	// guest return; the invariant is that cancellation cannot close the module.
+	_, _ = cell.Step(callCtx, abi.StepEnvelope{CallNumber: 1, WallTime: 1})
+	if err := cell.Shutdown(context.Background()); err != nil {
+		t.Fatalf("cancelled caller closed the default reactor before shutdown: %v", err)
+	}
+}

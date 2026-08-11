@@ -61,6 +61,7 @@ type hostedEffectTestApplication struct {
 	capabilities    []ext.Capability
 	capabilityScope ext.Scope
 	cross           *crossApplicationRegistry
+	providerAccess  *applicationProviderAccess
 }
 
 // StartHostedEffectTestHost loads the exact application graph described by a
@@ -197,6 +198,11 @@ func startHostedEffectTestApplication(
 			return nil, fmt.Errorf("hosted effect test kit: init %s/%s: %w", application.Identity, spec.Name, initErr)
 		}
 	}
+	started.providerAccess = &applicationProviderAccess{identity: application.Identity, runtimes: cells, active: true}
+	if err := deploymentOperatorCommands.bind(application.Identity, started.providerAccess); err != nil {
+		started.close(context.Background())
+		return nil, fmt.Errorf("hosted effect test kit: bind operator commands: %w", err)
+	}
 	if err := cross.markReady(application, &applicationRuntime{application: application, runtimes: cells}); err != nil {
 		started.close(context.Background())
 		return nil, fmt.Errorf("hosted effect test kit: register %s providers: %w", application.Identity, err)
@@ -327,6 +333,10 @@ func (h *HostedEffectTestHost) Shutdown(ctx context.Context) error {
 }
 
 func (h *hostedEffectTestApplication) close(ctx context.Context) error {
+	if h.providerAccess != nil {
+		deploymentOperatorCommands.unbind(h.application.Identity)
+		h.providerAccess.revoke()
+	}
 	if h == nil {
 		return nil
 	}

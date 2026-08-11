@@ -17,13 +17,14 @@ import (
 // are retained as explicit application-host inputs: the caller performs the
 // one-time extension setup using them before any runtime is created.
 type ScopedApplicationRuntimeFactoryConfig struct {
-	Registry         *host.Registry
-	Limits           *host.Limits
-	Logger           *slog.Logger
-	ModuleCacheScope *host.ModuleCacheScope
-	StorageRoot      string
-	HTTPPort         string
-	Endpoints        *EndpointRegistry
+	Registry          *host.Registry
+	Limits            *host.Limits
+	Logger            *slog.Logger
+	ModuleCacheScope  *host.ModuleCacheScope
+	StorageRoot       string
+	StorageNamespaces map[string]string
+	HTTPPort          string
+	Endpoints         *EndpointRegistry
 	// RequireScopedCapabilityLifecycle rejects known process-global extension
 	// lifecycles when a host has more than one application instance.
 	RequireScopedCapabilityLifecycle bool

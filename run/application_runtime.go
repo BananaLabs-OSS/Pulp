@@ -190,12 +190,13 @@ func (r *applicationRuntime) Start(parent context.Context) error {
 		if err != nil {
 			return r.startFailure(err)
 		}
-		cellCtx, cancel := context.WithCancel(r.ctx)
+		cellCtx, moduleCancel := context.WithCancel(r.ctx)
+		stepCtx, stepCancel := context.WithCancel(cellCtx)
 		declared := map[string]bool{}
 		for _, name := range spec.Capabilities {
 			declared[name] = true
 		}
-		r.runtimes[placement.Address] = &cellRuntime{spec: spec, address: placement.Address, scope: scope, events: make(chan routedEvent, eventChanSize), ctx: cellCtx, cancel: cancel, declared: declared, readyCh: make(chan struct{}), stepDone: make(chan struct{})}
+		r.runtimes[placement.Address] = &cellRuntime{spec: spec, address: placement.Address, scope: scope, events: make(chan routedEvent, eventChanSize), ctx: cellCtx, moduleCancel: moduleCancel, stepCtx: stepCtx, cancel: stepCancel, declared: declared, readyCh: make(chan struct{}), stepDone: make(chan struct{})}
 	}
 	r.registry.Always(siblingCapabilityWithCrossApplication(newSiblingRegistry(r.runtimes), r.config.CrossApplications, r.application))
 	if missing := validateSiblingLinks(r.runtimes); len(missing) != 0 {
@@ -246,6 +247,10 @@ func (r *applicationRuntime) Start(parent context.Context) error {
 		r.ops.launchStep(rt)
 	}
 	r.started = true
+	r.providerAccess = &applicationProviderAccess{identity: r.application.Identity, runtimes: r.runtimes, active: true}
+	if err := deploymentOperatorCommands.bind(r.application.Identity, r.providerAccess); err != nil {
+		return r.startFailure(fmt.Errorf("bind operator commands: %w", err))
+	}
 	if r.config.CrossApplications != nil {
 		if err := r.config.CrossApplications.markReady(r.application, r); err != nil {
 			return r.startFailure(fmt.Errorf("register cross-application providers: %w", err))
@@ -254,7 +259,6 @@ func (r *applicationRuntime) Start(parent context.Context) error {
 	if r.config.Lifecycle != nil {
 		var err error
 		if observer, ok := r.config.Lifecycle.(ApplicationLifecycleObserverV2); ok {
-			r.providerAccess = &applicationProviderAccess{identity: r.application.Identity, runtimes: r.runtimes, active: true}
 			err = observer.AfterApplicationStartWithProvider(r.ctx, r.application.Identity, r.providerAccess)
 		} else {
 			err = r.config.Lifecycle.AfterApplicationStart(r.ctx, r.application.Identity)
@@ -278,7 +282,7 @@ func (r *applicationRuntime) setupCapabilities() error {
 	if r.application.StorageNamespace != "" {
 		storageRoot = filepath.Join(storageRoot, r.application.StorageNamespace, r.application.Identity.InstanceID)
 	}
-	env := ext.SetupEnv{Scope: scope, Endpoints: r.config.Endpoints, StorageRoot: storageRoot, Logger: r.config.Logger}
+	env := ext.SetupEnv{Scope: scope, Endpoints: r.config.Endpoints, StorageRoot: storageRoot, StorageNamespaces: r.config.StorageNamespaces, HTTPPort: r.config.HTTPPort, Logger: r.config.Logger}
 	for _, c := range r.allCaps {
 		if r.declaredUnion[c.Name] {
 			env.Config = r.capabilityConfigs[c.Name]
@@ -447,6 +451,7 @@ func (r *applicationRuntime) stopLocked(ctx context.Context) error {
 		}
 	}
 	if r.providerAccess != nil {
+		deploymentOperatorCommands.unbind(r.application.Identity)
 		r.providerAccess.revoke()
 	}
 	for _, rt := range r.runtimes {
@@ -474,6 +479,9 @@ func (r *applicationRuntime) stopLocked(ctx context.Context) error {
 			if err := rt.cell.Close(context.Background()); err != nil {
 				errs = append(errs, err)
 			}
+		}
+		if rt.moduleCancel != nil {
+			rt.moduleCancel()
 		}
 	}
 	r.teardownCapabilities()

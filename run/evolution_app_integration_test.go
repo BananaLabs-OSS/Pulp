@@ -487,31 +487,34 @@ depends_on = ["minecraft-resolver", "sessions"]
 
 func evolutionApplicationCellSources(workspace string) map[string]string {
 	return map[string]string{
-		"jvm-jre-detect":             filepath.Join(workspace, "minecraft-resolver", "jvm-jre-detect"),
-		"minecraft-resolver":         filepath.Join(workspace, "minecraft-resolver", "pulp-cell"),
-		"sessions":                   filepath.Join(workspace, "Sessions-Gene", "composition-cell"),
-		"commerce":                   filepath.Join(workspace, "Evolution", "commerce"),
-		"fleet":                      filepath.Join(workspace, "Evolution", "fleet"),
-		"funding":                    filepath.Join(workspace, "Evolution", "funding"),
-		"identity":                   filepath.Join(workspace, "Evolution", "identity"),
-		"control":                    filepath.Join(workspace, "Evolution", "control"),
-		"effects":                    filepath.Join(workspace, "Evolution", "effects"),
-		"public-upload":              filepath.Join(workspace, "Evolution", "public-upload"),
-		"exact-object-upload":        filepath.Join(workspace, "Evolution", "exact-object-upload"),
-		"artifact-validator":         filepath.Join(workspace, "Evolution", "artifact-validator"),
-		"configuration-registry":     filepath.Join(workspace, "Evolution", "configuration-registry"),
-		"fixed-window-counter":       filepath.Join(workspace, "Evolution", "fixed-window-counter"),
-		"workload-inventory":         filepath.Join(workspace, "Evolution", "workload-inventory"),
-		"capacity-scheduler":         filepath.Join(workspace, "Evolution", "capacity-scheduler"),
-		"workload-provisioning":      filepath.Join(workspace, "Evolution", "workload-provisioning"),
-		"runtime-control":            filepath.Join(workspace, "Evolution", "runtime-control"),
-		"artifact-lifecycle":         filepath.Join(workspace, "Evolution", "artifact-lifecycle"),
-		"archive-lifecycle":          filepath.Join(workspace, "Evolution", "archive-lifecycle"),
-		"observation-registry":       filepath.Join(workspace, "Evolution", "observation-registry"),
-		"notification-outbox":        filepath.Join(workspace, "Evolution", "notification-outbox"),
-		"minecraft-profile-resolver": filepath.Join(workspace, "Evolution", "minecraft-profile-resolver"),
-		"lua-orchestrator":           filepath.Join(workspace, "Pulp-Lua", "pulp-cell"),
-		"evolution":                  filepath.Join(workspace, "Evolution", "pulp-cell"),
+		"jvm-jre-detect":                        filepath.Join(workspace, "minecraft-resolver", "jvm-jre-detect"),
+		"minecraft-resolver":                    filepath.Join(workspace, "minecraft-resolver", "pulp-cell"),
+		"sessions":                              filepath.Join(workspace, "Sessions-Gene", "composition-cell"),
+		"sessions-identity-retention-binding":   filepath.Join(workspace, "Sessions-Gene", "identity-retention-binding"),
+		"sessions-order-config":                 filepath.Join(workspace, "Sessions-Gene", "order-config"),
+		"sessions-provisioning-failure-cleanup": filepath.Join(workspace, "Sessions-Gene", "provisioning-failure-cleanup"),
+		"commerce":                              filepath.Join(workspace, "Evolution", "commerce"),
+		"fleet":                                 filepath.Join(workspace, "Evolution", "fleet"),
+		"funding":                               filepath.Join(workspace, "Evolution", "funding"),
+		"identity":                              filepath.Join(workspace, "Evolution", "identity"),
+		"control":                               filepath.Join(workspace, "Evolution", "control"),
+		"effects":                               filepath.Join(workspace, "Evolution", "effects"),
+		"public-upload":                         filepath.Join(workspace, "Evolution", "public-upload"),
+		"exact-object-upload":                   filepath.Join(workspace, "Evolution", "exact-object-upload"),
+		"artifact-validator":                    filepath.Join(workspace, "Evolution", "artifact-validator"),
+		"configuration-registry":                filepath.Join(workspace, "Evolution", "configuration-registry"),
+		"fixed-window-counter":                  filepath.Join(workspace, "Evolution", "fixed-window-counter"),
+		"workload-inventory":                    filepath.Join(workspace, "Evolution", "workload-inventory"),
+		"capacity-scheduler":                    filepath.Join(workspace, "Evolution", "capacity-scheduler"),
+		"workload-provisioning":                 filepath.Join(workspace, "Evolution", "workload-provisioning"),
+		"runtime-control":                       filepath.Join(workspace, "Evolution", "runtime-control"),
+		"artifact-lifecycle":                    filepath.Join(workspace, "Evolution", "artifact-lifecycle"),
+		"archive-lifecycle":                     filepath.Join(workspace, "Evolution", "archive-lifecycle"),
+		"observation-registry":                  filepath.Join(workspace, "Evolution", "observation-registry"),
+		"notification-outbox":                   filepath.Join(workspace, "Pulp-engines", "notification-outbox-sqlite-cell", "cmd", "notification-outbox"),
+		"minecraft-profile-resolver":            filepath.Join(workspace, "Evolution", "minecraft-profile-resolver"),
+		"lua-orchestrator":                      filepath.Join(workspace, "Pulp-Lua", "pulp-cell"),
+		"evolution":                             filepath.Join(workspace, "Evolution", "pulp-cell"),
 	}
 }
 
@@ -739,6 +742,21 @@ func evolutionAppBackendStubs() []ext.Capability {
 		builder.NewFunctionBuilder().WithFunc(unavailable4).Export("s3_exact_object_validate_artifact_zip")
 		return nil
 	}
+	// Template reload is an exact host import, not the former opaque HTTP
+	// proxy. The composition harness exposes only the ABI-identical unavailable
+	// stub; route-specific tests provide the fake host implementation.
+	templateReload := func(builder wazero.HostModuleBuilder, _ ext.Cell) error {
+		builder.NewFunctionBuilder().WithFunc(unavailable4).Export("bananagine_template_reload_execute_v1")
+		return nil
+	}
+	pfcPlanPrepare := func(builder wazero.HostModuleBuilder, _ ext.Cell) error {
+		builder.NewFunctionBuilder().WithFunc(unavailable4).Export("provisioning_failure_cleanup_plan_prepare_v1")
+		return nil
+	}
+	pfcExecute := func(builder wazero.HostModuleBuilder, _ ext.Cell) error {
+		builder.NewFunctionBuilder().WithFunc(unavailable4).Export("provisioning_failure_cleanup_execute_v1")
+		return nil
+	}
 	fleetRuntime := func(builder wazero.HostModuleBuilder, _ ext.Cell) error {
 		execute := func(ctx context.Context, module api.Module, requestPtr, requestLen, responsePtrOut, responseLenOut uint32) uint32 {
 			if module == nil || module.Memory() == nil {
@@ -894,6 +912,9 @@ func evolutionAppBackendStubs() []ext.Capability {
 		{Name: "storage.s3.public-upload.v1", Register: exactObjectPublicUpload, Stub: exactObjectPublicUpload},
 		{Name: "storage.s3.exact-object-download-reference.v1", Register: exactObjectDownloadReference, Stub: exactObjectDownloadReference},
 		{Name: "storage.s3.artifact-validation.v1", Register: artifactValidation, Stub: artifactValidation},
+		{Name: "bananagine.template.reload.v1", Register: templateReload, Stub: templateReload},
+		{Name: "sessions.provisioning-failure-cleanup.plan-prepare.v1", Register: pfcPlanPrepare, Stub: pfcPlanPrepare},
+		{Name: "sessions.provisioning-failure-cleanup.execute.v1", Register: pfcExecute, Stub: pfcExecute},
 		{Name: "effect.fleet.runtime", Register: fleetRuntime, Stub: fleetRuntime},
 		{Name: "effect.fleet.observation", Register: fleetObservation, Stub: fleetObservation},
 		{Name: "effect.capacity.observation", Register: capacityObservation, Stub: capacityObservation},

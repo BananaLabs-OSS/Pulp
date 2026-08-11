@@ -66,8 +66,16 @@ type SetupEnv struct {
 	Endpoints   EndpointReporter
 	CellName    string
 	StorageRoot string
-	Config      map[string]any
-	Logger      *slog.Logger
+	// StorageNamespaces optionally aliases selected cell IDs into a stable
+	// shared storage namespace. It is host-owned topology, not guest input.
+	// Extensions that do not support shared namespaces ignore it.
+	StorageNamespaces map[string]string
+	// HTTPPort is an explicit host-selected listener port for legacy/direct
+	// single-application operation. It avoids a process-global HTTP_PORT env
+	// mutation; endpoint-reporter (multi-host) extensions may ignore it.
+	HTTPPort string
+	Config   map[string]any
+	Logger   *slog.Logger
 }
 
 // Endpoint is a host-visible address owned by one scoped capability. Name

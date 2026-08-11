@@ -61,3 +61,63 @@ func TestSessionsSourceMonolithAndSplitCompositionsLoad(t *testing.T) {
 		t.Fatalf("resolver dependencies = %#v, want [sessions]", host.ApplicationOrder[1].DependsOn)
 	}
 }
+
+func TestSessionsBananauthHumanAuthParityHarnessResolvesOnlyDeclaredProviders(t *testing.T) {
+	workspace, err := filepath.Abs(filepath.Join("..", "..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostPath := filepath.Join(workspace, "Sessions-Gene", "application", "testdata", "bananauth-human-auth-parity.pulp.host.toml")
+	host, err := LoadHost(hostPath)
+	if err != nil {
+		t.Fatalf("LoadHost(%s): %v", hostPath, err)
+	}
+	if len(host.Routes) != 0 {
+		t.Fatalf("parity harness routes = %#v, want none", host.Routes)
+	}
+	if len(host.ApplicationOrder) != 2 ||
+		host.ApplicationOrder[0].ID != "bananauth" ||
+		host.ApplicationOrder[1].ID != "sessions-auth-parity" {
+		t.Fatalf("host application order = %#v, want [bananauth sessions-auth-parity]", host.ApplicationOrder)
+	}
+
+	var caller *CellSpec
+	for _, cell := range host.ApplicationOrder[1].Application.Cells.Cells {
+		if cell.Name == "sessions-human-auth-parity" {
+			caller = cell
+			break
+		}
+	}
+	if caller == nil {
+		t.Fatal("Sessions auth parity caller cell is missing")
+	}
+	want := []string{
+		"auth.identity.v1.native.authenticate",
+		"auth.identity.v1.oauth.resolve",
+		"auth.identity.v1.email-verification.issue",
+		"auth.identity.v1.email-verification.consume",
+		"auth.session.v1.create",
+		"auth.session.v1.get",
+		"auth.session.v1.revoke",
+	}
+	if len(caller.HostConsumes) != len(want) {
+		t.Fatalf("host_consumes = %#v, want %#v", caller.HostConsumes, want)
+	}
+	for index, provider := range want {
+		if caller.HostConsumes[index] != provider {
+			t.Fatalf("host_consumes[%d] = %q, want %q", index, caller.HostConsumes[index], provider)
+		}
+	}
+
+	providers := map[string]string{}
+	for _, cell := range host.ApplicationOrder[0].Application.Cells.Cells {
+		for _, provider := range cell.Provides {
+			providers[provider] = cell.Name
+		}
+	}
+	for _, provider := range want {
+		if providers[provider] == "" {
+			t.Fatalf("Bananauth does not provide %q", provider)
+		}
+	}
+}

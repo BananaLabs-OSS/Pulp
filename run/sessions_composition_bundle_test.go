@@ -254,6 +254,10 @@ func stageSessionsCompositionWASM(t *testing.T, spec *manifest.CellSpec, cache s
 		sourceDir = filepath.Join(sourceDir, "..", "..", "Pulp-Lua", "pulp-cell")
 	case "minecraft-resolver":
 		sourceDir = filepath.Join(sourceDir, "..", "..", "minecraft-resolver", "pulp-cell")
+	case "notification-outbox":
+		// The portable owner is a reusable library module; its WASI entrypoint
+		// intentionally lives under cmd rather than at module root.
+		sourceDir = filepath.Join(sourceDir, "cmd", "notification-outbox")
 	}
 	goSources, err := filepath.Glob(filepath.Join(sourceDir, "*.go"))
 	if err != nil {

@@ -1,9 +1,11 @@
 package host
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -57,18 +59,18 @@ type Limits struct {
 	// CallTimeout bounds a single WASM entry point. 0 => default.
 	CallTimeout time.Duration
 
-	// Interruptible is retained for source compatibility. Calls are interruptible
-	// by default; use DisableInterruptible only for a deliberately trusted,
-	// externally-supervised compatibility cell.
+	// Interruptible opts this cell into wazero's WithCloseOnContextDone.
+	// It is intentionally off by default: ordinary caller cancellation must not
+	// close a long-lived reactor module that happens to be serving that call.
+	// Use it only with an external supervisor that can re-instantiate a runaway
+	// cell after the interrupted call closes its module.
 	Interruptible bool
-	// DisableInterruptible opts a cell out of wazero's WithCloseOnContextDone.
-	// It should be exceptional: without interruption, a guest infinite loop can
-	// hold the cell mutex forever and no restart policy can recover it.
+	// DisableInterruptible is retained for source compatibility. It wins over
+	// Interruptible when both fields are supplied.
 	DisableInterruptible bool
-
 }
 
-func (l *Limits) interruptible() bool { return l == nil || !l.DisableInterruptible }
+func (l *Limits) interruptible() bool { return l != nil && l.Interruptible && !l.DisableInterruptible }
 
 func (l *Limits) maxMemoryPages() uint32 {
 	if l != nil && l.MaxMemoryPages != 0 {
@@ -98,6 +100,12 @@ type Cell struct {
 	initFn     api.Function
 	stepFn     api.Function
 	shutdownFn api.Function
+	// initErrorPtrFn/initErrorLenFn are optional failure-only diagnostics from
+	// Fiber cells. Normal guest stdout/stderr remains discarded.
+	initErrorPtrFn api.Function
+	initErrorLenFn api.Function
+	callErrorPtrFn api.Function
+	callErrorLenFn api.Function
 
 	// onCallFn is the optional pulp_on_call export. Cells that
 	// declare `provides = [...]` in their manifest must export this;
@@ -309,8 +317,14 @@ func LoadScoped(ctx context.Context, spec *manifest.CellSpec, registry *Registry
 	// silently corrupts anything involving real timestamps (DB rows,
 	// TTLs, JWT exp checks).
 	cfg := wazero.NewModuleConfig().
-		WithStdout(os.Stdout).
-		WithStderr(os.Stderr).
+		// Cells must never inherit the host's stdin: a stdio MCP host owns that
+		// stream for JSON-RPC, not its guest modules.
+		WithStdin(bytes.NewReader(nil)).
+		// A cell is never allowed to share a host protocol stream (MCP uses
+		// stdout). Host logging remains available through slog; guest stdout is
+		// intentionally discarded unless a future explicit per-cell sink exists.
+		WithStdout(io.Discard).
+		WithStderr(io.Discard).
 		WithStartFunctions(startFn).
 		WithName(spec.Name).
 		WithSysWalltime().
@@ -337,6 +351,10 @@ func LoadScoped(ctx context.Context, spec *manifest.CellSpec, registry *Registry
 	p.initFn = mod.ExportedFunction("pulp_init")
 	p.stepFn = mod.ExportedFunction("pulp_step")
 	p.shutdownFn = mod.ExportedFunction("pulp_shutdown")
+	p.initErrorPtrFn = mod.ExportedFunction("pulp_init_error_ptr")
+	p.initErrorLenFn = mod.ExportedFunction("pulp_init_error_len")
+	p.callErrorPtrFn = mod.ExportedFunction("pulp_on_call_error_ptr")
+	p.callErrorLenFn = mod.ExportedFunction("pulp_on_call_error_len")
 	p.onCallFn = mod.ExportedFunction("pulp_on_call")
 	// Optional canonical-ABI tree-free export. Absent for every legacy msgpack
 	// cell, which therefore stays on the unchanged opaque Call path.
@@ -384,6 +402,9 @@ func (p *Cell) Init(ctx context.Context, config []byte) error {
 		return fmt.Errorf("pulp_init trap: %w", err)
 	}
 	if code := int32(results[0]); code != 0 {
+		if diagnostic := p.initDiagnostic(callCtx); diagnostic != "" {
+			return fmt.Errorf("pulp_init returned %d: %s", code, diagnostic)
+		}
 		return fmt.Errorf("pulp_init returned %d", code)
 	}
 	p.log.Info("init complete")
@@ -522,6 +543,9 @@ func (p *Cell) Call(ctx context.Context, funcName string, args []byte) ([]byte, 
 		return nil, fmt.Errorf("pulp_on_call trap: %w", err)
 	}
 	if code := uint32(results[0]); code != 0 {
+		if diagnostic := p.callDiagnostic(callCtx); diagnostic != "" {
+			return nil, fmt.Errorf("pulp_on_call returned %d: %s", code, diagnostic)
+		}
 		return nil, fmt.Errorf("pulp_on_call returned %d", code)
 	}
 
@@ -752,9 +776,47 @@ func (p *Cell) Close(ctx context.Context) error {
 	p.initFn = nil
 	p.stepFn = nil
 	p.shutdownFn = nil
+	p.initErrorPtrFn = nil
+	p.initErrorLenFn = nil
+	p.callErrorPtrFn = nil
+	p.callErrorLenFn = nil
 	p.onCallFn = nil
 	p.postReturnFn = nil
 	return err
+}
+
+// initDiagnostic reads Fiber's optional, bounded failure-only init message.
+// It is called only after a non-zero pulp_init result, never captures guest
+// streams, and tolerates absent or malformed exports from older/foreign cells.
+func (p *Cell) initDiagnostic(ctx context.Context) string {
+	return p.diagnostic(ctx, p.initErrorPtrFn, p.initErrorLenFn)
+}
+
+func (p *Cell) callDiagnostic(ctx context.Context) string {
+	return p.diagnostic(ctx, p.callErrorPtrFn, p.callErrorLenFn)
+}
+
+func (p *Cell) diagnostic(ctx context.Context, ptrFn, lenFn api.Function) string {
+	if ptrFn == nil || lenFn == nil || p.module == nil {
+		return ""
+	}
+	ptrResult, err := ptrFn.Call(ctx)
+	if err != nil || len(ptrResult) == 0 {
+		return ""
+	}
+	lenResult, err := lenFn.Call(ctx)
+	if err != nil || len(lenResult) == 0 {
+		return ""
+	}
+	ptr, length := uint32(ptrResult[0]), uint32(lenResult[0])
+	if ptr == 0 || length == 0 || length > 4096 {
+		return ""
+	}
+	b, ok := p.module.Memory().Read(ptr, length)
+	if !ok {
+		return ""
+	}
+	return string(b)
 }
 
 // writeBytes allocates space in the cell's linear memory via its exported

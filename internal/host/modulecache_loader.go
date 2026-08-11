@@ -1,8 +1,10 @@
 package host
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 
@@ -79,8 +81,9 @@ func LoadScopedCached(ctx context.Context, spec *manifest.CellSpec, registry *Re
 
 func cachedCellModuleConfig(name, startFn string) wazero.ModuleConfig {
 	cfg := wazero.NewModuleConfig().
-		WithStdout(os.Stdout).
-		WithStderr(os.Stderr).
+		WithStdin(bytes.NewReader(nil)).
+		WithStdout(io.Discard).
+		WithStderr(io.Discard).
 		WithStartFunctions(startFn).
 		WithName(name).
 		WithSysWalltime().
@@ -98,6 +101,10 @@ func bindCellExports(ctx context.Context, cell *Cell) error {
 	cell.initFn = cell.module.ExportedFunction("pulp_init")
 	cell.stepFn = cell.module.ExportedFunction("pulp_step")
 	cell.shutdownFn = cell.module.ExportedFunction("pulp_shutdown")
+	cell.initErrorPtrFn = cell.module.ExportedFunction("pulp_init_error_ptr")
+	cell.initErrorLenFn = cell.module.ExportedFunction("pulp_init_error_len")
+	cell.callErrorPtrFn = cell.module.ExportedFunction("pulp_on_call_error_ptr")
+	cell.callErrorLenFn = cell.module.ExportedFunction("pulp_on_call_error_len")
 	cell.onCallFn = cell.module.ExportedFunction("pulp_on_call")
 	cell.postReturnFn = cell.module.ExportedFunction("pulp_post_return")
 
