@@ -118,6 +118,12 @@ func siblingCapabilityWithCrossApplication(reg *siblingRegistry, crossApplicatio
 
 					resp, err := reg.callDirect(ctx, caller, target, funcName, args)
 					if err != nil {
+						slog.Default().Warn("pulp_call target failed",
+							"caller", caller,
+							"target", target,
+							"provider", funcName,
+							"error", err,
+						)
 						return 4
 					}
 					return writeSiblingResponse(ctx, m, resp, respPtrOut, respLenOut)
