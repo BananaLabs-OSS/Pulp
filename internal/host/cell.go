@@ -43,12 +43,42 @@ const (
 	// an unbounded message lets one request permanently consume a cell.
 	DefaultMaxMessageBytes = 8 * 1024 * 1024
 
-	// reentrantCallGrace bounds how long Call waits for the cell mutex before
+	// reentrantCallGrace bounds how long an unannotated legacy call waits for
 	// declaring a (likely re-entrant / loopback) busy condition. A legitimate
 	// concurrent step releases the mutex in microseconds; a re-entrant
 	// A->B->A loopback never will, so we fail fast instead of deadlocking.
 	reentrantCallGrace = 250 * time.Millisecond
 )
+
+type cellCallStackContextKey struct{}
+
+func callStackContainsCell(ctx context.Context, cell *Cell) bool {
+	stack, _ := ctx.Value(cellCallStackContextKey{}).([]*Cell)
+	for _, item := range stack {
+		if item == cell {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureCellCallStack marks a context as participating in the explicit cell
+// call stack protocol without adding a target cell yet. This lets an
+// independent top-level Call wait for a busy cell, while lockForCall can still
+// reject a real loopback when that target is already present in the stack.
+func ensureCellCallStack(ctx context.Context) context.Context {
+	if _, ok := ctx.Value(cellCallStackContextKey{}).([]*Cell); ok {
+		return ctx
+	}
+	return context.WithValue(ctx, cellCallStackContextKey{}, []*Cell(nil))
+}
+
+func withCellOnCallStack(ctx context.Context, cell *Cell) context.Context {
+	ctx = ensureCellCallStack(ctx)
+	stack, _ := ctx.Value(cellCallStackContextKey{}).([]*Cell)
+	next := append(append([]*Cell(nil), stack...), cell)
+	return context.WithValue(ctx, cellCallStackContextKey{}, next)
+}
 
 // Limits are the per-cell resource bounds applied at instantiation and on
 // every WASM call. A nil *Limits (or a zero field) falls back to the
@@ -157,16 +187,18 @@ func (p *Cell) callContext(ctx context.Context) (context.Context, context.Cancel
 	return context.WithTimeout(ctx, p.callTimeout)
 }
 
-// lockForCall acquires p.mu for a sibling Call without blocking forever.
-// It returns true once the mutex is held. It returns false if the mutex is
-// still held after reentrantCallGrace (or ctx is cancelled) — the signature
-// of a re-entrant / loopback call that would otherwise deadlock the host.
-//
-// We poll TryLock rather than block on Lock so a true A->B->A loopback
-// (same goroutine, mutex never released) fails fast instead of hanging,
-// while brief legitimate contention from another cell's concurrent step
-// (released in microseconds) still succeeds.
+// lockForCall acquires p.mu for a sibling Call without blocking forever. A
+// call-stack loopback fails immediately; an annotated independent caller may
+// wait only until its regular call context is cancelled. Legacy callers retain
+// the historical short grace period until all entrypoints use the stack.
 func (p *Cell) lockForCall(ctx context.Context) bool {
+	// A true synchronous A -> B -> A (or self) loopback carries the target
+	// cell in its call context and must fail immediately. Independent callers
+	// do not, so they may wait for the bounded call context instead of being
+	// misclassified merely because a valid workflow exceeded the grace period.
+	if callStackContainsCell(ctx, p) {
+		return false
+	}
 	if p.mu.TryLock() {
 		return true
 	}
@@ -179,7 +211,13 @@ func (p *Cell) lockForCall(ctx context.Context) bool {
 		case <-ctx.Done():
 			return false
 		case <-deadline.C:
-			return false
+			// Legacy callers without an annotated stack retain the historical
+			// fast failure. Annotated independent calls may wait until their
+			// regular call deadline.
+			if _, annotated := ctx.Value(cellCallStackContextKey{}).([]*Cell); !annotated {
+				return false
+			}
+			deadline.Reset(reentrantCallGrace)
 		case <-tick.C:
 			if p.mu.TryLock() {
 				return true
@@ -388,7 +426,7 @@ func (p *Cell) Init(ctx context.Context, config []byte) error {
 		return errors.New("cell is closed or not initialized")
 	}
 
-	callCtx, cancel := p.callContext(ctx)
+	callCtx, cancel := p.callContext(withCellOnCallStack(ctx, p))
 	defer cancel()
 
 	ptr, err := p.writeBytes(callCtx, config)
@@ -421,7 +459,7 @@ func (p *Cell) Step(ctx context.Context, env abi.StepEnvelope) (outputHandle int
 		return 0, errors.New("cell is closed")
 	}
 
-	callCtx, cancel := p.callContext(ctx)
+	callCtx, cancel := p.callContext(withCellOnCallStack(ctx, p))
 	defer cancel()
 
 	input := env.Encode()
@@ -493,10 +531,12 @@ func (p *Cell) Call(ctx context.Context, funcName string, args []byte) ([]byte, 
 	// Do NOT block indefinitely on p.mu: a sibling call cycle (A->B->A) or
 	// a self-targeted call re-enters this method on the same goroutine that
 	// already holds p.mu, which a plain Lock() would deadlock on forever.
-	// TryLock with a short grace window distinguishes brief legitimate
-	// contention (another cell's step, released in microseconds) from a
-	// true loopback (never released) and fails fast on the latter.
-	if !p.lockForCall(ctx) {
+	// The incoming context names currently active caller cells. It must not
+	// contain p: that is a true A->B->A loopback. Otherwise this independent
+	// request may wait until its normal call deadline.
+	lockCtx, cancel := p.callContext(ensureCellCallStack(ctx))
+	defer cancel()
+	if !p.lockForCall(lockCtx) {
 		return nil, ErrReentrantCall
 	}
 	defer p.mu.Unlock()
@@ -508,8 +548,7 @@ func (p *Cell) Call(ctx context.Context, funcName string, args []byte) ([]byte, 
 		return nil, ErrMessageTooLarge
 	}
 
-	callCtx, cancel := p.callContext(ctx)
-	defer cancel()
+	callCtx := withCellOnCallStack(lockCtx, p)
 
 	nameBytes := []byte(funcName)
 	namePtr, err := p.writeBytes(callCtx, nameBytes)
@@ -616,7 +655,9 @@ func (p *Cell) ExportsPostReturn() bool {
 func (p *Cell) CallTyped(ctx context.Context, funcName string, args []byte,
 	lift func(mem api.Memory, respPtr, respLen uint32) error) error {
 
-	if !p.lockForCall(ctx) {
+	lockCtx, cancel := p.callContext(ensureCellCallStack(ctx))
+	defer cancel()
+	if !p.lockForCall(lockCtx) {
 		return ErrReentrantCall
 	}
 	defer p.mu.Unlock()
@@ -631,8 +672,7 @@ func (p *Cell) CallTyped(ctx context.Context, funcName string, args []byte,
 		return ErrMessageTooLarge
 	}
 
-	callCtx, cancel := p.callContext(ctx)
-	defer cancel()
+	callCtx := withCellOnCallStack(lockCtx, p)
 
 	nameBytes := []byte(funcName)
 	namePtr, err := p.writeBytes(callCtx, nameBytes)
@@ -708,7 +748,7 @@ func (p *Cell) Shutdown(ctx context.Context) error {
 		return nil
 	}
 
-	callCtx, cancel := p.callContext(ctx)
+	callCtx, cancel := p.callContext(withCellOnCallStack(ctx, p))
 	defer cancel()
 
 	results, err := p.shutdownFn.Call(callCtx)
