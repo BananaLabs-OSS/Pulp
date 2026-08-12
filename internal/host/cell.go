@@ -419,10 +419,20 @@ func (p *Cell) Init(ctx context.Context, config []byte) error {
 // Step encodes the envelope, writes it into WASM linear memory, and calls
 // pulp_step. Returns the output handle (0 means no output).
 func (p *Cell) Step(ctx context.Context, env abi.StepEnvelope) (outputHandle int32, err error) {
-	if len(env.Payload) == 0 && p.callWaiters.Load() > 0 {
-		return 0, nil
+	if len(env.Payload) == 0 {
+		// Idle ticks must never queue ahead of a provider call. TryLock also
+		// closes the race between checking callWaiters and acquiring mu: if a
+		// call already owns the cell, the idle tick yields immediately.
+		if !p.mu.TryLock() {
+			return 0, nil
+		}
+		if p.callWaiters.Load() > 0 {
+			p.mu.Unlock()
+			return 0, nil
+		}
+	} else {
+		p.mu.Lock()
 	}
-	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if p.stepFn == nil {
