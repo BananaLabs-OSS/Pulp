@@ -65,6 +65,11 @@ type applicationProviderAccess struct {
 	mu       sync.Mutex
 	active   bool
 	calls    sync.WaitGroup
+	// workflowDispatchMu serializes host background dispatch into the one
+	// application Lua orchestrator. The orchestrator may synchronously enter
+	// Fleet; concurrent host pollers must not turn that valid work into a
+	// misleading cell loopback rejection.
+	workflowDispatchMu sync.Mutex
 }
 
 func (a *applicationProviderAccess) Identity() ApplicationIdentity { return a.identity }
@@ -78,6 +83,10 @@ func (a *applicationProviderAccess) CallProvider(ctx context.Context, cellName, 
 	a.calls.Add(1)
 	a.mu.Unlock()
 	defer a.calls.Done()
+	if cellName == "lua-orchestrator" && provider == "orchestrator.dispatch" {
+		a.workflowDispatchMu.Lock()
+		defer a.workflowDispatchMu.Unlock()
+	}
 	runtime := a.runtimes[cellName]
 	if runtime == nil || runtime.failed.Load() || runtime.cell == nil {
 		return nil, fmt.Errorf("application %s provider cell %q is unavailable", a.identity, cellName)
