@@ -42,6 +42,12 @@ const (
 	// guest allocators intentionally retain their high-water mark, so allowing
 	// an unbounded message lets one request permanently consume a cell.
 	DefaultMaxMessageBytes = 8 * 1024 * 1024
+
+	// reentrantCallGrace bounds how long Call waits for the cell mutex before
+	// declaring a (likely re-entrant / loopback) busy condition. A legitimate
+	// concurrent step releases the mutex in microseconds; a re-entrant
+	// A->B->A loopback never will, so we fail fast instead of deadlocking.
+	reentrantCallGrace = 250 * time.Millisecond
 )
 
 // Limits are the per-cell resource bounds applied at instantiation and on
@@ -160,40 +166,24 @@ func (p *Cell) callContext(ctx context.Context) (context.Context, context.Cancel
 // (same goroutine, mutex never released) fails fast instead of hanging,
 // while brief legitimate contention from another cell's concurrent step
 // (released in microseconds) still succeeds.
-type cellCallStackKey struct{}
-
-func withCellCall(ctx context.Context, cell *Cell) context.Context {
-	stack, _ := ctx.Value(cellCallStackKey{}).(map[*Cell]struct{})
-	copy := make(map[*Cell]struct{}, len(stack)+1)
-	for item := range stack {
-		copy[item] = struct{}{}
+func (p *Cell) lockForCall(ctx context.Context) bool {
+	if p.mu.TryLock() {
+		return true
 	}
-	copy[cell] = struct{}{}
-	return context.WithValue(ctx, cellCallStackKey{}, copy)
-}
-
-func cellOnCallStack(ctx context.Context, cell *Cell) bool {
-	stack, _ := ctx.Value(cellCallStackKey{}).(map[*Cell]struct{})
-	_, ok := stack[cell]
-	return ok
-}
-
-// lockForCall queues independent callers, but never beyond this cell's normal
-// call timeout. True loopbacks are rejected by the context call stack before
-// this wait begins.
-func (p *Cell) lockForCall(ctx context.Context) error {
-	waitCtx, cancel := p.callContext(ctx)
-	defer cancel()
+	deadline := time.NewTimer(reentrantCallGrace)
+	defer deadline.Stop()
 	tick := time.NewTicker(200 * time.Microsecond)
 	defer tick.Stop()
 	for {
-		if p.mu.TryLock() {
-			return nil
-		}
 		select {
-		case <-waitCtx.Done():
-			return waitCtx.Err()
+		case <-ctx.Done():
+			return false
+		case <-deadline.C:
+			return false
 		case <-tick.C:
+			if p.mu.TryLock() {
+				return true
+			}
 		}
 	}
 }
@@ -391,9 +381,7 @@ func LoadScoped(ctx context.Context, spec *manifest.CellSpec, registry *Registry
 // Init calls pulp_init with the given config bytes. Config is written into
 // WASM linear memory; the cell receives (ptr, len).
 func (p *Cell) Init(ctx context.Context, config []byte) error {
-	if err := p.lockForCall(ctx); err != nil {
-		return fmt.Errorf("wait for cell call: %w", err)
-	}
+	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if p.initFn == nil {
@@ -402,7 +390,6 @@ func (p *Cell) Init(ctx context.Context, config []byte) error {
 
 	callCtx, cancel := p.callContext(ctx)
 	defer cancel()
-	callCtx = withCellCall(callCtx, p)
 
 	ptr, err := p.writeBytes(callCtx, config)
 	if err != nil {
@@ -427,9 +414,7 @@ func (p *Cell) Init(ctx context.Context, config []byte) error {
 // Step encodes the envelope, writes it into WASM linear memory, and calls
 // pulp_step. Returns the output handle (0 means no output).
 func (p *Cell) Step(ctx context.Context, env abi.StepEnvelope) (outputHandle int32, err error) {
-	if err := p.lockForCall(ctx); err != nil {
-		return 0, fmt.Errorf("wait for cell call: %w", err)
-	}
+	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if p.stepFn == nil {
@@ -438,7 +423,6 @@ func (p *Cell) Step(ctx context.Context, env abi.StepEnvelope) (outputHandle int
 
 	callCtx, cancel := p.callContext(ctx)
 	defer cancel()
-	callCtx = withCellCall(callCtx, p)
 
 	input := env.Encode()
 	if len(input) > DefaultMaxMessageBytes {
@@ -512,10 +496,9 @@ func (p *Cell) Call(ctx context.Context, funcName string, args []byte) ([]byte, 
 	// TryLock with a short grace window distinguishes brief legitimate
 	// contention (another cell's step, released in microseconds) from a
 	// true loopback (never released) and fails fast on the latter.
-	if cellOnCallStack(ctx, p) {
+	if !p.lockForCall(ctx) {
 		return nil, ErrReentrantCall
 	}
-	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if p.onCallFn == nil {
@@ -527,7 +510,6 @@ func (p *Cell) Call(ctx context.Context, funcName string, args []byte) ([]byte, 
 
 	callCtx, cancel := p.callContext(ctx)
 	defer cancel()
-	callCtx = withCellCall(callCtx, p)
 
 	nameBytes := []byte(funcName)
 	namePtr, err := p.writeBytes(callCtx, nameBytes)
@@ -634,10 +616,9 @@ func (p *Cell) ExportsPostReturn() bool {
 func (p *Cell) CallTyped(ctx context.Context, funcName string, args []byte,
 	lift func(mem api.Memory, respPtr, respLen uint32) error) error {
 
-	if cellOnCallStack(ctx, p) {
+	if !p.lockForCall(ctx) {
 		return ErrReentrantCall
 	}
-	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if p.onCallFn == nil {
@@ -652,7 +633,6 @@ func (p *Cell) CallTyped(ctx context.Context, funcName string, args []byte,
 
 	callCtx, cancel := p.callContext(ctx)
 	defer cancel()
-	callCtx = withCellCall(callCtx, p)
 
 	nameBytes := []byte(funcName)
 	namePtr, err := p.writeBytes(callCtx, nameBytes)
@@ -730,7 +710,6 @@ func (p *Cell) Shutdown(ctx context.Context) error {
 
 	callCtx, cancel := p.callContext(ctx)
 	defer cancel()
-	callCtx = withCellCall(callCtx, p)
 
 	results, err := p.shutdownFn.Call(callCtx)
 	if err != nil {
