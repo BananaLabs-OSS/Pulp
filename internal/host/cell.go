@@ -45,10 +45,11 @@ const (
 	DefaultMaxMessageBytes = 8 * 1024 * 1024
 
 	// reentrantCallGrace bounds how long Call waits for the cell mutex before
-	// declaring a (likely re-entrant / loopback) busy condition. A legitimate
-	// concurrent step releases the mutex in microseconds; a re-entrant
-	// A->B->A loopback never will, so we fail fast instead of deadlocking.
-	reentrantCallGrace = 250 * time.Millisecond
+	// declaring a (likely re-entrant / loopback) busy condition. Provider calls
+	// may include SQLite/WASM work and legitimately exceed a millisecond; the
+	// bounded wait prevents false loopback errors while still failing a true
+	// A->B->A cycle instead of deadlocking forever.
+	reentrantCallGrace = 5 * time.Second
 )
 
 // Limits are the per-cell resource bounds applied at instantiation and on
