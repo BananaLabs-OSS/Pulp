@@ -163,28 +163,19 @@ func (p *Cell) callContext(ctx context.Context) (context.Context, context.Cancel
 	return context.WithTimeout(ctx, p.callTimeout)
 }
 
-// lockForCall acquires p.mu for a sibling Call without blocking forever.
-// It returns true once the mutex is held. It returns false if the mutex is
-// still held after reentrantCallGrace (or ctx is cancelled) — the signature
-// of a re-entrant / loopback call that would otherwise deadlock the host.
-//
-// We poll TryLock rather than block on Lock so a true A->B->A loopback
-// (same goroutine, mutex never released) fails fast instead of hanging,
-// while brief legitimate contention from another cell's concurrent step
-// (released in microseconds) still succeeds.
+// lockForCall acquires p.mu for a sibling Call. Calls queue behind an active
+// step until their context deadline; converting ordinary provider contention
+// into a synthetic loopback error causes durable work to be dropped. A true
+// A->B->A cycle is still bounded by the caller's existing call context.
 func (p *Cell) lockForCall(ctx context.Context) bool {
 	if p.mu.TryLock() {
 		return true
 	}
-	deadline := time.NewTimer(reentrantCallGrace)
-	defer deadline.Stop()
 	tick := time.NewTicker(200 * time.Microsecond)
 	defer tick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return false
-		case <-deadline.C:
 			return false
 		case <-tick.C:
 			if p.mu.TryLock() {
