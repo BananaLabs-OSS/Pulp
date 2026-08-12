@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/BananaLabs-OSS/Pulp/abi"
@@ -134,6 +135,10 @@ type Cell struct {
 	// concurrently with its own step loop — the mutex prevents race
 	// conditions and re-entrant trap corruption.
 	mu sync.Mutex
+	// callWaiters gives synchronous provider calls priority over the idle step
+	// loop. Without it, a busy idle loop can reacquire mu indefinitely and make
+	// valid sibling work look like a re-entrant cycle after the grace period.
+	callWaiters atomic.Int32
 
 	// callTimeout bounds a single WASM entry point (Init/Step/Call/
 	// Shutdown) on the HOST side only: it cancels the call's context but
@@ -414,6 +419,9 @@ func (p *Cell) Init(ctx context.Context, config []byte) error {
 // Step encodes the envelope, writes it into WASM linear memory, and calls
 // pulp_step. Returns the output handle (0 means no output).
 func (p *Cell) Step(ctx context.Context, env abi.StepEnvelope) (outputHandle int32, err error) {
+	if len(env.Payload) == 0 && p.callWaiters.Load() > 0 {
+		return 0, nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -490,6 +498,8 @@ var ErrReentrantCall = errors.New("re-entrant / loopback sibling call rejected (
 var ErrMessageTooLarge = fmt.Errorf("cell message exceeds %d-byte limit", DefaultMaxMessageBytes)
 
 func (p *Cell) Call(ctx context.Context, funcName string, args []byte) ([]byte, error) {
+	p.callWaiters.Add(1)
+	defer p.callWaiters.Add(-1)
 	// Do NOT block indefinitely on p.mu: a sibling call cycle (A->B->A) or
 	// a self-targeted call re-enters this method on the same goroutine that
 	// already holds p.mu, which a plain Lock() would deadlock on forever.
