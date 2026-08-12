@@ -49,7 +49,7 @@ const (
 	// may include SQLite/WASM work and legitimately exceed a millisecond; the
 	// bounded wait prevents false loopback errors while still failing a true
 	// A->B->A cycle instead of deadlocking forever.
-	reentrantCallGrace = 5 * time.Second
+	reentrantCallGrace = DefaultCallTimeout
 )
 
 // Limits are the per-cell resource bounds applied at instantiation and on
