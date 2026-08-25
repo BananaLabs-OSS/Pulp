@@ -41,6 +41,9 @@ func TestSessionsSourceMonolithAndSplitCompositionsLoad(t *testing.T) {
 				if got != test.singleApp {
 					t.Fatalf("legacy_owner_imports_single_app = %v, want %v", got, test.singleApp)
 				}
+				if test.singleApp {
+					assertEvolutionSQLiteExecutionUnit(t, app)
+				}
 			}
 		})
 	}
@@ -59,6 +62,35 @@ func TestSessionsSourceMonolithAndSplitCompositionsLoad(t *testing.T) {
 	if len(host.ApplicationOrder[1].DependsOn) != 1 ||
 		host.ApplicationOrder[1].DependsOn[0] != "sessions" {
 		t.Fatalf("resolver dependencies = %#v, want [sessions]", host.ApplicationOrder[1].DependsOn)
+	}
+}
+
+func assertEvolutionSQLiteExecutionUnit(t *testing.T, app *Application) {
+	t.Helper()
+	var unit *ExecutionUnit
+	for index := range app.ExecutionUnits {
+		if app.ExecutionUnits[index].Name == "evolution-sqlite-core" {
+			unit = &app.ExecutionUnits[index]
+			break
+		}
+	}
+	if unit == nil {
+		t.Fatal("Evolution application is missing the evolution-sqlite-core execution unit")
+	}
+	if unit.Artifact == nil || unit.Artifact.Name != "evolution-state-engine" {
+		t.Fatalf("Evolution SQLite unit artifact = %#v, want evolution-state-engine", unit.Artifact)
+	}
+	want := []string{
+		"configuration-registry", "fixed-window-counter", "workload-inventory", "capacity-scheduler",
+		"archive-lifecycle", "artifact-lifecycle", "observation-registry", "runtime-control", "workload-provisioning", "notification-outbox",
+	}
+	if len(unit.Members) != len(want) {
+		t.Fatalf("Evolution SQLite unit members = %#v, want %#v", unit.Members, want)
+	}
+	for index, member := range want {
+		if unit.Members[index] != member {
+			t.Fatalf("Evolution SQLite unit member[%d] = %q, want %q", index, unit.Members[index], member)
+		}
 	}
 }
 

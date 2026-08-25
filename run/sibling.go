@@ -21,6 +21,7 @@ import (
 	"runtime/debug"
 
 	"github.com/BananaLabs-OSS/Pulp/ext"
+	"github.com/BananaLabs-OSS/Pulp/internal/manifest"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 )
@@ -29,11 +30,28 @@ import (
 // handler needs: lookup a cell by name and verify the caller is allowed to
 // invoke an exact manifest-declared provider/function.
 type siblingRegistry struct {
-	runtimes map[string]*cellRuntime
+	runtimes       map[string]*cellRuntime
+	logicalSpecs   map[string]*manifest.CellSpec
+	physicalTarget map[string]string
 }
 
 func newSiblingRegistry(runtimes map[string]*cellRuntime) *siblingRegistry {
 	return &siblingRegistry{runtimes: runtimes}
+}
+
+// newPlacedSiblingRegistry keeps public sibling addresses logical while the
+// deployment plan may route them to a smaller set of physical runtimes.
+func newPlacedSiblingRegistry(runtimes map[string]*cellRuntime, logicalSpecs map[string]*manifest.CellSpec, physicalTarget map[string]string) *siblingRegistry {
+	return &siblingRegistry{runtimes: runtimes, logicalSpecs: logicalSpecs, physicalTarget: physicalTarget}
+}
+
+func (r *siblingRegistry) resolveTarget(target string) string {
+	if r != nil && r.physicalTarget != nil {
+		if physical := r.physicalTarget[target]; physical != "" {
+			return physical
+		}
+	}
+	return target
 }
 
 // siblingCapability returns a Capability that binds the pulp_call host
@@ -169,11 +187,15 @@ func allowedToCall(reg *siblingRegistry, caller, target, funcName string) bool {
 	if !ok {
 		return false
 	}
-	targetRT, ok := reg.runtimes[target]
+	targetRT, ok := reg.runtimes[reg.resolveTarget(target)]
 	if !ok {
 		return false
 	}
-	return containsExact(callerRT.spec.Consumes, funcName) && containsExact(targetRT.spec.Provides, funcName)
+	targetSpec := targetRT.spec
+	if logical := reg.logicalSpecs[target]; logical != nil {
+		targetSpec = logical
+	}
+	return containsExact(callerRT.spec.Consumes, funcName) && containsExact(targetSpec.Provides, funcName)
 }
 
 func containsExact(values []string, want string) bool {
@@ -189,7 +211,8 @@ func containsExact(values []string, want string) bool {
 // and invokes the target cell's Call method directly. Used from the
 // pulp_call host-function closure.
 func (r *siblingRegistry) callDirect(ctx context.Context, caller, target, funcName string, args []byte) ([]byte, error) {
-	targetRT, ok := r.runtimes[target]
+	physicalTarget := r.resolveTarget(target)
+	targetRT, ok := r.runtimes[physicalTarget]
 	if !ok {
 		return nil, fmt.Errorf("unknown target cell %q", target)
 	}
@@ -266,6 +289,31 @@ func validateSiblingLinks(runtimes map[string]*cellRuntime) []string {
 			default:
 				missing = append(missing, fmt.Sprintf("%s consumes %s (ambiguous provider templates: %v)", rt.spec.Name, c, providers))
 			}
+		}
+	}
+	return missing
+}
+
+// validatePlacedSiblingLinks validates the author-facing graph rather than the
+// reduced execution graph. A fused artifact may serve several logical cells,
+// but dependencies and provider ownership still belong to those logical cells.
+func validatePlacedSiblingLinks(logical map[string]*manifest.CellSpec) []string {
+	provided := map[string]map[string]struct{}{}
+	for name, spec := range logical {
+		for _, provider := range spec.Provides {
+			if provided[provider] == nil { provided[provider] = map[string]struct{}{} }
+			provided[provider][name] = struct{}{}
+		}
+	}
+	var missing []string
+	for name, spec := range logical {
+		for _, dependency := range spec.DependsOn {
+			if logical[dependency] == nil { missing = append(missing, fmt.Sprintf("%s depends_on %s (no such logical cell)", name, dependency)) }
+		}
+		for _, consumed := range spec.Consumes {
+			owners := provided[consumed]
+			if len(owners) == 0 { missing = append(missing, fmt.Sprintf("%s consumes %s (no logical provider)", name, consumed))
+			} else if len(owners) > 1 { missing = append(missing, fmt.Sprintf("%s consumes %s (ambiguous logical providers)", name, consumed)) }
 		}
 	}
 	return missing

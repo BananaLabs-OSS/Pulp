@@ -33,6 +33,21 @@ type Application struct {
 	// instances for this application. Legacy apps have one `primary` placement
 	// per entry in Cells.Order.
 	Placements []CellPlacement
+	// ExecutionUnits describe deployment-selected physical artifacts. Members
+	// retain their logical package identities; the runtime may later dispatch
+	// those logical addresses to the one artifact without changing Lua.
+	ExecutionUnits []ExecutionUnit
+}
+
+// ExecutionUnit maps multiple logical packages to one deployment artifact.
+// Members retain their individual manifests, providers, dependency checks, and
+// Lua-visible names; the runtime instantiates Artifact once and routes member
+// calls to it. This is the deployment-only fusion seam: it never promises that
+// arbitrary third-party Wasm binaries can share implementation internals.
+type ExecutionUnit struct {
+	Name     string
+	Artifact *CellSpec
+	Members  []string
 }
 
 // CellPlacement is one independently instantiated copy of a reusable cell
@@ -51,7 +66,14 @@ type rawApplication struct {
 	Cells             []string           `toml:"cells"`
 	RequireWASMSHA256 bool               `toml:"require_wasm_sha256"`
 	CellPlacements    []rawCellPlacement `toml:"cell_placements"`
+	ExecutionUnits    []rawExecutionUnit `toml:"execution_units"`
 	Orchestrator      rawOrchestrator    `toml:"orchestrator"`
+}
+
+type rawExecutionUnit struct {
+	Name     string   `toml:"name"`
+	Artifact string   `toml:"artifact"`
+	Members  []string `toml:"members"`
 }
 
 // rawCellPlacement intentionally references a template cell by its manifest
@@ -171,9 +193,6 @@ func LoadApp(path string) (*Application, error) {
 		if err != nil {
 			return nil, fmt.Errorf("app cell %s: %w", cellPath, err)
 		}
-		if err := verifyWASMDigest(spec, raw.RequireWASMSHA256); err != nil {
-			return nil, fmt.Errorf("app cell %s: %w", cellPath, err)
-		}
 		specs = append(specs, spec)
 		if samePath(spec.ManifestPath, orchestratorManifest) {
 			orchestrator = spec
@@ -194,6 +213,24 @@ func LoadApp(path string) (*Application, error) {
 	placements, err := buildAppPlacements(set, raw.CellPlacements)
 	if err != nil {
 		return nil, fmt.Errorf("validate app cell placements: %w", err)
+	}
+	executionUnits, err := buildExecutionUnits(baseDir, set, raw.ExecutionUnits, raw.RequireWASMSHA256)
+	if err != nil {
+		return nil, fmt.Errorf("validate app execution units: %w", err)
+	}
+	fusedMembers := map[string]bool{}
+	for _, unit := range executionUnits {
+		for _, member := range unit.Members {
+			fusedMembers[member] = true
+		}
+	}
+	for _, spec := range set.Cells {
+		if fusedMembers[spec.Name] {
+			continue
+		}
+		if err := verifyWASMDigest(spec, raw.RequireWASMSHA256); err != nil {
+			return nil, fmt.Errorf("app cell %s: %w", spec.ManifestPath, err)
+		}
 	}
 	orchestratorPlacements := 0
 	for _, placement := range placements {
@@ -217,7 +254,59 @@ func LoadApp(path string) (*Application, error) {
 		RequireWASMSHA256:    raw.RequireWASMSHA256,
 		Cells:                set,
 		Placements:           placements,
+		ExecutionUnits:       executionUnits,
 	}, nil
+}
+
+func buildExecutionUnits(baseDir string, set *Set, rawUnits []rawExecutionUnit, requireDigest bool) ([]ExecutionUnit, error) {
+	byName := make(map[string]*CellSpec, len(set.Cells))
+	for _, spec := range set.Cells {
+		byName[spec.Name] = spec
+	}
+	claimed := map[string]string{}
+	units := make([]ExecutionUnit, 0, len(rawUnits))
+	for index, rawUnit := range rawUnits {
+		name := strings.TrimSpace(rawUnit.Name)
+		if name == "" {
+			return nil, fmt.Errorf("execution_units[%d].name is required", index)
+		}
+		artifactPath, err := resolveAppRelativePath(baseDir, rawUnit.Artifact, fmt.Sprintf("execution_units[%d].artifact", index))
+		if err != nil {
+			return nil, err
+		}
+		artifact, err := Load(artifactPath)
+		if err != nil {
+			return nil, fmt.Errorf("load %q: %w", rawUnit.Artifact, err)
+		}
+		if err := verifyWASMDigest(artifact, requireDigest); err != nil {
+			return nil, err
+		}
+		members := dedupe(rawUnit.Members)
+		if len(members) < 2 {
+			return nil, fmt.Errorf("execution unit %q requires at least two logical members", name)
+		}
+		artifactProviders := make(map[string]struct{}, len(artifact.Provides))
+		for _, provider := range artifact.Provides {
+			artifactProviders[provider] = struct{}{}
+		}
+		for _, member := range members {
+			spec, ok := byName[member]
+			if !ok {
+				return nil, fmt.Errorf("execution unit %q references unknown logical cell %q", name, member)
+			}
+			if previous, exists := claimed[member]; exists {
+				return nil, fmt.Errorf("logical cell %q is assigned to both %q and %q", member, previous, name)
+			}
+			for _, provider := range spec.Provides {
+				if _, provided := artifactProviders[provider]; !provided {
+					return nil, fmt.Errorf("execution unit %q artifact %q does not provide logical cell %q provider %q", name, artifact.Name, member, provider)
+				}
+			}
+			claimed[member] = name
+		}
+		units = append(units, ExecutionUnit{Name: name, Artifact: artifact, Members: members})
+	}
+	return units, nil
 }
 
 func buildAppPlacements(set *Set, rawPlacements []rawCellPlacement) ([]CellPlacement, error) {

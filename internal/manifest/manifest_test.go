@@ -100,6 +100,37 @@ name = "hill-alpha"
 	}
 }
 
+func TestLoad_ExecutionFusible(t *testing.T) {
+	path := writeManifest(t, `
+name = "state-owner"
+version = "1"
+[execution]
+mode = "fusible"
+group = "sessions-state"
+abi = "pulp-linear-v1"
+`)
+	spec, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := spec.Execution; got.Mode != ExecutionFusible || got.Group != "sessions-state" || got.ABI != "pulp-linear-v1" {
+		t.Fatalf("execution = %#v", got)
+	}
+}
+
+func TestLoad_ExecutionFusibleRequiresContract(t *testing.T) {
+	path := writeManifest(t, `
+name = "state-owner"
+version = "1"
+[execution]
+mode = "fusible"
+group = "sessions-state"
+`)
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "execution.abi") {
+		t.Fatalf("Load error = %v, want execution ABI validation", err)
+	}
+}
+
 func TestLoad_NestedConfigRemainsFreeForm(t *testing.T) {
 	path := writeManifest(t, `
 name = "http-probe"

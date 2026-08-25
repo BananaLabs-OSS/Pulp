@@ -13,6 +13,7 @@ import (
 
 	"github.com/BananaLabs-OSS/Pulp/ext"
 	"github.com/BananaLabs-OSS/Pulp/internal/manifest"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 // TestApplicationRuntimeShutdownDoesNotSuperviseCancelledIdleStep exercises
@@ -64,6 +65,68 @@ sha256 = "%x"
 	}
 }
 
+func TestExecutionUnitStartsOneArtifactForLogicalMembers(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PULP_WAZERO_CACHE", filepath.Join(root, "wazero"))
+	wasm := buildLuaHarnessCell(t, filepath.Join("..", "testdata", "lua-math-engine"), "execution-unit", t.TempDir())
+	bytes, err := os.ReadFile(wasm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "engine.wasm"), bytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writePlacementAppFile(t, root, "alpha.cell.toml", "name = \"alpha\"\nversion = \"1\"\nwasm = \"unused-alpha.wasm\"\nprovides = [\"math.double\"]\n")
+	writePlacementAppFile(t, root, "beta.cell.toml", "name = \"beta\"\nversion = \"1\"\nwasm = \"unused-beta.wasm\"\nprovides = [\"math.other\"]\n")
+	writePlacementAppFile(t, root, "engine.cell.toml", "name = \"math-engine\"\nversion = \"1\"\nwasm = \"engine.wasm\"\nprovides = [\"math.double\", \"math.other\"]\n")
+	writePlacementAppFile(t, root, "lua.cell.toml", "name = \"lua\"\nversion = \"1\"\nwasm = \"engine.wasm\"\n")
+	script := "return true"
+	writePlacementAppFile(t, root, "app.lua", script)
+	digest := sha256.Sum256([]byte(script))
+	appPath := writePlacementAppFile(t, root, "pulp.app.toml", fmt.Sprintf(`name = "execution-unit"
+version = "1"
+cells = ["alpha.cell.toml", "beta.cell.toml", "lua.cell.toml"]
+[[execution_units]]
+name = "math"
+artifact = "engine.cell.toml"
+members = ["alpha", "beta"]
+[orchestrator]
+manifest = "lua.cell.toml"
+script = "app.lua"
+sha256 = "%x"
+`, digest))
+	app, err := manifest.LoadApp(appPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	placements, _, _, err := executionPlacements(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(placements) != 2 || placements[0].Spec.Name != "math-engine" || placements[1].Spec.Name != "lua" {
+		t.Fatalf("physical placement order = %#v, want fused engine at the first member position before lua", placements)
+	}
+	runtime := newDirectApplicationRuntime(app, DirectApplicationOptions{})
+	if err := runtime.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Shutdown(context.Background())
+	if runtime.host == nil || len(runtime.host.runtime.runtimes) != 2 || runtime.host.runtime.runtimes["alpha"] != nil || runtime.host.runtime.runtimes["beta"] != nil {
+		t.Fatalf("physical runtimes = %#v", runtime.host.runtime.runtimes)
+	}
+	logical := map[string]*manifest.CellSpec{"alpha": app.Cells.Cells[0]}
+	registry := newPlacedSiblingRegistry(runtime.host.runtime.runtimes, logical, map[string]string{"alpha": "math-engine"})
+	input, _ := msgpack.Marshal(map[string]any{"value": int64(21)})
+	output, err := registry.callDirect(context.Background(), "lua", "alpha", "math.double", input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result map[string]any
+	if err := msgpack.Unmarshal(output, &result); err != nil || result["value"] != int64(42) {
+		t.Fatalf("logical call result = %#v, err=%v", result, err)
+	}
+}
+
 func TestApplicationRuntimeSiblingRegistryIsApplicationLocal(t *testing.T) {
 	provider := &cellRuntime{spec: &manifest.CellSpec{Name: "provider", Provides: []string{"math.sum"}}}
 	consumer := &cellRuntime{spec: &manifest.CellSpec{Name: "consumer", Consumes: []string{"math.sum"}, DependsOn: []string{"provider"}}}
@@ -82,6 +145,23 @@ func TestApplicationRuntimeSiblingRegistryIsApplicationLocal(t *testing.T) {
 	}
 	if _, err := other.callDirect(context.Background(), "consumer", "consumer", "math.sum", nil); err == nil {
 		t.Fatal("foreign application unexpectedly resolved a missing caller target")
+	}
+}
+
+func TestPlacedSiblingRegistryKeepsLogicalContracts(t *testing.T) {
+	logicalProvider := &manifest.CellSpec{Name: "vector", Provides: []string{"vector.v1.add"}}
+	consumer := &cellRuntime{spec: &manifest.CellSpec{Name: "game", Consumes: []string{"vector.v1.add"}}}
+	physical := &cellRuntime{spec: &manifest.CellSpec{Name: "math-engine", Provides: []string{"vector.v1.add", "matrix.v1.mul"}}}
+	registry := newPlacedSiblingRegistry(
+		map[string]*cellRuntime{"game": consumer, "math-engine": physical},
+		map[string]*manifest.CellSpec{"vector": logicalProvider},
+		map[string]string{"vector": "math-engine"},
+	)
+	if !allowedToCall(registry, "game", "vector", "vector.v1.add") {
+		t.Fatal("logical provider was not routed to its physical execution unit")
+	}
+	if allowedToCall(registry, "game", "vector", "matrix.v1.mul") {
+		t.Fatal("physical artifact leaked a provider outside the logical contract")
 	}
 }
 

@@ -66,6 +66,12 @@ type CellSpec struct {
 	// imports that match declared capabilities; everything else fails loudly.
 	Capabilities []string
 
+	// Execution declares how Pulp may place this logical cell at runtime.
+	// It never changes the cell's public provides/consumes contract. The
+	// zero value is isolated, preserving the existing one-cell/one-instance
+	// behaviour for every manifest written before execution planning existed.
+	Execution ExecutionSpec
+
 	// SharedMemoryGroups — opt-in zero-copy regions between cooperating
 	// cells. Absent from v0.2 linking but parsed so manifests are
 	// forward-compatible.
@@ -118,6 +124,22 @@ type CellSpec struct {
 	WASMSHA256 string
 }
 
+// ExecutionMode is the requested physical-layout policy for one logical cell.
+const (
+	ExecutionIsolated = "isolated"
+	ExecutionFusible  = "fusible"
+)
+
+// ExecutionSpec is deliberately small: a fusible cell opts into Pulp's
+// internal ABI and names the desired execution group. A planner may still
+// reject a group (and run it isolated) when its security or lifecycle
+// constraints do not match. This makes optimisation safe-by-default.
+type ExecutionSpec struct {
+	Mode  string
+	Group string
+	ABI   string
+}
+
 // raw mirrors the TOML schema exactly. It's the only struct BurntSushi/toml
 // unmarshals into. Normalization happens afterward in Load.
 type raw struct {
@@ -129,11 +151,12 @@ type raw struct {
 	WASM       string  `toml:"wasm"`
 	WASMSHA256 *string `toml:"wasm_sha256"`
 
-	Provides     []string `toml:"provides"`
-	Consumes     []string `toml:"consumes"`
-	HostConsumes []string `toml:"host_consumes"`
-	DependsOn    []string `toml:"depends_on"`
-	Capabilities []string `toml:"capabilities"`
+	Provides     []string     `toml:"provides"`
+	Consumes     []string     `toml:"consumes"`
+	HostConsumes []string     `toml:"host_consumes"`
+	DependsOn    []string     `toml:"depends_on"`
+	Capabilities []string     `toml:"capabilities"`
+	Execution    rawExecution `toml:"execution"`
 
 	SharedMemoryGroups []string `toml:"shared_memory_groups"`
 
@@ -151,6 +174,12 @@ type raw struct {
 	Migratable        bool     `toml:"migratable"`
 
 	Config map[string]any `toml:"config"`
+}
+
+type rawExecution struct {
+	Mode  string `toml:"mode"`
+	Group string `toml:"group"`
+	ABI   string `toml:"abi"`
 }
 
 // Load reads, parses, and validates a pulp.cell.toml at path. Returns a
@@ -255,6 +284,10 @@ func normalize(r *raw, manifestPath string) (*CellSpec, error) {
 			return nil, err
 		}
 	}
+	execution, err := normalizeExecution(r.Execution)
+	if err != nil {
+		return nil, err
+	}
 
 	return &CellSpec{
 		SchemaVersion:      schemaVersion,
@@ -265,6 +298,7 @@ func normalize(r *raw, manifestPath string) (*CellSpec, error) {
 		HostConsumes:       hostConsumes,
 		DependsOn:          dedupe(r.DependsOn),
 		Capabilities:       dedupe(lowerAll(r.Capabilities)),
+		Execution:          execution,
 		SharedMemoryGroups: dedupe(r.SharedMemoryGroups),
 		DedicatedThread:    r.DedicatedThread,
 		Snapshotable:       r.Snapshotable,
@@ -276,6 +310,34 @@ func normalize(r *raw, manifestPath string) (*CellSpec, error) {
 		WASMPath:           wasmPath,
 		WASMSHA256:         wasmSHA256,
 	}, nil
+}
+
+func normalizeExecution(r rawExecution) (ExecutionSpec, error) {
+	mode := strings.ToLower(strings.TrimSpace(r.Mode))
+	if mode == "" {
+		mode = ExecutionIsolated
+	}
+	group := strings.TrimSpace(r.Group)
+	abi := strings.TrimSpace(r.ABI)
+	switch mode {
+	case ExecutionIsolated:
+		if group != "" || abi != "" {
+			return ExecutionSpec{}, errors.New("execution.group and execution.abi require execution.mode = \"fusible\"")
+		}
+	case ExecutionFusible:
+		if group == "" {
+			return ExecutionSpec{}, errors.New("execution.group is required when execution.mode = \"fusible\"")
+		}
+		if abi == "" {
+			return ExecutionSpec{}, errors.New("execution.abi is required when execution.mode = \"fusible\"")
+		}
+		if strings.IndexFunc(group, func(r rune) bool { return r <= ' ' }) >= 0 {
+			return ExecutionSpec{}, errors.New("execution.group must not contain whitespace")
+		}
+	default:
+		return ExecutionSpec{}, fmt.Errorf("execution.mode %q is not one of %q, %q", mode, ExecutionIsolated, ExecutionFusible)
+	}
+	return ExecutionSpec{Mode: mode, Group: group, ABI: abi}, nil
 }
 
 func normalizeHostConsumes(values []string) ([]string, error) {

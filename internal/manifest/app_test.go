@@ -296,6 +296,44 @@ sha256 = "%x"
 	}
 }
 
+func TestLoadAppRejectsExecutionUnitArtifactMissingMemberProvider(t *testing.T) {
+	root := t.TempDir()
+	writeAppFile(t, root, "alpha.cell.toml", `
+name = "alpha"
+version = "1.0.0"
+provides = ["alpha.v1.call"]
+`)
+	writeAppFile(t, root, "beta.cell.toml", `
+name = "beta"
+version = "1.0.0"
+provides = ["beta.v1.call"]
+`)
+	writeAppFile(t, root, "engine.cell.toml", `
+name = "engine"
+version = "1.0.0"
+provides = ["alpha.v1.call"]
+`)
+	script := `return true`
+	writeAppFile(t, root, "app.lua", script)
+	digest := sha256.Sum256([]byte(script))
+	appPath := writeAppFile(t, root, "pulp.app.toml", fmt.Sprintf(`
+name = "test"
+version = "1"
+cells = ["alpha.cell.toml", "beta.cell.toml"]
+[[execution_units]]
+name = "engine"
+artifact = "engine.cell.toml"
+members = ["alpha", "beta"]
+[orchestrator]
+manifest = "alpha.cell.toml"
+script = "app.lua"
+sha256 = "%x"
+`, digest))
+	if _, err := LoadApp(appPath); err == nil || !strings.Contains(err.Error(), `does not provide logical cell "beta" provider "beta.v1.call"`) {
+		t.Fatalf("LoadApp error = %v", err)
+	}
+}
+
 func TestLoadAppRejectsMissingCellManifest(t *testing.T) {
 	root := t.TempDir()
 	script := `return true`

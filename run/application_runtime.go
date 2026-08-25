@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/BananaLabs-OSS/Pulp/ext"
+	"github.com/BananaLabs-OSS/Pulp/internal/fusion"
 	"github.com/BananaLabs-OSS/Pulp/internal/host"
 	"github.com/BananaLabs-OSS/Pulp/internal/manifest"
 	"github.com/BananaLabs-OSS/Pulp/internal/safe"
@@ -149,6 +150,45 @@ func newApplicationRuntime(app HostedApplication, config ScopedApplicationRuntim
 	return &applicationRuntime{application: app, config: config}
 }
 
+// executionPlacements converts a logical application graph into the smaller
+// physical layout selected by its deployment execution units. Members must be
+// singleton placements: per-instance fusion needs an explicit future selector.
+func executionPlacements(app *manifest.Application) ([]manifest.CellPlacement, map[string]*manifest.CellSpec, map[string]string, error) {
+	logical := make(map[string]*manifest.CellSpec, len(app.Cells.Cells))
+	for _, spec := range app.Cells.Cells {
+		logical[spec.Name] = spec
+	}
+	memberUnit := map[string]manifest.ExecutionUnit{}
+	for _, unit := range app.ExecutionUnits {
+		for _, member := range unit.Members {
+			memberUnit[member] = unit
+		}
+	}
+	placements := make([]manifest.CellPlacement, 0, len(app.Placements)+len(app.ExecutionUnits))
+	targets := map[string]string{}
+	emittedUnits := map[string]bool{}
+	for _, placement := range app.Placements {
+		if unit, fused := memberUnit[placement.Spec.Name]; fused {
+			if placement.InstanceID != "primary" || placement.Address != placement.Spec.Name {
+				return nil, nil, nil, fmt.Errorf("execution unit member %q must use the singleton primary placement", placement.Spec.Name)
+			}
+			if !emittedUnits[unit.Name] {
+				artifact := unit.Artifact
+				placements = append(placements, manifest.CellPlacement{Spec: artifact, InstanceID: "primary", Address: artifact.Name})
+				emittedUnits[unit.Name] = true
+			}
+			continue
+		}
+		placements = append(placements, placement)
+	}
+	for _, unit := range app.ExecutionUnits {
+		for _, member := range unit.Members {
+			targets[member] = unit.Artifact.Name
+		}
+	}
+	return placements, logical, targets, nil
+}
+
 func (r *applicationRuntime) Identity() ApplicationIdentity { return r.application.Identity }
 
 func (r *applicationRuntime) HTTPAddress() string {
@@ -171,19 +211,37 @@ func (r *applicationRuntime) Start(parent context.Context) error {
 	if err != nil {
 		return fmt.Errorf("load application %s: %w", r.application.Identity, err)
 	}
+	// Planning is deliberately before capability registration and loading. It
+	// makes the physical-layout decision visible, deterministic, and testable;
+	// until a matching fused artifact is built, accepted groups retain the
+	// isolated execution fallback rather than changing semantics implicitly.
+	fusionPlan := fusion.Build(loaded.Cells.Order)
+	for _, group := range fusionPlan.Groups {
+		r.config.Logger.Info("fusion group eligible; isolated fallback active pending fused artifact",
+			"group", group.Name, "abi", group.ABI, "members", len(group.Members))
+	}
+	for _, decision := range fusionPlan.Isolated {
+		r.config.Logger.Debug("cell remains isolated", "cell", decision.Cell.Name, "reason", decision.Reason)
+	}
 	r.ctx, r.cancel = context.WithCancel(parent)
 	r.allCaps, err = selectedRuntimeCapabilities()
 	if err != nil {
 		r.reset()
 		return err
 	}
+	physicalPlacements, logicalSpecs, physicalTargets, err := executionPlacements(loaded)
+	if err != nil {
+		r.reset()
+		return err
+	}
 	r.declaredUnion, r.setupCaps = map[string]bool{}, map[string]bool{}
-	for _, spec := range loaded.Cells.Order {
+	for _, placement := range physicalPlacements {
+		spec := placement.Spec
 		for _, name := range spec.Capabilities {
 			r.declaredUnion[name] = true
 		}
 	}
-	r.resolveCapabilityConfigs(loaded.Placements)
+	r.resolveCapabilityConfigs(physicalPlacements)
 	if err := r.setupCapabilities(); err != nil {
 		r.reset()
 		return err
@@ -192,8 +250,8 @@ func (r *applicationRuntime) Start(parent context.Context) error {
 	for _, capability := range r.allCaps {
 		r.registry.Gated(capability)
 	}
-	r.runtimes = make(map[string]*cellRuntime, len(loaded.Placements))
-	for _, placement := range loaded.Placements {
+	r.runtimes = make(map[string]*cellRuntime, len(physicalPlacements))
+	for _, placement := range physicalPlacements {
 		spec := placement.Spec
 		scope, err := r.application.NewCellScope(spec.Name, placement.InstanceID)
 		if err != nil {
@@ -207,11 +265,15 @@ func (r *applicationRuntime) Start(parent context.Context) error {
 		}
 		r.runtimes[placement.Address] = &cellRuntime{spec: spec, address: placement.Address, scope: scope, events: make(chan routedEvent, eventChanSize), ctx: cellCtx, moduleCancel: moduleCancel, stepCtx: stepCtx, cancel: stepCancel, declared: declared, readyCh: make(chan struct{}), stepDone: make(chan struct{})}
 	}
-	r.registry.Always(siblingCapabilityWithCrossApplication(newSiblingRegistry(r.runtimes), r.config.CrossApplications, r.application))
-	if missing := validateSiblingLinks(r.runtimes); len(missing) != 0 {
+	r.registry.Always(siblingCapabilityWithCrossApplication(newPlacedSiblingRegistry(r.runtimes, logicalSpecs, physicalTargets), r.config.CrossApplications, r.application))
+	missing := validateSiblingLinks(r.runtimes)
+	if len(loaded.ExecutionUnits) > 0 {
+		missing = validatePlacedSiblingLinks(logicalSpecs)
+	}
+	if len(missing) != 0 {
 		return r.startFailure(fmt.Errorf("application %s sibling links: %v", r.application.Identity, missing))
 	}
-	for _, placement := range loaded.Placements {
+	for _, placement := range physicalPlacements {
 		spec := placement.Spec
 		rt := r.runtimes[placement.Address]
 		configBytes, err := manifest.EncodeConfig(spec.Config)
