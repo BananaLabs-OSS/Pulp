@@ -14,7 +14,7 @@ import (
 	"github.com/BananaLabs-OSS/Pulp/internal/manifest"
 )
 
-// startPeelApplicationHTTP boots Peel's deployed four-cell application.
+// startPeelApplicationHTTP boots Peel's composed application.
 // The control API now belongs to peel-api, so a single peel-relay cell
 // harness would truthfully return 404. This narrow harness preserves the
 // real API -> Lua -> owner/relay sibling-call boundary used in production.
@@ -30,9 +30,10 @@ func startPeelApplicationHTTP(t *testing.T, serviceToken string) *CellHarness {
 		t.Fatalf("load Peel application: %v", err)
 	}
 	sources := map[string]string{
-		"peel-owner":       filepath.Join(workspace, "Peel", "owner-cell"),
-		"peel-relay":       filepath.Join(workspace, "Peel", "pulp-cell"),
+		"routing-state":     filepath.Join(workspace, "Peel", "owner-cell"),
+		"udp-relay":         filepath.Join(workspace, "Peel", "pulp-cell"),
 		"peel-api":         filepath.Join(workspace, "Peel", "api-cell"),
+		"http-json":        filepath.Join(workspace, "Peel", "http-client-cell"),
 		"lua-orchestrator": filepath.Join(workspace, "Pulp-Lua", "pulp-cell"),
 	}
 	runtimes := make(map[string]*composedHarnessRuntime, len(application.Cells.Order))
@@ -46,7 +47,7 @@ func startPeelApplicationHTTP(t *testing.T, serviceToken string) *CellHarness {
 			spec.Config = map[string]any{}
 		}
 		switch spec.Name {
-		case "peel-relay":
+		case "udp-relay":
 			spec.Config["listen_addr"] = "127.0.0.1:0"
 		case "peel-api":
 			spec.Config["service_token"] = serviceToken
