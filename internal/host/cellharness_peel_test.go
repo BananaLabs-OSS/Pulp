@@ -33,9 +33,9 @@ import (
 	"testing"
 )
 
-// peelSourceDir: Pulp/internal/host -> ../../../Peel/pulp-cell.
+// peelSourceDir resolves the shared routed UDP relay used by Peel.
 func peelSourceDir() string {
-	return filepath.Join("..", "..", "..", "Peel", "pulp-cell")
+	return filepath.Join("..", "..", "..", "pulp-engines", "routed-udp-relay-host-cell")
 }
 
 // startPeel boots the composed Peel application with the given service token.

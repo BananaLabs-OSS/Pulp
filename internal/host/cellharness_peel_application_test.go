@@ -30,10 +30,10 @@ func startPeelApplicationHTTP(t *testing.T, serviceToken string) *CellHarness {
 		t.Fatalf("load Peel application: %v", err)
 	}
 	sources := map[string]string{
-		"routing-state":     filepath.Join(workspace, "Peel", "owner-cell"),
-		"udp-relay":         filepath.Join(workspace, "Peel", "pulp-cell"),
+		"routing-state":    filepath.Join(workspace, "pulp-engines", "routing-state-sqlite-cell"),
+		"routed-udp-relay": filepath.Join(workspace, "pulp-engines", "routed-udp-relay-host-cell"),
 		"peel-api":         filepath.Join(workspace, "Peel", "api-cell"),
-		"http-json":        filepath.Join(workspace, "Peel", "http-client-cell"),
+		"http-json":        filepath.Join(workspace, "pulp-engines", "http-json-cell"),
 		"lua-orchestrator": filepath.Join(workspace, "Pulp-Lua", "pulp-cell"),
 	}
 	runtimes := make(map[string]*composedHarnessRuntime, len(application.Cells.Order))
@@ -47,7 +47,7 @@ func startPeelApplicationHTTP(t *testing.T, serviceToken string) *CellHarness {
 			spec.Config = map[string]any{}
 		}
 		switch spec.Name {
-		case "udp-relay":
+		case "routed-udp-relay":
 			spec.Config["listen_addr"] = "127.0.0.1:0"
 		case "peel-api":
 			spec.Config["service_token"] = serviceToken
