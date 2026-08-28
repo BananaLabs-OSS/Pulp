@@ -25,6 +25,7 @@ type Host struct {
 	SchemaVersion int
 	Name          string
 	ManifestPath  string
+	HealthPath    string
 
 	Applications []*HostedApplication
 	// ApplicationOrder is a dependency-safe startup order. It contains the
@@ -63,6 +64,7 @@ type RouteBinding struct {
 type rawHost struct {
 	SchemaVersion int               `toml:"schema_version"`
 	Name          string            `toml:"name"`
+	HealthPath    string            `toml:"health_path"`
 	Applications  []rawHostedApp    `toml:"applications"`
 	Routes        []rawRouteBinding `toml:"routes"`
 }
@@ -131,7 +133,13 @@ func LoadHost(hostPath string) (*Host, error) {
 	}
 
 	baseDir := filepath.Dir(manifestPath)
-	host := &Host{SchemaVersion: schemaVersion, Name: name, ManifestPath: manifestPath}
+	healthPath := strings.TrimSpace(raw.HealthPath)
+	if healthPath != "" {
+		if !strings.HasPrefix(healthPath, "/") || strings.ContainsAny(healthPath, "?#\\") || path.Clean(healthPath) != healthPath || healthPath == "/" || strings.HasSuffix(healthPath, "/") {
+			return nil, fmt.Errorf("host health_path %q must be a canonical non-root URL path", healthPath)
+		}
+	}
+	host := &Host{SchemaVersion: schemaVersion, Name: name, ManifestPath: manifestPath, HealthPath: healthPath}
 	byID := make(map[string]*HostedApplication, len(raw.Applications))
 	storageOwners := make(map[string]string, len(raw.Applications))
 	eventOwners := make(map[string]string, len(raw.Applications))

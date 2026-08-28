@@ -14,6 +14,7 @@ func TestLoadHostLoadsApplicationsInstancesRoutesAndNamespaces(t *testing.T) {
 	hostPath := writeAppFile(t, root, "pulp.host.toml", `
 schema_version = 1
 name = "platform"
+health_path = "/health"
 
 [[applications]]
 id = "evolution"
@@ -47,6 +48,9 @@ instance = "sessions-public"
 	}
 	if host.Name != "platform" || len(host.Applications) != 2 || len(host.Routes) != 2 {
 		t.Fatalf("host shape = %#v", host)
+	}
+	if host.HealthPath != "/health" {
+		t.Fatalf("health path = %q", host.HealthPath)
 	}
 	evolution := host.Applications[0]
 	if evolution.Application.Name != "evolution" || evolution.Instances[0].Alias != "evolution-web" {
@@ -392,6 +396,25 @@ application = "a"`,
 				t.Fatalf("LoadHost error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestLoadHostRejectsInvalidHealthPath(t *testing.T) {
+	root := t.TempDir()
+	writeHostApplication(t, root, "apps/a", "a")
+	for _, healthPath := range []string{"/", "health", "/health/", "/a/../health", "/health?deep=1"} {
+		hostPath := writeAppFile(t, root, strings.NewReplacer("/", "_", "?", "_").Replace(healthPath)+".toml", fmt.Sprintf(`
+name = "platform"
+health_path = %q
+[[applications]]
+id = "a"
+manifest = "apps/a/pulp.app.toml"
+storage_namespace = "a"
+event_namespace = "a-events"
+`, healthPath))
+		if _, err := LoadHost(hostPath); err == nil || !strings.Contains(err.Error(), "health_path") {
+			t.Fatalf("LoadHost health_path %q error = %v", healthPath, err)
+		}
 	}
 }
 

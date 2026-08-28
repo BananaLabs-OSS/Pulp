@@ -38,10 +38,11 @@ type hostGatewayRoute struct {
 // composition. It maps canonical route prefixes to exact application instance
 // identities and strips only the matched external prefix before proxying.
 type HostGateway struct {
-	mu     sync.Mutex
-	addr   string
-	logger *slog.Logger
-	routes []hostGatewayRoute
+	mu         sync.Mutex
+	addr       string
+	healthPath string
+	logger     *slog.Logger
+	routes     []hostGatewayRoute
 
 	server   *http.Server
 	listener net.Listener
@@ -139,7 +140,12 @@ func NewSupervisorHostGateway(addr string, hostManifest *manifest.Host, supervis
 	}
 	runtimes := append([]ApplicationRuntime(nil), supervisor.runtimes...)
 	supervisor.mu.Unlock()
-	return NewHostGateway(addr, hostManifest.Routes, runtimes, logger)
+	gateway, err := NewHostGateway(addr, hostManifest.Routes, runtimes, logger)
+	if err != nil {
+		return nil, err
+	}
+	gateway.healthPath = hostManifest.HealthPath
+	return gateway, nil
 }
 
 func canonicalGatewayPrefix(prefix string) (string, error) {
@@ -224,6 +230,15 @@ func joinGatewayPath(base, path string) string {
 }
 
 func (g *HostGateway) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	if g.healthPath != "" && request.URL.Path == g.healthPath && (request.Method == http.MethodGet || request.Method == http.MethodHead) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.Header().Set("Cache-Control", "no-store")
+		writer.WriteHeader(http.StatusOK)
+		if request.Method != http.MethodHead {
+			_, _ = writer.Write([]byte("{\"status\":\"healthy\"}\n"))
+		}
+		return
+	}
 	for index := range g.routes {
 		route := &g.routes[index]
 		if gatewayPrefixMatches(route.prefix, request.URL.Path) {

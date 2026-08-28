@@ -181,7 +181,7 @@ func TestNewSupervisorHostGatewayRequiresRunningExactRuntimeSnapshot(t *testing.
 		identity: ApplicationIdentity{ApplicationID: "sessions", InstanceID: "blue"},
 		address:  upstream.URL,
 	}
-	hostManifest := &manifest.Host{Routes: []*manifest.RouteBinding{
+	hostManifest := &manifest.Host{HealthPath: "/health", Routes: []*manifest.RouteBinding{
 		{Path: "/sessions", Application: "sessions", Instance: "blue"},
 	}}
 	supervisor := &MultiHostSupervisor{state: multiHostRunning, runtimes: []ApplicationRuntime{runtime}}
@@ -191,6 +191,11 @@ func TestNewSupervisorHostGatewayRequiresRunningExactRuntimeSnapshot(t *testing.
 	}
 	if len(gateway.routes) != 1 || gateway.routes[0].identity != runtime.identity {
 		t.Fatalf("gateway routes = %#v", gateway.routes)
+	}
+	response := httptest.NewRecorder()
+	gateway.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if response.Code != http.StatusOK || response.Body.String() != "{\"status\":\"healthy\"}\n" {
+		t.Fatalf("host health response = %d %q", response.Code, response.Body.String())
 	}
 
 	supervisor.state = multiHostStopped
