@@ -26,6 +26,19 @@ Flags:
 
 TLS is controlled by `HTTP_CERT` and `HTTP_KEY` environment variables (paths to PEM files), read by `Pulp-ext-http` during Setup — not by command-line flags.
 
+Cells that need a deployment secret can opt into individual host environment
+values without inheriting the host environment. Map a config key to an
+environment variable in the cell manifest; an unset variable leaves the
+regular `[config]` value unchanged:
+
+```toml
+[config]
+service_token = ""
+
+[config_env]
+service_token = "SERVICE_TOKEN"
+```
+
 ## Application manifests
 
 `pulp.app.toml` makes a named application from cell manifests plus one verified

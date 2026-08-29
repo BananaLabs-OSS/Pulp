@@ -161,6 +161,54 @@ http_probe = { destinations = { "status.website.6227748c2fbaff8f" = { url = "htt
 	}
 }
 
+func TestLoad_ConfigEnvOverridesOnlyMappedConfig(t *testing.T) {
+	t.Setenv("PULP_TEST_CELL_SECRET", "runtime-secret")
+	path := writeManifest(t, `
+name = "secret-consumer"
+version = "1"
+
+[config]
+secret = ""
+ordinary = "manifest-value"
+
+[config_env]
+secret = "PULP_TEST_CELL_SECRET"
+`)
+	spec, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if spec.Config["secret"] != "runtime-secret" || spec.Config["ordinary"] != "manifest-value" {
+		t.Fatalf("resolved config = %#v", spec.Config)
+	}
+	if spec.ConfigEnv["secret"] != "PULP_TEST_CELL_SECRET" {
+		t.Fatalf("config env = %#v", spec.ConfigEnv)
+	}
+}
+
+func TestLoad_ConfigEnvLeavesDefaultWhenUnset(t *testing.T) {
+	const name = "PULP_TEST_INTENTIONALLY_UNSET"
+	t.Setenv(name, "")
+	if err := os.Unsetenv(name); err != nil {
+		t.Fatal(err)
+	}
+	path := writeManifest(t, `
+name = "optional-secret"
+version = "1"
+[config]
+secret = "disabled"
+[config_env]
+secret = "PULP_TEST_INTENTIONALLY_UNSET"
+`)
+	spec, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if spec.Config["secret"] != "disabled" {
+		t.Fatalf("secret = %#v", spec.Config["secret"])
+	}
+}
+
 func TestLoadNormalizesWASMSHA256(t *testing.T) {
 	digest := sha256.Sum256([]byte("package bytes"))
 	path := writeManifest(t, fmt.Sprintf("\nname = \"pinned\"\nversion = \"1\"\nwasm_sha256 = \"%X\"\n", digest))

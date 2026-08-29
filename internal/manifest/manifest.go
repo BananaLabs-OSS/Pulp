@@ -108,6 +108,12 @@ type CellSpec struct {
 	// Absent or empty table => nil map.
 	Config map[string]any
 
+	// ConfigEnv maps config keys to host environment variable names. Only
+	// explicitly mapped values are copied into this cell's config, avoiding
+	// secret exposure to unrelated WASM modules. An unset variable leaves the
+	// manifest value intact.
+	ConfigEnv map[string]string
+
 	// ManifestPath is the absolute path the manifest was loaded from.
 	// Used to resolve relative WASM paths.
 	ManifestPath string
@@ -173,7 +179,8 @@ type raw struct {
 	FederatedConsumes []string `toml:"federated_consumes"`
 	Migratable        bool     `toml:"migratable"`
 
-	Config map[string]any `toml:"config"`
+	Config    map[string]any    `toml:"config"`
+	ConfigEnv map[string]string `toml:"config_env"`
 }
 
 type rawExecution struct {
@@ -289,6 +296,21 @@ func normalize(r *raw, manifestPath string) (*CellSpec, error) {
 		return nil, err
 	}
 
+	config := cloneConfig(r.Config)
+	for key, envName := range r.ConfigEnv {
+		key = strings.TrimSpace(key)
+		envName = strings.TrimSpace(envName)
+		if key == "" || envName == "" {
+			return nil, errors.New("config_env keys and environment variable names must be non-empty")
+		}
+		if value, ok := os.LookupEnv(envName); ok {
+			if config == nil {
+				config = map[string]any{}
+			}
+			config[key] = value
+		}
+	}
+
 	return &CellSpec{
 		SchemaVersion:      schemaVersion,
 		Name:               strings.TrimSpace(r.Name),
@@ -305,11 +327,23 @@ func normalize(r *raw, manifestPath string) (*CellSpec, error) {
 		MaxMemoryPages:     r.MaxMemoryPages,
 		CallTimeoutMS:      r.CallTimeoutMS,
 		Restart:            restart,
-		Config:             r.Config,
+		Config:             config,
+		ConfigEnv:          r.ConfigEnv,
 		ManifestPath:       manifestPath,
 		WASMPath:           wasmPath,
 		WASMSHA256:         wasmSHA256,
 	}, nil
+}
+
+func cloneConfig(config map[string]any) map[string]any {
+	if config == nil {
+		return nil
+	}
+	clone := make(map[string]any, len(config))
+	for key, value := range config {
+		clone[key] = value
+	}
+	return clone
 }
 
 func normalizeExecution(r rawExecution) (ExecutionSpec, error) {
