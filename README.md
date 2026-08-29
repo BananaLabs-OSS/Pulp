@@ -39,6 +39,9 @@ service_token = ""
 service_token = "SERVICE_TOKEN"
 ```
 
+Nested configuration uses a quoted dotted key, for example
+`"values.service_token" = "SERVICE_TOKEN"`.
+
 ## Application manifests
 
 `pulp.app.toml` makes a named application from cell manifests plus one verified

@@ -307,7 +307,9 @@ func normalize(r *raw, manifestPath string) (*CellSpec, error) {
 			if config == nil {
 				config = map[string]any{}
 			}
-			config[key] = value
+			if err := setConfigPath(config, key, value); err != nil {
+				return nil, fmt.Errorf("config_env %q: %w", key, err)
+			}
 		}
 	}
 
@@ -333,6 +335,34 @@ func normalize(r *raw, manifestPath string) (*CellSpec, error) {
 		WASMPath:           wasmPath,
 		WASMSHA256:         wasmSHA256,
 	}, nil
+}
+
+func setConfigPath(config map[string]any, path, value string) error {
+	parts := strings.Split(path, ".")
+	cursor := config
+	for _, part := range parts[:len(parts)-1] {
+		if part == "" {
+			return errors.New("config path contains an empty segment")
+		}
+		next, exists := cursor[part]
+		if !exists {
+			child := map[string]any{}
+			cursor[part] = child
+			cursor = child
+			continue
+		}
+		child, ok := next.(map[string]any)
+		if !ok {
+			return fmt.Errorf("config path segment %q is not a table", part)
+		}
+		cursor = child
+	}
+	leaf := parts[len(parts)-1]
+	if leaf == "" {
+		return errors.New("config path contains an empty segment")
+	}
+	cursor[leaf] = value
+	return nil
 }
 
 func cloneConfig(config map[string]any) map[string]any {

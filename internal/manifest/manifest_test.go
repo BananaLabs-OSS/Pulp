@@ -209,6 +209,27 @@ secret = "PULP_TEST_INTENTIONALLY_UNSET"
 	}
 }
 
+func TestLoad_ConfigEnvSupportsNestedConfig(t *testing.T) {
+	t.Setenv("PULP_TEST_NESTED_SECRET", "nested-secret")
+	path := writeManifest(t, `
+name = "nested-secret-consumer"
+version = "1"
+[config.values]
+ordinary = "preserved"
+secret = ""
+[config_env]
+"values.secret" = "PULP_TEST_NESTED_SECRET"
+`)
+	spec, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	values := spec.Config["values"].(map[string]any)
+	if values["secret"] != "nested-secret" || values["ordinary"] != "preserved" {
+		t.Fatalf("nested config = %#v", values)
+	}
+}
+
 func TestLoadNormalizesWASMSHA256(t *testing.T) {
 	digest := sha256.Sum256([]byte("package bytes"))
 	path := writeManifest(t, fmt.Sprintf("\nname = \"pinned\"\nversion = \"1\"\nwasm_sha256 = \"%X\"\n", digest))
