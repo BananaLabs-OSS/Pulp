@@ -63,9 +63,11 @@ func main() {
 }
 
 type quotaRequest struct {
-	Current int64 `json:"current"`
-	Delta   int64 `json:"delta"`
-	Limit   int64 `json:"limit"`
+	Current  int64  `json:"current"`
+	Delta    int64  `json:"delta"`
+	Limit    int64  `json:"limit"`
+	Subject  string `json:"subject"`
+	Evidence []byte `json:"evidence"`
 }
 type requestFlags []quotaRequest
 
@@ -82,7 +84,7 @@ func (r *requestFlags) add(value string) error {
 		}
 		values[index] = parsed
 	}
-	*r = append(*r, quotaRequest{values[0], values[1], values[2]})
+	*r = append(*r, quotaRequest{Current: values[0], Delta: values[1], Limit: values[2], Subject: "tenant-a", Evidence: []byte{1, 2, 3}})
 	return nil
 }
 
@@ -151,21 +153,35 @@ func callRequests(manifestPath string, requests []quotaRequest) error {
 	defer cell.Shutdown(ctx)
 	encoder := json.NewEncoder(os.Stdout)
 	for _, request := range requests {
-		wire := make([]byte, 24)
+		subject := []byte(request.Subject)
+		wire := make([]byte, 32+len(subject)+len(request.Evidence))
 		binary.LittleEndian.PutUint64(wire[0:8], uint64(request.Current))
 		binary.LittleEndian.PutUint64(wire[8:16], uint64(request.Delta))
 		binary.LittleEndian.PutUint64(wire[16:24], uint64(request.Limit))
+		binary.LittleEndian.PutUint32(wire[24:28], uint32(len(subject)))
+		binary.LittleEndian.PutUint32(wire[28:32], uint32(len(request.Evidence)))
+		copy(wire[32:], subject)
+		copy(wire[32+len(subject):], request.Evidence)
 		response, err := cell.Call(ctx, "quota.admit-v1", wire)
 		if err != nil {
 			return err
 		}
-		if len(response) != 1 || response[0] > 1 {
+		if len(response) < 10 || response[0] != 0 || response[1] > 1 {
 			return fmt.Errorf("invalid quota response: %x", response)
 		}
+		subjectLength := int(binary.LittleEndian.Uint32(response[2:6]))
+		evidenceLength := int(binary.LittleEndian.Uint32(response[6:10]))
+		if len(response) != 10+subjectLength+evidenceLength {
+			return fmt.Errorf("invalid quota response length: %d", len(response))
+		}
+		responseSubject := string(response[10 : 10+subjectLength])
+		responseEvidence := append([]byte(nil), response[10+subjectLength:]...)
 		if err := encoder.Encode(struct {
 			Request  quotaRequest `json:"request"`
 			Accepted bool         `json:"accepted"`
-		}{request, response[0] == 1}); err != nil {
+			Subject  string       `json:"subject"`
+			Evidence []byte       `json:"evidence"`
+		}{request, response[1] == 1, responseSubject, responseEvidence}); err != nil {
 			return err
 		}
 	}

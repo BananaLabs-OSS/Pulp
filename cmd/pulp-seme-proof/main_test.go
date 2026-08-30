@@ -14,8 +14,8 @@ func TestApplicationArgs(t *testing.T) {
 	if !enabled || manifestPath != "quota.cell.toml" || len(requests) != 2 {
 		t.Fatalf("unexpected parse: enabled=%t manifest=%q requests=%v", enabled, manifestPath, requests)
 	}
-	if requests[0] != (quotaRequest{Current: 40, Delta: 2, Limit: 50}) ||
-		requests[1] != (quotaRequest{Current: -10, Delta: 3, Limit: -5}) {
+	if requests[0].Current != 40 || requests[0].Delta != 2 || requests[0].Limit != 50 || requests[0].Subject != "tenant-a" ||
+		requests[1].Current != -10 || requests[1].Delta != 3 || requests[1].Limit != -5 {
 		t.Fatalf("unexpected requests: %v", requests)
 	}
 }
