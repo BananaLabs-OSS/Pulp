@@ -7,16 +7,20 @@ func TestApplicationArgs(t *testing.T) {
 		"-manifest", "quota.cell.toml",
 		"-request", "40,2,50",
 		"-request=-10,3,-5",
+		"-request=1,2,3,",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !enabled || manifestPath != "quota.cell.toml" || len(requests) != 2 {
+	if !enabled || manifestPath != "quota.cell.toml" || len(requests) != 3 {
 		t.Fatalf("unexpected parse: enabled=%t manifest=%q requests=%v", enabled, manifestPath, requests)
 	}
 	if requests[0].Current != 40 || requests[0].Delta != 2 || requests[0].Limit != 50 || requests[0].Subject != "tenant-a" ||
 		requests[1].Current != -10 || requests[1].Delta != 3 || requests[1].Limit != -5 {
 		t.Fatalf("unexpected requests: %v", requests)
+	}
+	if requests[2].Subject != "" {
+		t.Fatalf("explicit empty subject was not preserved: %v", requests[2])
 	}
 }
 

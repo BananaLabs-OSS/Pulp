@@ -73,18 +73,22 @@ type requestFlags []quotaRequest
 
 func (r *requestFlags) add(value string) error {
 	parts := strings.Split(value, ",")
-	if len(parts) != 3 {
-		return fmt.Errorf("request must contain CURRENT,DELTA,LIMIT")
+	if len(parts) != 3 && len(parts) != 4 {
+		return fmt.Errorf("request must contain CURRENT,DELTA,LIMIT[,SUBJECT]")
 	}
 	values := [3]int64{}
-	for index := range parts {
+	for index := range values {
 		parsed, err := strconv.ParseInt(parts[index], 10, 64)
 		if err != nil {
 			return fmt.Errorf("request field %d: %w", index, err)
 		}
 		values[index] = parsed
 	}
-	*r = append(*r, quotaRequest{Current: values[0], Delta: values[1], Limit: values[2], Subject: "tenant-a", Evidence: []byte{1, 2, 3}})
+	subject := "tenant-a"
+	if len(parts) == 4 {
+		subject = parts[3]
+	}
+	*r = append(*r, quotaRequest{Current: values[0], Delta: values[1], Limit: values[2], Subject: subject, Evidence: []byte{1, 2, 3}})
 	return nil
 }
 
@@ -165,6 +169,25 @@ func callRequests(manifestPath string, requests []quotaRequest) error {
 		response, err := cell.Call(ctx, "quota.admit-v1", wire)
 		if err != nil {
 			return err
+		}
+		if len(response) == 0 {
+			return fmt.Errorf("invalid quota response: %x", response)
+		}
+		if response[0] == 1 {
+			if len(response) < 5 {
+				return fmt.Errorf("invalid quota error response: %x", response)
+			}
+			messageLength := int(binary.LittleEndian.Uint32(response[1:5]))
+			if len(response) != 5+messageLength {
+				return fmt.Errorf("invalid quota error response length: %d", len(response))
+			}
+			if err := encoder.Encode(struct {
+				Request quotaRequest `json:"request"`
+				Error   string       `json:"error"`
+			}{request, string(response[5:])}); err != nil {
+				return err
+			}
+			continue
 		}
 		if len(response) < 10 || response[0] != 0 || response[1] > 1 {
 			return fmt.Errorf("invalid quota response: %x", response)
