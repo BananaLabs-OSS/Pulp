@@ -3,6 +3,15 @@ package abi
 import "github.com/vmihailenco/msgpack/v5"
 
 const (
+	// SSETransportVersionV2 identifies subscriber-aware route registration and
+	// event emission. SSEAuthRequestVersionV2 and SSEBindingVersionV2 identify
+	// the two halves of the host-to-owner authorization exchange. Keeping these
+	// wire versions distinct prevents a transport request from being accepted as
+	// an authorization request.
+	SSETransportVersionV2   = "pulp.sse.v2"
+	SSEAuthRequestVersionV2 = "pulp.sse.auth.v2"
+	SSEBindingVersionV2     = "pulp.sse.binding.v2"
+
 	SSEAudiencePublic  = "public"
 	SSEAudienceAccount = "account"
 	SSEAudiencePool    = "pool"
