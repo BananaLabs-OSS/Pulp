@@ -259,7 +259,7 @@ func resolveHostRelativePath(baseDir, relative, field string) (string, error) {
 	if relative == "" {
 		return "", fmt.Errorf("%s is required", field)
 	}
-	if filepath.IsAbs(relative) {
+	if isPortableAbsolutePath(relative) {
 		return "", fmt.Errorf("%s must be relative to pulp.host.toml", field)
 	}
 	resolved, err := filepath.Abs(filepath.Join(baseDir, relative))
@@ -267,6 +267,17 @@ func resolveHostRelativePath(baseDir, relative, field string) (string, error) {
 		return "", fmt.Errorf("resolve %s: %w", field, err)
 	}
 	return resolved, nil
+}
+
+// isPortableAbsolutePath rejects absolute paths from any supported host OS,
+// even when a manifest is validated on a different one. filepath.IsAbs alone
+// treats C:/... as relative on Unix and /... as rooted-but-not-absolute on
+// Windows.
+func isPortableAbsolutePath(value string) bool {
+	if filepath.IsAbs(value) || strings.HasPrefix(value, `\\`) {
+		return true
+	}
+	return len(value) >= 3 && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z')) && value[1] == ':' && (value[2] == '/' || value[2] == '\\')
 }
 
 func normalizeApplicationInstances(id string, count int, aliases []string) ([]ApplicationInstance, error) {

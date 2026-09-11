@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/BananaLabs-OSS/Pulp/ext"
+	"github.com/BananaLabs-OSS/Pulp/internal/dependency"
 	"github.com/BananaLabs-OSS/Pulp/internal/fusion"
 	"github.com/BananaLabs-OSS/Pulp/internal/host"
 	"github.com/BananaLabs-OSS/Pulp/internal/manifest"
@@ -27,6 +28,7 @@ type applicationRuntime struct {
 	ctx               context.Context
 	cancel            context.CancelFunc
 	runtimes          map[string]*cellRuntime
+	physicalPlan      *dependency.Plan
 	eventTargets      map[string]*cellRuntime
 	allCaps           []ext.Capability
 	declaredUnion     map[string]bool
@@ -66,13 +68,12 @@ type applicationProviderAccess struct {
 	mu       sync.Mutex
 	active   bool
 	calls    sync.WaitGroup
-	// providerCallMu serializes host lifecycle work into this application's
-	// non-reentrant cells. Background controllers and effect pollers share this
-	// revocable lease; without one boundary, a Fleet poller can overlap a Lua
-	// workflow that synchronously enters Fleet and look like a loopback.
-	// Guest-to-guest calls do not use this lease, so Cell's own loopback guard
-	// remains the authority for real synchronous cycles.
-	providerCallMu sync.Mutex
+	// providerCallLocks serialize host lifecycle work per target cell. A single
+	// application-wide mutex made an eight-second Fleet effect block unrelated
+	// Funding, Identity, and customer-facing Evolution calls. Different cells
+	// are independent WASM instances and may progress concurrently; calls into
+	// the same non-reentrant cell remain serialized here and by Cell itself.
+	providerCallLocks sync.Map // map[string]*sync.Mutex
 }
 
 func (a *applicationProviderAccess) Identity() ApplicationIdentity { return a.identity }
@@ -86,8 +87,10 @@ func (a *applicationProviderAccess) CallProvider(ctx context.Context, cellName, 
 	a.calls.Add(1)
 	a.mu.Unlock()
 	defer a.calls.Done()
-	a.providerCallMu.Lock()
-	defer a.providerCallMu.Unlock()
+	lockValue, _ := a.providerCallLocks.LoadOrStore(cellName, &sync.Mutex{})
+	cellLock := lockValue.(*sync.Mutex)
+	cellLock.Lock()
+	defer cellLock.Unlock()
 	runtime := a.runtimes[cellName]
 	if runtime == nil || runtime.failed.Load() || runtime.cell == nil {
 		return nil, fmt.Errorf("application %s provider cell %q is unavailable", a.identity, cellName)
@@ -102,6 +105,8 @@ func (a *applicationProviderAccess) CallProvider(ctx context.Context, cellName, 
 	if !allowed {
 		return nil, fmt.Errorf("application %s cell %q does not provide %q", a.identity, cellName, provider)
 	}
+	runtime.execution.RLock()
+	defer runtime.execution.RUnlock()
 	return runtime.cell.Call(ctx, provider, args)
 }
 
@@ -189,6 +194,81 @@ func executionPlacements(app *manifest.Application) ([]manifest.CellPlacement, m
 	return placements, logical, targets, nil
 }
 
+// prepareAutomaticFusion turns verified coordinator activations into the same
+// execution-unit representation accepted by the rest of the runtime. It works
+// on a shallow application copy and never mutates the manifest cache or logical
+// CellSpecs. Manual units take precedence for whole groups; partial overlap is
+// rejected because it would give one logical member two physical owners.
+func prepareAutomaticFusion(ctx context.Context, identity ApplicationIdentity, app *manifest.Application, plan fusion.Plan, preparer FusionRuntimePreparer) (*manifest.Application, []error, error) {
+	if preparer == nil || len(plan.Groups) == 0 {
+		return app, nil, nil
+	}
+	prepared := *app
+	prepared.ExecutionUnits = append([]manifest.ExecutionUnit(nil), app.ExecutionUnits...)
+	owned := make(map[string]string)
+	for _, unit := range app.ExecutionUnits {
+		for _, member := range unit.Members {
+			owned[member] = unit.Name
+		}
+	}
+	var fallbacks []error
+	for _, group := range plan.Groups {
+		manualUnit := ""
+		covered := 0
+		for _, member := range group.Members {
+			if unit := owned[member.Name]; unit != "" {
+				covered++
+				if manualUnit == "" {
+					manualUnit = unit
+				} else if manualUnit != unit {
+					return nil, nil, fmt.Errorf("fusion group %q is split across execution units %q and %q", group.Name, manualUnit, unit)
+				}
+			}
+		}
+		if covered != 0 {
+			if covered != len(group.Members) {
+				return nil, nil, fmt.Errorf("fusion group %q is only partially covered by execution unit %q", group.Name, manualUnit)
+			}
+			continue
+		}
+		activation, err := preparer.PrepareFusion(ctx, identity, group)
+		if err != nil {
+			return nil, nil, fmt.Errorf("prepare fusion group %q: %w", group.Name, err)
+		}
+		if activation == nil {
+			return nil, nil, fmt.Errorf("prepare fusion group %q returned a nil activation", group.Name)
+		}
+		if !activation.Fused {
+			if activation.Fallback == nil {
+				return nil, nil, fmt.Errorf("prepare fusion group %q requested fallback without a cause", group.Name)
+			}
+			fallbacks = append(fallbacks, fmt.Errorf("fusion group %q: %w", group.Name, activation.Fallback))
+			continue
+		}
+		if activation.Spec == nil {
+			return nil, nil, fmt.Errorf("prepare fusion group %q returned no physical cell spec", group.Name)
+		}
+		// The registry attestation owns artifact identity and contracts, while
+		// application manifests own runtime policy and configuration. Planner
+		// compatibility proves these values are identical across all members.
+		// Copy them onto a fresh physical spec so coordinator/cache objects are
+		// never mutated and logical configuration is not dropped at activation.
+		physical := *activation.Spec
+		base := group.Members[0]
+		physical.Config = cloneCapabilitySetupConfig(base.Config)
+		physical.Restart = base.Restart
+		physical.MaxMemoryPages = base.MaxMemoryPages
+		physical.CallTimeoutMS = base.CallTimeoutMS
+		members := make([]string, 0, len(group.Members))
+		for _, member := range group.Members {
+			members = append(members, member.Name)
+			owned[member.Name] = physical.Name
+		}
+		prepared.ExecutionUnits = append(prepared.ExecutionUnits, manifest.ExecutionUnit{Name: physical.Name, Artifact: &physical, Members: members})
+	}
+	return &prepared, fallbacks, nil
+}
+
 func (r *applicationRuntime) Identity() ApplicationIdentity { return r.application.Identity }
 
 func (r *applicationRuntime) HTTPAddress() string {
@@ -212,16 +292,23 @@ func (r *applicationRuntime) Start(parent context.Context) error {
 		return fmt.Errorf("load application %s: %w", r.application.Identity, err)
 	}
 	// Planning is deliberately before capability registration and loading. It
-	// makes the physical-layout decision visible, deterministic, and testable;
-	// until a matching fused artifact is built, accepted groups retain the
-	// isolated execution fallback rather than changing semantics implicitly.
+	// makes source-level fusion eligibility visible and deterministic. Physical
+	// selection is deployment-owned and is reported separately below from the
+	// application's explicit execution units.
 	fusionPlan := fusion.Build(loaded.Cells.Order)
 	for _, group := range fusionPlan.Groups {
-		r.config.Logger.Info("fusion group eligible; isolated fallback active pending fused artifact",
+		r.config.Logger.Info("fusion group eligible",
 			"group", group.Name, "abi", group.ABI, "members", len(group.Members))
 	}
 	for _, decision := range fusionPlan.Isolated {
 		r.config.Logger.Debug("cell remains isolated", "cell", decision.Cell.Name, "reason", decision.Reason)
+	}
+	loaded, fusionFallbacks, err := prepareAutomaticFusion(parent, r.application.Identity, loaded, fusionPlan, r.config.Fusion)
+	if err != nil {
+		return fmt.Errorf("prepare application %s fusion: %w", r.application.Identity, err)
+	}
+	for _, fallback := range fusionFallbacks {
+		r.config.Logger.Warn("fused artifact unavailable; explicit isolated fallback active", "err", fallback)
 	}
 	r.ctx, r.cancel = context.WithCancel(parent)
 	r.allCaps, err = selectedRuntimeCapabilities()
@@ -233,6 +320,15 @@ func (r *applicationRuntime) Start(parent context.Context) error {
 	if err != nil {
 		r.reset()
 		return err
+	}
+	r.physicalPlan, err = physicalDependencyPlan(loaded, physicalPlacements, physicalTargets)
+	if err != nil {
+		r.reset()
+		return fmt.Errorf("plan physical application graph: %w", err)
+	}
+	for _, unit := range loaded.ExecutionUnits {
+		r.config.Logger.Info("physical execution unit active",
+			"unit", unit.Name, "artifact", unit.Artifact.Name, "members", len(unit.Members))
 	}
 	r.declaredUnion, r.setupCaps = map[string]bool{}, map[string]bool{}
 	for _, placement := range physicalPlacements {
@@ -273,33 +369,51 @@ func (r *applicationRuntime) Start(parent context.Context) error {
 	if len(missing) != 0 {
 		return r.startFailure(fmt.Errorf("application %s sibling links: %v", r.application.Identity, missing))
 	}
+	placementsByAddress := make(map[string]manifest.CellPlacement, len(physicalPlacements))
 	for _, placement := range physicalPlacements {
+		placementsByAddress[placement.Address] = placement
+	}
+	_, initErr := dependency.Execute(r.ctx, r.physicalPlan, 0, func(ctx context.Context, address string) error {
+		placement := placementsByAddress[address]
 		spec := placement.Spec
-		rt := r.runtimes[placement.Address]
+		rt := r.runtimes[address]
 		configBytes, err := manifest.EncodeConfig(spec.Config)
 		if err != nil {
 			rt.failed.Store(true)
 			close(rt.readyCh)
-			return r.startFailure(err)
+			return err
 		}
 		limits := &host.Limits{MaxMemoryPages: spec.MaxMemoryPages, CallTimeout: time.Duration(spec.CallTimeoutMS) * time.Millisecond}
 		cell, err := host.LoadScoped(rt.ctx, spec, r.registry, limits, r.config.Logger, rt.effectiveScope())
 		if err != nil {
 			rt.failed.Store(true)
 			close(rt.readyCh)
-			return r.startFailure(fmt.Errorf("load cell %s: %w", spec.Name, err))
+			return fmt.Errorf("load cell %s: %w", spec.Name, err)
 		}
 		rt.cell, rt.registry, rt.limits, rt.configBytes = cell, r.registry, limits, configBytes
 		if err := cell.Init(rt.ctx, configBytes); err != nil {
 			rt.failed.Store(true)
 			close(rt.readyCh)
 			_ = cell.Close(context.Background())
-			return r.startFailure(fmt.Errorf("init cell %s: %w", spec.Name, err))
+			return fmt.Errorf("init cell %s: %w", spec.Name, err)
 		}
 		close(rt.readyCh)
+		return nil
+	})
+	if initErr != nil {
+		return r.startFailure(initErr)
 	}
 	r.eventTargets = make(map[string]*cellRuntime, len(r.runtimes)*2)
-	for _, rt := range r.runtimes {
+	startupOrder := make([]string, 0, len(r.runtimes))
+	if r.physicalPlan != nil {
+		startupOrder = r.physicalPlan.StartOrder()
+	} else {
+		for address := range r.runtimes {
+			startupOrder = append(startupOrder, address)
+		}
+	}
+	for _, address := range startupOrder {
+		rt := r.runtimes[address]
 		rt.eventTarget = ext.CellIDOf(rt.cell)
 		r.eventTargets[rt.eventTarget] = rt
 		// A bare legacy cell name is accepted only when there is exactly one
@@ -353,7 +467,7 @@ func (r *applicationRuntime) setupCapabilities() error {
 	if r.application.StorageNamespace != "" {
 		storageRoot = filepath.Join(storageRoot, r.application.StorageNamespace, r.application.Identity.InstanceID)
 	}
-	env := ext.SetupEnv{Scope: scope, Endpoints: r.config.Endpoints, StorageRoot: storageRoot, StorageNamespaces: r.config.StorageNamespaces, HTTPPort: r.config.HTTPPort, Logger: r.config.Logger}
+	env := ext.SetupEnv{Scope: scope, Endpoints: r.config.Endpoints, StorageRoot: storageRoot, StorageNamespaces: r.config.StorageNamespaces, HTTPPort: r.config.HTTPPort, PlacementGrants: r.config.PlacementGrants, Logger: r.config.Logger}
 	for _, c := range r.allCaps {
 		if r.declaredUnion[c.Name] {
 			env.Config = r.capabilityConfigs[c.Name]
@@ -522,7 +636,7 @@ func (r *applicationRuntime) stopLocked(ctx context.Context) error {
 		}
 	}
 	if r.providerAccess != nil {
-		deploymentOperatorCommands.unbind(r.application.Identity)
+		deploymentOperatorCommands.unbind(r.application.Identity, r.providerAccess)
 		r.providerAccess.revoke()
 	}
 	for _, rt := range r.runtimes {
@@ -531,7 +645,16 @@ func (r *applicationRuntime) stopLocked(ctx context.Context) error {
 	if r.ops != nil {
 		r.ops.stepWG.Wait()
 	}
-	for _, rt := range r.runtimes {
+	shutdownOrder := make([]string, 0, len(r.runtimes))
+	if r.physicalPlan != nil {
+		shutdownOrder = r.physicalPlan.StopOrder()
+	} else {
+		for address := range r.runtimes {
+			shutdownOrder = append(shutdownOrder, address)
+		}
+	}
+	for _, address := range shutdownOrder {
+		rt := r.runtimes[address]
 		for {
 			select {
 			case event := <-rt.events:
@@ -570,6 +693,7 @@ func (r *applicationRuntime) reset() {
 	r.ctx = nil
 	r.cancel = nil
 	r.runtimes = nil
+	r.physicalPlan = nil
 	r.eventTargets = nil
 	r.ops = nil
 	r.registry = nil

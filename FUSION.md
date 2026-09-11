@@ -19,7 +19,8 @@ The fallback preserves the public `provides` / `consumes` ABI exactly.
 ## Artifact backend contract
 
 An accepted group becomes one physical instance only when the Pulp fusible
-compiler emits an artifact for the exact group digest. That compiler must:
+compiler emits its artifact and the application selects it with an explicit
+`[[execution_units]]` mapping. That compiler must:
 
 1. compile source packages against `pulp-linear-v1`, rather than concatenate
    independently compiled Wasm binaries;

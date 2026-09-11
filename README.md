@@ -1,10 +1,26 @@
 # Pulp
 
-A minimal, universal application runtime. Go host, WASM cells, Docker-shaped boundary.
+A modular application runtime: a small Go host, capability-bounded Wasm cells,
+Lua-owned composition, immutable module resolution, and optional verified
+fusion.
 
 ## Status
 
-**v0.4 — storage.** v0.3 stood up transport (HTTP / HTTPS / WebSocket / SSE) on a shared port. v0.4 adds a scoped filesystem and a per-cell SQLite database. The combination is enough to host Hytale-Auth; the existing port lives in `Hytale-Auth/pulp-cell/`.
+Pulp is active pre-1.0 infrastructure. The current implementation includes
+application manifests, dependency-ordered parallel initialization, capability
+isolation, HTTP/WebSocket/SSE transport, scoped storage, cross-application
+calls, deterministic Lua composition, immutable registry locks, snapshots,
+live reconciliation, placement planning, and verified fusion activation.
+
+The architecture and its supporting repositories are mapped in
+[`docs/PUBLIC_PLATFORM.md`](docs/PUBLIC_PLATFORM.md). A fresh auditor can clone
+the complete sibling workspace with `scripts/bootstrap-public-workspace.sh`.
+
+```sh
+git clone https://github.com/BananaLabs-OSS/Pulp.git
+Pulp/scripts/bootstrap-public-workspace.sh pulp-platform
+Pulp/scripts/audit-public-workspace.sh pulp-platform
+```
 
 ## Running
 

@@ -31,7 +31,7 @@ type ApplicationHTTPRuntime interface {
 type hostGatewayRoute struct {
 	prefix   string
 	identity ApplicationIdentity
-	target   ApplicationHTTPRuntime
+	router   *AtomicRuntimeRouter
 }
 
 // HostGateway is the single public HTTP front door for a pulp.host.toml
@@ -43,6 +43,7 @@ type HostGateway struct {
 	healthPath string
 	logger     *slog.Logger
 	routes     []hostGatewayRoute
+	transport  http.RoundTripper
 
 	server   *http.Server
 	listener net.Listener
@@ -54,6 +55,18 @@ type HostGateway struct {
 // runtime. It fails closed for missing, duplicate, unready, or non-HTTP
 // runtimes, so a route can never silently fall through to a sibling app.
 func NewHostGateway(addr string, bindings []*manifest.RouteBinding, runtimes []ApplicationRuntime, logger *slog.Logger) (*HostGateway, error) {
+	routers := make(map[ApplicationIdentity]*AtomicRuntimeRouter, len(runtimes))
+	for _, runtime := range runtimes {
+		if runtime != nil {
+			routers[runtime.Identity()] = NewAtomicRuntimeRouter(runtime)
+		}
+	}
+	return NewHostGatewayWithRouters(addr, bindings, routers, logger)
+}
+
+// NewHostGatewayWithRouters binds routes to live runtime indirection. Each
+// request retains its lease through the complete proxy operation.
+func NewHostGatewayWithRouters(addr string, bindings []*manifest.RouteBinding, routers map[ApplicationIdentity]*AtomicRuntimeRouter, logger *slog.Logger) (*HostGateway, error) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
 		return nil, errors.New("host gateway address is required")
@@ -62,19 +75,21 @@ func NewHostGateway(addr string, bindings []*manifest.RouteBinding, runtimes []A
 		logger = slog.Default()
 	}
 
-	byIdentity := make(map[ApplicationIdentity]ApplicationRuntime, len(runtimes))
-	for _, runtime := range runtimes {
-		if runtime == nil {
+	byIdentity := make(map[ApplicationIdentity]*AtomicRuntimeRouter, len(routers))
+	for identity, router := range routers {
+		if router == nil || router.Current() == nil {
 			return nil, errors.New("host gateway runtime is nil")
 		}
-		identity := runtime.Identity()
 		if err := identity.validate(); err != nil {
 			return nil, fmt.Errorf("host gateway runtime identity: %w", err)
 		}
 		if _, exists := byIdentity[identity]; exists {
 			return nil, fmt.Errorf("host gateway has duplicate runtime target %s", identity)
 		}
-		byIdentity[identity] = runtime
+		if router.Current().Identity() != identity {
+			return nil, fmt.Errorf("host gateway router identity %s targets %s", identity, router.Current().Identity())
+		}
+		byIdentity[identity] = router
 	}
 
 	routes := make([]hostGatewayRoute, 0, len(bindings))
@@ -93,19 +108,26 @@ func NewHostGateway(addr string, bindings []*manifest.RouteBinding, runtimes []A
 		}
 		seenPrefixes[prefix] = identity
 
-		runtime, exists := byIdentity[identity]
+		router, exists := byIdentity[identity]
 		if !exists {
 			return nil, fmt.Errorf("host gateway route %q target %s is unavailable", prefix, identity)
 		}
-		httpRuntime, ok := runtime.(ApplicationHTTPRuntime)
+		lease, leaseErr := router.Acquire()
+		if leaseErr != nil {
+			return nil, fmt.Errorf("host gateway route %q target %s is unready: %w", prefix, identity, leaseErr)
+		}
+		httpRuntime, ok := lease.Runtime.(ApplicationHTTPRuntime)
 		if !ok {
+			lease.Release()
 			return nil, fmt.Errorf("host gateway route %q target %s does not expose HTTP", prefix, identity)
 		}
 		if _, err := parseGatewayUpstream(httpRuntime.HTTPAddress()); err != nil {
+			lease.Release()
 			return nil, fmt.Errorf("host gateway route %q target %s is unready: %w", prefix, identity, err)
 		}
+		lease.Release()
 
-		route := hostGatewayRoute{prefix: prefix, identity: identity, target: httpRuntime}
+		route := hostGatewayRoute{prefix: prefix, identity: identity, router: router}
 		routes = append(routes, route)
 	}
 	// Longest prefix first makes nested bindings deterministic while exact
@@ -242,13 +264,26 @@ func (g *HostGateway) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	for index := range g.routes {
 		route := &g.routes[index]
 		if gatewayPrefixMatches(route.prefix, request.URL.Path) {
-			upstream, err := parseGatewayUpstream(route.target.HTTPAddress())
+			lease, err := route.router.Acquire()
+			if err != nil {
+				http.Error(writer, "application upstream unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			defer lease.Release()
+			httpRuntime, ok := lease.Runtime.(ApplicationHTTPRuntime)
+			if !ok {
+				http.Error(writer, "application upstream unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			upstream, err := parseGatewayUpstream(httpRuntime.HTTPAddress())
 			if err != nil {
 				g.logger.Warn("host gateway target is unready", "target", route.identity.String(), "err", err)
 				http.Error(writer, "application upstream unavailable", http.StatusServiceUnavailable)
 				return
 			}
-			newHostGatewayProxy(*route, upstream, g.logger).ServeHTTP(writer, request)
+			proxy := newHostGatewayProxy(*route, upstream, g.logger)
+			proxy.Transport = g.transport
+			proxy.ServeHTTP(writer, request)
 			return
 		}
 	}

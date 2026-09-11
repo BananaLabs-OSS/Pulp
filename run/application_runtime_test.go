@@ -16,6 +16,33 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
+func TestDirectApplicationExposesCanonicalCompositionIdentity(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("lua.cell.toml", "name=\"lua\"\nversion=\"1\"\n")
+	script := []byte("return true\n")
+	write("app.lua", string(script))
+	digest := sha256.Sum256(script)
+	appPath := filepath.Join(dir, "pulp.app.toml")
+	write("pulp.app.toml", fmt.Sprintf("name=\"identity\"\nversion=\"1\"\ncells=[\"lua.cell.toml\"]\n[orchestrator]\nmanifest=\"lua.cell.toml\"\nscript=\"app.lua\"\nsha256=\"%x\"\n", digest))
+	inspected, err := InspectApplicationComposition(appPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewDirectApplicationRuntime(appPath, DirectApplicationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.CompositionIdentity(); got != inspected || got.ApplicationID != "identity" || len(got.SHA256) != 64 {
+		t.Fatalf("runtime identity = %#v, inspected = %#v", got, inspected)
+	}
+}
+
 // TestApplicationRuntimeShutdownDoesNotSuperviseCancelledIdleStep exercises
 // the production application teardown path while a restartable cell is taking
 // idle steps. Cancellation is the mechanism that wakes that loop, not a WASM
@@ -69,11 +96,11 @@ func TestExecutionUnitStartsOneArtifactForLogicalMembers(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("PULP_WAZERO_CACHE", filepath.Join(root, "wazero"))
 	wasm := buildLuaHarnessCell(t, filepath.Join("..", "testdata", "lua-math-engine"), "execution-unit", t.TempDir())
-	bytes, err := os.ReadFile(wasm)
+	wasmBytes, err := os.ReadFile(wasm)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "engine.wasm"), bytes, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "engine.wasm"), wasmBytes, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	writePlacementAppFile(t, root, "alpha.cell.toml", "name = \"alpha\"\nversion = \"1\"\nwasm = \"unused-alpha.wasm\"\nprovides = [\"math.double\"]\n")
@@ -106,7 +133,9 @@ sha256 = "%x"
 	if len(placements) != 2 || placements[0].Spec.Name != "math-engine" || placements[1].Spec.Name != "lua" {
 		t.Fatalf("physical placement order = %#v, want fused engine at the first member position before lua", placements)
 	}
-	runtime := newDirectApplicationRuntime(app, DirectApplicationOptions{})
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	runtime := newDirectApplicationRuntime(app, DirectApplicationOptions{Logger: logger})
 	if err := runtime.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -124,6 +153,14 @@ sha256 = "%x"
 	var result map[string]any
 	if err := msgpack.Unmarshal(output, &result); err != nil || result["value"] != int64(42) {
 		t.Fatalf("logical call result = %#v, err=%v", result, err)
+	}
+	if err := runtime.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := logs.String(); !strings.Contains(got, `msg="physical execution unit active" unit=math artifact=math-engine members=2`) {
+		t.Fatalf("startup did not report the selected physical execution unit:\n%s", got)
+	} else if strings.Contains(got, "isolated fallback active pending fused artifact") {
+		t.Fatalf("startup falsely reported isolated fallback for an active execution unit:\n%s", got)
 	}
 }
 
@@ -145,6 +182,20 @@ func TestApplicationRuntimeSiblingRegistryIsApplicationLocal(t *testing.T) {
 	}
 	if _, err := other.callDirect(context.Background(), "consumer", "consumer", "math.sum", nil); err == nil {
 		t.Fatal("foreign application unexpectedly resolved a missing caller target")
+	}
+}
+
+func TestSiblingRegistryAllowsExactHostImportWhenProviderIsColocated(t *testing.T) {
+	runtimes := map[string]*cellRuntime{
+		"consumer": {spec: &manifest.CellSpec{Name: "consumer", HostConsumes: []string{"resolver.resolve.v1"}}},
+		"resolver": {spec: &manifest.CellSpec{Name: "resolver", Provides: []string{"resolver.resolve.v1"}}},
+	}
+	registry := newSiblingRegistry(runtimes)
+	if !allowedToCall(registry, "consumer", "resolver", "resolver.resolve.v1") {
+		t.Fatal("exact host import did not survive provider colocation")
+	}
+	if allowedToCall(registry, "consumer", "resolver", "resolver.admin.v1") {
+		t.Fatal("provider colocation broadened host import authority")
 	}
 }
 

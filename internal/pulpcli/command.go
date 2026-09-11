@@ -21,7 +21,7 @@ import (
 
 var commands = map[string]bool{
 	"sync": true, "update": true, "inspect": true, "publish": true,
-	"refresh": true, "refresh-app": true, "digest-gate": true, "verify": true, "rollback": true, "recovery": true,
+	"refresh": true, "refresh-cell": true, "refresh-app": true, "digest-gate": true, "verify": true, "rollback": true, "recovery": true,
 	"import-go": true, "inspect-app": true,
 }
 
@@ -31,7 +31,7 @@ func IsCommand(args []string) bool { return len(args) > 0 && commands[args[0]] }
 // Run executes a unified package command.
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: pulp <sync|update|inspect|publish|refresh|refresh-app|verify|rollback> [flags]")
+		return errors.New("usage: pulp <sync|update|inspect|publish|refresh|refresh-cell|refresh-app|verify|rollback> [flags]")
 	}
 	switch args[0] {
 	case "sync":
@@ -46,6 +46,8 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return publish(ctx, args[1:], stdout, stderr)
 	case "refresh":
 		return refresh(args[1:], stdout, stderr)
+	case "refresh-cell":
+		return refreshCell(args[1:], stdout, stderr)
 	case "refresh-app":
 		return refreshApp(args[1:], stdout, stderr)
 	case "digest-gate":
@@ -353,6 +355,20 @@ func refreshApp(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if err := appmanifest.RefreshAppDigests(*path); err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, *path)
+	return nil
+}
+
+func refreshCell(args []string, stdout, stderr io.Writer) error {
+	f := flag.NewFlagSet("refresh-cell", flag.ContinueOnError)
+	f.SetOutput(stderr)
+	path := f.String("manifest", "pulp.cell.toml", "cell manifest")
+	if err := f.Parse(args); err != nil {
+		return err
+	}
+	if err := appmanifest.RefreshCellDigest(*path); err != nil {
 		return err
 	}
 	fmt.Fprintln(stdout, *path)

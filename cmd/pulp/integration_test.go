@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -39,7 +40,7 @@ func TestHeartbeatLifecycle(t *testing.T) {
 	}
 
 	cmd := exec.Command(binary, "-manifest", manifestPath)
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr lockedBuffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
@@ -99,7 +100,24 @@ func TestHeartbeatLifecycle(t *testing.T) {
 // waitForLog polls buf until it contains needle or the timeout elapses.
 // Returns an error if the needle never appears — lets callers distinguish
 // "process is slow to start" from "process is hung or crashed."
-func waitForLog(buf *bytes.Buffer, needle string, timeout time.Duration) error {
+type lockedBuffer struct {
+	mu  sync.RWMutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(payload []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(payload)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.buf.String()
+}
+
+func waitForLog(buf *lockedBuffer, needle string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if strings.Contains(buf.String(), needle) {
@@ -162,4 +180,3 @@ func envExcept(keys ...string) []string {
 	}
 	return out
 }
-

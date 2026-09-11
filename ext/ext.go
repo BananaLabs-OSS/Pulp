@@ -75,7 +75,11 @@ type SetupEnv struct {
 	// mutation; endpoint-reporter (multi-host) extensions may ignore it.
 	HTTPPort string
 	Config   map[string]any
-	Logger   *slog.Logger
+	// PlacementGrants is host-owned, placement-scoped authority. A nil resolver
+	// preserves legacy behavior. Extensions must query using the exact Scope
+	// received from the cell at Register time.
+	PlacementGrants PlacementGrantResolver
+	Logger          *slog.Logger
 }
 
 // Endpoint is a host-visible address owned by one scoped capability. Name

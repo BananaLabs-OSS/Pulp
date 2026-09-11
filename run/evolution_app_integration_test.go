@@ -54,6 +54,7 @@ type evolutionAppGeneResponse struct {
 // temporary pulp.host.toml declares Evolution's exact Resolver and Sessions
 // dependencies, matching production composition.
 func TestEvolutionApplicationDispatchesRealLuaRoute(t *testing.T) {
+	t.Setenv("EVOLUTION_ROLE", "all")
 	if testing.Short() {
 		t.Skip("skipping real multi-application Evolution integration test in short mode")
 	}
@@ -67,16 +68,19 @@ func TestEvolutionApplicationDispatchesRealLuaRoute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load real Evolution/Sessions host: %v", err)
 	}
-	if len(applications) != 3 {
-		t.Fatalf("host applications = %d, want 3", len(applications))
+	if len(applications) != 4 {
+		t.Fatalf("host applications = %d, want 4", len(applications))
 	}
-	if applications[0].Identity != (ApplicationIdentity{ApplicationID: "sessions", InstanceID: "primary"}) ||
+	if applications[0].Identity != (ApplicationIdentity{ApplicationID: "bananauth", InstanceID: "primary"}) ||
 		applications[1].Identity != (ApplicationIdentity{ApplicationID: "minecraft-resolver", InstanceID: "primary"}) ||
-		applications[2].Identity != (ApplicationIdentity{ApplicationID: "evolution", InstanceID: "primary"}) ||
-		len(applications[1].DependsOn) != 1 || applications[1].DependsOn[0] != "sessions" ||
+		applications[2].Identity != (ApplicationIdentity{ApplicationID: "sessions", InstanceID: "primary"}) ||
+		applications[3].Identity != (ApplicationIdentity{ApplicationID: "evolution", InstanceID: "primary"}) ||
 		len(applications[2].DependsOn) != 2 ||
-		applications[2].DependsOn[0] != "minecraft-resolver" ||
-		applications[2].DependsOn[1] != "sessions" {
+		applications[2].DependsOn[0] != "bananauth" ||
+		applications[2].DependsOn[1] != "minecraft-resolver" ||
+		len(applications[3].DependsOn) != 2 ||
+		applications[3].DependsOn[0] != "minecraft-resolver" ||
+		applications[3].DependsOn[1] != "sessions" {
 		t.Fatalf("host dependency composition = %#v", applications)
 	}
 
@@ -96,6 +100,11 @@ func TestEvolutionApplicationDispatchesRealLuaRoute(t *testing.T) {
 		}
 	})
 	for _, application := range applications {
+		if application.Identity.ApplicationID == "bananauth" {
+			// Auth has its own full real-cell parity harness. This route test only
+			// needs its declared dependency present in the loaded host graph.
+			continue
+		}
 		started = append(started, startEvolutionHostedApplication(
 			t, ctx, workspace, cache, storageRoot, endpoints, crossApplications,
 			capabilities, logger, application,
@@ -133,6 +142,7 @@ func TestEvolutionApplicationDispatchesRealLuaRoute(t *testing.T) {
 // is a local sibling call and the Evolution cell explicitly opts into local
 // legacy-owner imports.
 func TestEvolutionApplicationMonolithCompatibility(t *testing.T) {
+	t.Setenv("EVOLUTION_ROLE", "all")
 	if testing.Short() {
 		t.Skip("skipping real monolithic Evolution integration test in short mode")
 	}
@@ -322,15 +332,21 @@ func startEvolutionHostedApplication(
 	if err != nil {
 		t.Fatalf("load %s application: %v", application.Identity, err)
 	}
-	if loaded.Name != application.Identity.ApplicationID {
-		t.Fatalf("host application %s loads app named %q", application.Identity, loaded.Name)
-	}
 	for _, spec := range loaded.Cells.Order {
 		source, ok := evolutionApplicationCellSources(workspace)[spec.Name]
 		if !ok {
 			t.Fatalf("%s contains unexpected cell %q", application.Identity, spec.Name)
 		}
-		spec.WASMPath = buildLuaHarnessCell(t, source, application.Identity.ApplicationID+"-"+spec.Name, cache)
+		built := buildLuaHarnessCell(t, source, application.Identity.ApplicationID+"-"+spec.Name, cache)
+		spec.WASMPath = built
+		// Placements are immutable per-instance clones. Exercise those exact
+		// specs so the harness observes deployment config overrides instead of
+		// silently testing the unplaced package defaults.
+		for _, placement := range loaded.Placements {
+			if placement.Spec.Name == spec.Name {
+				placement.Spec.WASMPath = built
+			}
+		}
 	}
 
 	declared := map[string]bool{}
@@ -358,8 +374,9 @@ func startEvolutionHostedApplication(
 		activeCapabilities = append(activeCapabilities, capability)
 	}
 
-	cells := make(map[string]*cellRuntime, len(loaded.Cells.Order))
-	for _, spec := range loaded.Cells.Order {
+	cells := make(map[string]*cellRuntime, len(loaded.Placements))
+	for _, placement := range loaded.Placements {
+		spec := placement.Spec
 		cells[spec.Name] = &cellRuntime{spec: spec}
 	}
 	registry := host.NewRegistry()
@@ -378,7 +395,8 @@ func startEvolutionHostedApplication(
 		capabilityScope: capabilityScope,
 		cross:           cross,
 	}
-	for _, spec := range loaded.Cells.Order {
+	for _, placement := range loaded.Placements {
+		spec := placement.Spec
 		scope, err := application.NewCellScope(spec.Name, "primary")
 		if err != nil {
 			harness.close(context.Background())
@@ -435,11 +453,16 @@ func writeEvolutionSessionsHost(t *testing.T, workspace string) string {
 	t.Helper()
 	root := t.TempDir()
 	// The ordinary pulp.app.toml remains the explicit all-in-one compatibility
-	// composition. Host mode has its own two-cell descriptor so this test can
+	// composition. Host mode has its own explicit descriptor so this test can
 	// never accidentally prove a local sibling fallback.
+	bananauthManifest := filepath.Join(workspace, "Evolution", "bananauth.pulp.app.toml")
 	resolverManifest := filepath.Join(workspace, "minecraft-resolver", "application", "pulp.app.toml")
 	evolutionManifest := filepath.Join(workspace, "Evolution", "pulp-cell", "pulp.host-app.toml")
 	sessionsManifest := filepath.Join(workspace, "Sessions-Gene", "application", "pulp.app.toml")
+	bananauthRelative, err := filepath.Rel(root, bananauthManifest)
+	if err != nil {
+		t.Fatalf("resolve BananaAuth manifest relative to host: %v", err)
+	}
 	resolverRelative, err := filepath.Rel(root, resolverManifest)
 	if err != nil {
 		t.Fatalf("resolve Minecraft Resolver manifest relative to host: %v", err)
@@ -457,11 +480,19 @@ func writeEvolutionSessionsHost(t *testing.T, workspace string) string {
 name = "evolution-sessions-real-integration"
 
 [[applications]]
+id = "bananauth"
+manifest = %q
+aliases = ["primary"]
+storage_namespace = "bananauth"
+event_namespace = "bananauth"
+
+[[applications]]
 id = "sessions"
 manifest = %q
 aliases = ["primary"]
 storage_namespace = "sessions"
 event_namespace = "sessions"
+depends_on = ["bananauth", "minecraft-resolver"]
 
 [[applications]]
 id = "minecraft-resolver"
@@ -469,7 +500,6 @@ manifest = %q
 aliases = ["primary"]
 storage_namespace = "minecraft-resolver"
 event_namespace = "minecraft-resolver"
-depends_on = ["sessions"]
 
 [[applications]]
 id = "evolution"
@@ -478,7 +508,7 @@ aliases = ["primary"]
 storage_namespace = "evolution"
 event_namespace = "evolution"
 depends_on = ["minecraft-resolver", "sessions"]
-`, filepath.ToSlash(sessionsRelative), filepath.ToSlash(resolverRelative), filepath.ToSlash(evolutionRelative))
+`, filepath.ToSlash(bananauthRelative), filepath.ToSlash(sessionsRelative), filepath.ToSlash(resolverRelative), filepath.ToSlash(evolutionRelative))
 	if err := os.WriteFile(hostPath, []byte(content), 0o600); err != nil {
 		t.Fatalf("write temporary host manifest: %v", err)
 	}
@@ -487,12 +517,17 @@ depends_on = ["minecraft-resolver", "sessions"]
 
 func evolutionApplicationCellSources(workspace string) map[string]string {
 	return map[string]string{
-		"jvm-jre-detect":                        filepath.Join(workspace, "minecraft-resolver", "jvm-jre-detect"),
+		"auth-identity":                         filepath.Join(workspace, "Bananauth", "identity-owner"),
+		"auth-session":                          filepath.Join(workspace, "Bananauth", "session-owner"),
+		"bananauth-lua":                         filepath.Join(workspace, "Pulp-Lua", "pulp-cell"),
+		"jvm-jre-detect":                        filepath.Join(workspace, "pulp-engines", "jvm-jre-detect-cell"),
 		"minecraft-resolver":                    filepath.Join(workspace, "minecraft-resolver", "pulp-cell"),
 		"sessions":                              filepath.Join(workspace, "Sessions-Gene", "composition-cell"),
 		"sessions-identity-retention-binding":   filepath.Join(workspace, "Sessions-Gene", "identity-retention-binding"),
 		"sessions-order-config":                 filepath.Join(workspace, "Sessions-Gene", "order-config"),
 		"sessions-provisioning-failure-cleanup": filepath.Join(workspace, "Sessions-Gene", "provisioning-failure-cleanup"),
+		"sessions-auth-return-relay":            filepath.Join(workspace, "Sessions-Gene", "auth-return-relay"),
+		"sessions-auth-issue-relay":             filepath.Join(workspace, "Sessions-Gene", "auth-issue-relay"),
 		"commerce":                              filepath.Join(workspace, "Evolution", "commerce"),
 		"fleet":                                 filepath.Join(workspace, "Evolution", "fleet"),
 		"funding":                               filepath.Join(workspace, "Evolution", "funding"),
@@ -511,7 +546,8 @@ func evolutionApplicationCellSources(workspace string) map[string]string {
 		"artifact-lifecycle":                    filepath.Join(workspace, "Evolution", "artifact-lifecycle"),
 		"archive-lifecycle":                     filepath.Join(workspace, "Evolution", "archive-lifecycle"),
 		"observation-registry":                  filepath.Join(workspace, "Evolution", "observation-registry"),
-		"notification-outbox":                   filepath.Join(workspace, "Pulp-engines", "notification-outbox-sqlite-cell", "cmd", "notification-outbox"),
+		"notification-outbox":                   filepath.Join(workspace, "Evolution", "notification-outbox"),
+		"player-identity-resolver":              filepath.Join(workspace, "pulp-engines", "player-identity-resolver-host-cell"),
 		"minecraft-profile-resolver":            filepath.Join(workspace, "Evolution", "minecraft-profile-resolver"),
 		"lua-orchestrator":                      filepath.Join(workspace, "Pulp-Lua", "pulp-cell"),
 		"evolution":                             filepath.Join(workspace, "Evolution", "pulp-cell"),

@@ -20,6 +20,7 @@ package host
 // via that dir's own go.mod, so no module wiring is needed here.
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -35,6 +36,12 @@ func bananasplitSourceDir() string {
 // route handler body runs, so the outbound deps are never reached for the
 // auth-path assertions (a 401 aborts in middleware).
 func startBananasplit(t *testing.T, serviceToken string) *CellHarness {
+	t.Helper()
+	if _, err := os.Stat(bananasplitSourceDir()); os.IsNotExist(err) {
+		t.Skip("optional sibling Bananasplit/pulp-cell checkout is not present")
+	} else if err != nil {
+		t.Fatalf("inspect Bananasplit fixture: %v", err)
+	}
 	return StartCellHTTP(t, CellHarnessConfig{
 		SourceDir:    bananasplitSourceDir(),
 		Name:         "bananasplit",

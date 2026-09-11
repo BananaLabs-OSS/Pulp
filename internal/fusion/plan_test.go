@@ -30,6 +30,36 @@ func TestBuildFallsBackForOneMember(t *testing.T) {
 	}
 }
 
+func TestBuildFallsBackWhenV1CannotPreserveLogicalRuntimeBoundary(t *testing.T) {
+	t.Run("different config", func(t *testing.T) {
+		a, b := cell("a", nil), cell("b", nil)
+		a.Config, b.Config = map[string]any{"mode": "a"}, map[string]any{"mode": "b"}
+		plan := Build([]*manifest.CellSpec{a, b})
+		if len(plan.Groups) != 0 || plan.Isolated[0].Reason != "config differs within fusion group" {
+			t.Fatalf("plan = %#v", plan)
+		}
+	})
+	t.Run("snapshot", func(t *testing.T) {
+		a, b := cell("a", nil), cell("b", nil)
+		a.Snapshotable = true
+		plan := Build([]*manifest.CellSpec{a, b})
+		if len(plan.Groups) != 0 || plan.Isolated[0].Reason != "snapshotable cells require per-member snapshot ABI support" {
+			t.Fatalf("plan = %#v", plan)
+		}
+	})
+}
+
+func TestBuildV2AllowsMemberConfigAndSnapshotPartitions(t *testing.T) {
+	a, b := cell("a", []string{"storage.sqlite"}), cell("b", []string{"storage.sqlite"})
+	a.Execution.ABI, b.Execution.ABI = "pulp-member-v2", "pulp-member-v2"
+	a.Config, b.Config = map[string]any{"member": "a"}, map[string]any{"member": "b"}
+	a.Snapshotable, b.Snapshotable = true, true
+	plan := Build([]*manifest.CellSpec{a, b})
+	if len(plan.Groups) != 1 || len(plan.Isolated) != 0 {
+		t.Fatalf("v2 plan = %+v", plan)
+	}
+}
+
 func cell(name string, caps []string) *manifest.CellSpec {
 	return &manifest.CellSpec{Name: name, Capabilities: caps, Restart: manifest.RestartOnCrash, Execution: manifest.ExecutionSpec{Mode: manifest.ExecutionFusible, Group: "state", ABI: "pulp-linear-v1"}}
 }

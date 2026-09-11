@@ -28,4 +28,8 @@ consumes = ["evolution"]
 		t.Fatalf("init order = [%s, %s], want [sessions, evolution]",
 			set.Order[0].Name, set.Order[1].Name)
 	}
+	levels := set.Plan.Levels()
+	if len(levels) != 2 || len(levels[0]) != 1 || levels[0][0] != "sessions" || len(levels[1]) != 1 || levels[1][0] != "evolution" {
+		t.Fatalf("dependency levels = %#v, want [[sessions] [evolution]]", levels)
+	}
 }

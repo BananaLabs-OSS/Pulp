@@ -165,6 +165,9 @@ aliases = ["b1", "b2"]
 [cell_placements.config]
 mode = "placement"
 
+[cell_placements.config.values]
+resolver_scope = "local"
+
 [orchestrator]
 manifest = "lua.cell.toml"
 script = "app.lua"
@@ -192,6 +195,10 @@ sha256 = "%x"
 	}
 	if mode := got["player-manager@b1"].Spec.Config["mode"]; mode != "placement" {
 		t.Fatalf("placement config override = %#v, want placement", mode)
+	}
+	values, ok := got["player-manager@b1"].Spec.Config["values"].(map[string]any)
+	if !ok || values["resolver_scope"] != "local" {
+		t.Fatalf("nested placement config = %#v, want resolver_scope=local", got["player-manager@b1"].Spec.Config["values"])
 	}
 }
 

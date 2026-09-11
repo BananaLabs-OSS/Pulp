@@ -55,6 +55,11 @@ type HostRuntimeOptions struct {
 	StorageNamespaces map[string]string
 	HTTPPort          string
 	Logger            *slog.Logger
+	PlacementGrants   ext.PlacementGrantResolver
+	// Fusion is deployment-owned and optional. A configured preparer turns
+	// eligible logical groups into verified physical execution units before
+	// any cell starts; nil preserves isolated/manual execution units.
+	Fusion FusionRuntimePreparer
 }
 
 // DirectApplicationOptions configures one monolithic `pulp -app` runtime.
@@ -66,7 +71,9 @@ type DirectApplicationOptions struct {
 	StorageNamespaces map[string]string
 	HTTPPort          string
 	Logger            *slog.Logger
+	PlacementGrants   ext.PlacementGrantResolver
 	Lifecycle         ApplicationLifecycleObserver
+	Fusion            FusionRuntimePreparer
 	// InstanceID distinguishes simultaneously hosted direct applications with
 	// the same manifest. An empty value preserves the historical default.
 	InstanceID string
@@ -125,12 +132,51 @@ type directApplicationRuntime struct {
 	stopped bool
 }
 
+// ApplicationCompositionIdentity identifies the exact validated application
+// code and composition independently of its checkout or installation path.
+type ApplicationCompositionIdentity struct {
+	ApplicationID string `json:"application_id"`
+	Version       string `json:"version"`
+	SHA256        string `json:"sha256"`
+}
+
+// InspectApplicationComposition validates an application without starting it
+// and returns the same canonical identity retained by a direct runtime.
+func InspectApplicationComposition(appPath string) (ApplicationCompositionIdentity, error) {
+	app, err := manifest.LoadApp(appPath)
+	if err != nil {
+		return ApplicationCompositionIdentity{}, err
+	}
+	return applicationCompositionIdentity(app), nil
+}
+
+func applicationCompositionIdentity(app *manifest.Application) ApplicationCompositionIdentity {
+	if app == nil {
+		return ApplicationCompositionIdentity{}
+	}
+	return ApplicationCompositionIdentity{ApplicationID: app.Name, Version: app.Version, SHA256: app.CompositionSHA256}
+}
+
+// CompositionIdentity returns the immutable code/composition identity. It is
+// distinct from Identity(), which identifies one mutable runtime instance.
+func (r *directApplicationRuntime) CompositionIdentity() ApplicationCompositionIdentity {
+	if r == nil {
+		return ApplicationCompositionIdentity{}
+	}
+	return applicationCompositionIdentity(r.app)
+}
+
 // NewDirectApplicationRuntime validates appPath and returns a startable
 // monolithic runtime. The returned ApplicationRuntime exposes only Identity,
 // Start, and Shutdown; cells, extension registries, and host internals remain
 // encapsulated. An explicit Lifecycle observer is scoped to this runtime and
 // does not alter RegisterApplicationLifecycleObserver state.
-func NewDirectApplicationRuntime(appPath string, options DirectApplicationOptions) (ApplicationRuntime, error) {
+type DirectApplicationRuntime interface {
+	ApplicationRuntime
+	CompositionIdentity() ApplicationCompositionIdentity
+}
+
+func NewDirectApplicationRuntime(appPath string, options DirectApplicationOptions) (DirectApplicationRuntime, error) {
 	app, err := manifest.LoadApp(appPath)
 	if err != nil {
 		return nil, err
@@ -163,6 +209,8 @@ func (r *directApplicationRuntime) Start(ctx context.Context) error {
 		StorageNamespaces: r.options.StorageNamespaces,
 		HTTPPort:          r.options.HTTPPort,
 		Logger:            r.options.Logger,
+		PlacementGrants:   r.options.PlacementGrants,
+		Fusion:            r.options.Fusion,
 	}, r.options.Lifecycle, directInstanceID(r.options.InstanceID))
 	if err != nil {
 		return err
@@ -201,9 +249,11 @@ func startDirectApplicationWithLifecycle(ctx context.Context, app *manifest.Appl
 		StorageRoot:       options.StorageRoot,
 		StorageNamespaces: options.StorageNamespaces,
 		HTTPPort:          options.HTTPPort,
+		PlacementGrants:   options.PlacementGrants,
 		// Deployment-owned template bootstrap and effect pollers register through
 		// this same trusted observer in both monolithic and split modes.
 		Lifecycle: lifecycle,
+		Fusion:    options.Fusion,
 	})
 	if err := runtime.Start(ctx); err != nil {
 		return nil, err
@@ -239,7 +289,7 @@ func (h *directApplicationHost) startPollsters(logger *slog.Logger) {
 				}
 				event, ok := safe.CallPoll(capability, logger)
 				if !ok {
-					time.Sleep(200 * time.Microsecond)
+					time.Sleep(extensionPollIdleInterval)
 					continue
 				}
 				cell := h.runtime.eventTargets[event.CellID]
@@ -339,10 +389,12 @@ func startHostedApplications(ctx context.Context, hostPath string, options HostR
 		ModuleCacheScope:                 cacheScope,
 		StorageRoot:                      options.StorageRoot,
 		HTTPPort:                         options.HTTPPort,
+		PlacementGrants:                  options.PlacementGrants,
 		Endpoints:                        endpoints,
 		RequireScopedCapabilityLifecycle: applicationInstances > 1,
 		Lifecycle:                        registeredApplicationLifecycleObserver(),
 		CrossApplications:                crossApplications,
+		Fusion:                           options.Fusion,
 	})
 	if err != nil {
 		_ = moduleCache.Close(context.Background())
@@ -431,7 +483,7 @@ func (h *hostedApplicationHost) startPollsters(logger *slog.Logger) error {
 				}
 				event, ok := safe.CallPoll(capability, logger)
 				if !ok {
-					time.Sleep(200 * time.Microsecond)
+					time.Sleep(extensionPollIdleInterval)
 					continue
 				}
 				cell := targets[event.CellID]
@@ -493,6 +545,7 @@ type cellRuntime struct {
 	declared   map[string]bool // capabilities this cell declared
 	readyCh    chan struct{}   // closed after Init returns 0
 	callNumber atomic.Uint64   // atomic: written by the step loop, read by ctl status
+	execution  sync.RWMutex    // snapshot takes write access; calls and autonomous steps take read access
 
 	// stepDone is closed when this cell's step goroutine exits. Recreated
 	// each time a step loop is launched (initial start + every reload) so a
@@ -554,7 +607,27 @@ type routedEvent struct {
 	caps []ext.Capability // extensions to call Finalize on (usually one)
 }
 
-func Main() {
+// MainOptions are trusted host bootstrap dependencies. Guest manifests cannot
+// provide either placement authority or a fusion artifact preparer.
+type MainOptions struct {
+	PlacementGrants ext.PlacementGrantResolver
+	Fusion          FusionRuntimePreparer
+}
+
+func Main() { MainWithOptions(MainOptions{}) }
+
+// MainWithPlacementGrants runs the CLI host with deployment-owned grants.
+// Grants are never loaded from guest manifests; embedding hosts construct the
+// resolver after trusted user/project selection.
+func MainWithPlacementGrants(placementGrants ext.PlacementGrantResolver) {
+	MainWithOptions(MainOptions{PlacementGrants: placementGrants})
+}
+
+// MainWithOptions runs the ordinary CLI path with deployment-owned services.
+// This is the production entrypoint for hosts that resolve verified fused
+// artifacts; the same preparer is applied to -app and every -host instance.
+func MainWithOptions(options MainOptions) {
+	placementGrants := options.PlacementGrants
 	// `<exe> ctl <op> [cell]` is the control-socket CLIENT, not the host.
 	// Dispatched before flag parsing so a cell can run `<exe> ctl reload <name>`
 	// (via spawn.process) to hot-swap itself. Works for any deployment binary
@@ -611,9 +684,11 @@ func Main() {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		supervisor, err := startHostedApplications(ctx, hostPath, HostRuntimeOptions{
-			StorageRoot: storageRoot,
-			HTTPPort:    httpPort,
-			Logger:      logger,
+			StorageRoot:     storageRoot,
+			HTTPPort:        httpPort,
+			Logger:          logger,
+			PlacementGrants: placementGrants,
+			Fusion:          options.Fusion,
 		}, ManifestHostLoader{})
 		if err != nil {
 			logger.Error("multi-application host failed to start", "host", hostPath, "err", err)
@@ -652,10 +727,12 @@ func Main() {
 		// `-app` uses the same expanded placement runtime as `-host`. The
 		// legacy loop below remains only for repeated `-manifest` operation.
 		direct := newDirectApplicationRuntime(app, DirectApplicationOptions{
-			StorageRoot: storageRoot,
-			HTTPPort:    httpPort,
-			Logger:      logger,
-			Lifecycle:   registeredApplicationLifecycleObserver(),
+			StorageRoot:     storageRoot,
+			HTTPPort:        httpPort,
+			Logger:          logger,
+			Lifecycle:       registeredApplicationLifecycleObserver(),
+			PlacementGrants: placementGrants,
+			Fusion:          options.Fusion,
 		})
 		if err := direct.Start(context.Background()); err != nil {
 			logger.Error("application failed to start", "err", err)
@@ -744,9 +821,10 @@ func Main() {
 		// one-time shared initialization, not per-cell. Extensions
 		// that need per-cell state should maintain it in a map keyed
 		// by the cell identity they see at Register time.
-		Scope:       setupScope,
-		StorageRoot: storageRoot,
-		Logger:      logger,
+		Scope:           setupScope,
+		StorageRoot:     storageRoot,
+		Logger:          logger,
+		PlacementGrants: placementGrants,
 	}
 	for _, c := range allCaps {
 		if declaredUnion[c.Name] {
@@ -1055,6 +1133,13 @@ func Main() {
 	logger.Info("pulp exit clean")
 }
 
+// An empty extension poll is not latency-sensitive enough to justify a
+// microsecond busy-wait. HTTP and other capability implementations enqueue
+// work independently; this interval only bounds how quickly the host notices
+// that queued work. With many capabilities in one fused process, 200us here
+// consumed an entire core even while every application was idle.
+const extensionPollIdleInterval = 10 * time.Millisecond
+
 // runPollster polls one extension in a loop, publishing each returned
 // event to the appropriate cell's event channel. Events with a
 // non-empty CellID go to that cell; events with an empty CellID
@@ -1080,8 +1165,9 @@ func runPollster(
 
 		ev, ok := safe.CallPoll(c, logger)
 		if !ok {
-			// Nothing available; idle briefly to avoid pegging the CPU.
-			time.Sleep(200 * time.Microsecond)
+			// Nothing available; yield without turning the fused host into one
+			// busy-wait per declared capability.
+			time.Sleep(extensionPollIdleInterval)
 			continue
 		}
 
@@ -1184,9 +1270,17 @@ func stepLoop(rt *cellRuntime, capByName map[string]ext.Capability, logger *slog
 		// fuse.  Event delivery still wakes the loop immediately; this ceiling
 		// governs only the no-work path and keeps autonomous cell ticks timely
 		// without exhausting every long-lived cell in a few days.
-		idleMax     = time.Second
 		idleRampAge = time.Second
 	)
+	// Event-only cells wake immediately through rt.events and do not need to
+	// cross the WASM boundary every second. In a fused application that idle
+	// fan-out is expensive enough to consume a full core. The inbound cell owns
+	// autonomous application scheduling, so retain its one-second tick cadence;
+	// keep the remaining cells on a low-frequency liveness tick.
+	idleMax := 30 * time.Second
+	if rt.declared["transport.http.inbound"] {
+		idleMax = time.Second
+	}
 	idleSleep := idleMin
 	idleSince := time.Time{}
 	idleTimer := time.NewTimer(idleMin)
@@ -1255,7 +1349,10 @@ func stepLoop(rt *cellRuntime, capByName map[string]ext.Capability, logger *slog
 			// Use the module context for the WASM call. Wazero closes a module
 			// when a call context is cancelled, so stepCtx is only a loop-wakeup
 			// signal and must never be passed into guest code.
-			if _, err := rt.cell.Step(rt.ctx, env); err != nil {
+			rt.execution.RLock()
+			_, stepErr := rt.cell.Step(rt.ctx, env)
+			rt.execution.RUnlock()
+			if err := stepErr; err != nil {
 				logger.Error("step failed",
 					"cell", rt.spec.Name,
 					"call_number", n,
@@ -1282,7 +1379,10 @@ func stepLoop(rt *cellRuntime, capByName map[string]ext.Capability, logger *slog
 				WallTime:   uint64(time.Now().UnixNano()),
 				Payload:    nil,
 			}
-			if _, err := rt.cell.Step(rt.ctx, env); err != nil {
+			rt.execution.RLock()
+			_, stepErr := rt.cell.Step(rt.ctx, env)
+			rt.execution.RUnlock()
+			if err := stepErr; err != nil {
 				logger.Error("step failed (idle)",
 					"cell", rt.spec.Name,
 					"call_number", n,

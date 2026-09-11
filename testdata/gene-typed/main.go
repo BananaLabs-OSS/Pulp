@@ -12,7 +12,7 @@ package main
 
 import (
 	"github.com/BananaLabs-OSS/Fiber/pulp"
-	"github.com/BananaLabs-OSS/Fiber/pulp/gene"
+	"github.com/MonkeyLabs-LLC/Marrow/gene"
 )
 
 func main() {}

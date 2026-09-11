@@ -3,6 +3,8 @@ package manifest
 import (
 	"fmt"
 	"strings"
+
+	"github.com/BananaLabs-OSS/Pulp/internal/dependency"
 )
 
 // Set is a validated collection of cell specs ready for the host to boot.
@@ -17,6 +19,10 @@ type Set struct {
 	// A. Used by the host to drive Setup + Init in an order that satisfies
 	// every cell's depends_on.
 	Order []*CellSpec
+
+	// Plan retains the complete dependency graph, including stable levels and
+	// reverse edges. Order is derived from this plan for compatibility.
+	Plan *dependency.Plan
 }
 
 // Lookup finds a cell by name. Returns nil if not present.
@@ -109,60 +115,17 @@ func buildSet(specs []*CellSpec) (*Set, error) {
 		}
 	}
 
-	// Topological sort (Kahn). Detects cycles.
-	order, err := topoSort(specs, byName)
+	items := make([]dependency.Item, 0, len(specs))
+	for _, spec := range specs {
+		items = append(items, dependency.Item{ID: spec.Name, DependsOn: append([]string(nil), spec.DependsOn...)})
+	}
+	plan, err := dependency.Build(items)
 	if err != nil {
 		return nil, err
 	}
-
-	return &Set{Cells: specs, Order: order}, nil
-}
-
-// topoSort runs Kahn's algorithm on the dep graph. Returns the ordering
-// or an error listing the cycle members.
-func topoSort(specs []*CellSpec, byName map[string]*CellSpec) ([]*CellSpec, error) {
-	// in-degree = number of dependencies this cell has
-	indeg := make(map[string]int, len(specs))
-	// adjacency: dep -> cells that depend on dep
-	adj := make(map[string][]string, len(specs))
-	for _, s := range specs {
-		indeg[s.Name] = len(s.DependsOn)
-		for _, dep := range s.DependsOn {
-			adj[dep] = append(adj[dep], s.Name)
-		}
-	}
-
-	// Seed queue with all cells that have no deps. Preserve declaration
-	// order within a degree level for deterministic boot sequences.
-	var queue []string
-	for _, s := range specs {
-		if indeg[s.Name] == 0 {
-			queue = append(queue, s.Name)
-		}
-	}
-
 	order := make([]*CellSpec, 0, len(specs))
-	for len(queue) > 0 {
-		n := queue[0]
-		queue = queue[1:]
-		order = append(order, byName[n])
-		for _, m := range adj[n] {
-			indeg[m]--
-			if indeg[m] == 0 {
-				queue = append(queue, m)
-			}
-		}
+	for _, id := range plan.StartOrder() {
+		order = append(order, byName[id])
 	}
-
-	if len(order) != len(specs) {
-		var stuck []string
-		for name, d := range indeg {
-			if d > 0 {
-				stuck = append(stuck, name)
-			}
-		}
-		return nil, fmt.Errorf("dependency cycle involving: %s", strings.Join(stuck, ", "))
-	}
-
-	return order, nil
+	return &Set{Cells: specs, Order: order, Plan: plan}, nil
 }

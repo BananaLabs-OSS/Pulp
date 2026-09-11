@@ -105,6 +105,12 @@ func bindCellExports(ctx context.Context, cell *Cell) error {
 	cell.initErrorLenFn = cell.module.ExportedFunction("pulp_init_error_len")
 	cell.callErrorPtrFn = cell.module.ExportedFunction("pulp_on_call_error_ptr")
 	cell.callErrorLenFn = cell.module.ExportedFunction("pulp_on_call_error_len")
+	cell.snapshotFn = cell.module.ExportedFunction("pulp_snapshot")
+	cell.restoreFn = cell.module.ExportedFunction("pulp_restore")
+	cell.snapshotErrorPtrFn = cell.module.ExportedFunction("pulp_snapshot_error_ptr")
+	cell.snapshotErrorLenFn = cell.module.ExportedFunction("pulp_snapshot_error_len")
+	cell.restoreErrorPtrFn = cell.module.ExportedFunction("pulp_restore_error_ptr")
+	cell.restoreErrorLenFn = cell.module.ExportedFunction("pulp_restore_error_len")
 	cell.onCallFn = cell.module.ExportedFunction("pulp_on_call")
 	cell.postReturnFn = cell.module.ExportedFunction("pulp_post_return")
 
@@ -119,6 +125,10 @@ func bindCellExports(ctx context.Context, cell *Cell) error {
 		missing = append(missing, "pulp_shutdown")
 	}
 	if len(missing) == 0 {
+		if err := cell.validateSnapshotABI(); err != nil {
+			_ = cell.Close(ctx)
+			return err
+		}
 		return nil
 	}
 	if err := cell.Close(ctx); err != nil {

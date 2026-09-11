@@ -234,7 +234,7 @@ end)
 		"request_msgpack": sessionsBananauthAdapterRequest(t, map[string]any{
 			"request_id": "sessions-adapter-consume-1", "id": "verification-adapter-1",
 			"account_id": "8b0d821e-baba-4b18-8f5e-6035fb8864d0",
-			"email": "adapter@example.com", "code": "123456", "now": int64(1_700_000_000_100),
+			"email":      "adapter@example.com", "code": "123456", "now": int64(1_700_000_000_100),
 		}),
 	})
 	if consume.Status != 200 || consume.Body["verified"] != true || consume.Body["account_id"] != "8b0d821e-baba-4b18-8f5e-6035fb8864d0" {
@@ -406,7 +406,8 @@ func sessionsBananauthStartOwners(t *testing.T, ctx context.Context, workspace s
 				"auth.identity.v1.retention-lease.create", "auth.identity.v1.retention-lease.renew", "auth.identity.v1.retention-lease.release",
 				"auth.identity.v1.retention-eligibility.get",
 			},
-			Capabilities: []string{"storage.sqlite", "workers"}},
+			Capabilities: []string{"storage.sqlite", "workers"},
+			Config:       map[string]any{"otp_key_current": "pulp-sessions-bananauth-parity-test-key-material-v1"}},
 		{Name: "auth-session", Version: "0.1.0", WASMPath: sessionWASM,
 			Provides:     []string{"auth.session.v1.create", "auth.session.v1.get", "auth.session.v1.revoke"},
 			Capabilities: []string{"storage.sqlite"}},
@@ -459,7 +460,12 @@ func sessionsBananauthStartOwners(t *testing.T, ctx context.Context, workspace s
 		}
 		runtimes[spec.Name].cell = cell
 		owners.cells = append(owners.cells, cell)
-		if err := cell.Init(ctx, nil); err != nil {
+		config, err := manifest.EncodeConfig(spec.Config)
+		if err != nil {
+			owners.close(context.Background())
+			t.Fatalf("encode Bananauth %s config: %v", spec.Name, err)
+		}
+		if err := cell.Init(ctx, config); err != nil {
 			owners.close(context.Background())
 			t.Fatalf("init Bananauth %s: %v", spec.Name, err)
 		}
