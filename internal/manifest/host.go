@@ -202,7 +202,25 @@ func validateHostConsumes(applications []*HostedApplication, byID map[string]*Ho
 			continue
 		}
 		for _, callerCell := range callerApp.Application.Cells.Cells {
-			for _, provider := range callerCell.HostConsumes {
+			for _, grant := range callerCell.HostConsumes {
+				targetID, provider, qualified := splitHostConsumeGrant(grant)
+				if qualified {
+					if !hostIdentifier.MatchString(targetID) {
+						return fmt.Errorf("application %q cell %q host_consumes %q has invalid target application", callerApp.ID, callerCell.Name, grant)
+					}
+					if !containsString(callerApp.DependsOn, targetID) {
+						return fmt.Errorf("application %q cell %q host_consumes %q but target is not a direct dependency", callerApp.ID, callerCell.Name, grant)
+					}
+					owners := providerOwners(byID[targetID], provider)
+					switch len(owners) {
+					case 0:
+						return fmt.Errorf("application %q cell %q host_consumes %q but target application does not provide it", callerApp.ID, callerCell.Name, grant)
+					case 1:
+						continue
+					default:
+						return fmt.Errorf("application %q cell %q host_consumes %q but target application provides it ambiguously: %s", callerApp.ID, callerCell.Name, grant, strings.Join(owners, ", "))
+					}
+				}
 				owners := providers[provider]
 				switch len(owners) {
 				case 0:
@@ -216,6 +234,36 @@ func validateHostConsumes(applications []*HostedApplication, byID map[string]*Ho
 		}
 	}
 	return nil
+}
+
+func splitHostConsumeGrant(grant string) (string, string, bool) {
+	parts := strings.SplitN(grant, "::", 2)
+	if len(parts) != 2 {
+		return "", grant, false
+	}
+	return parts[0], parts[1], true
+}
+
+func providerOwners(application *HostedApplication, provider string) []string {
+	if application == nil || application.Application == nil || application.Application.Cells == nil {
+		return nil
+	}
+	var owners []string
+	for _, cell := range application.Application.Cells.Cells {
+		if containsString(cell.Provides, provider) {
+			owners = append(owners, application.ID+"/"+cell.Name)
+		}
+	}
+	return owners
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func loadHostedApplication(baseDir string, index int, raw rawHostedApp) (*HostedApplication, error) {

@@ -52,9 +52,10 @@ type CellSpec struct {
 	// Dependency graph inputs. Resolved by the dependency resolver (not here).
 	Provides []string
 	Consumes []string
-	// HostConsumes lists exact provider/functions this cell may call through
-	// pulp_app_call_v1. Unlike Consumes, these are resolved only by LoadHost
-	// against direct dependency applications.
+	// HostConsumes lists provider/functions this cell may call through
+	// pulp_app_call_v1. An entry may be an exact provider (when exactly one
+	// direct dependency owns it) or "application::provider" to bind the grant
+	// to one direct dependency when generic provider names overlap.
 	HostConsumes []string
 
 	// DependsOn lists cell names (not capabilities) that must finish Init
@@ -417,6 +418,12 @@ func normalizeHostConsumes(values []string) ([]string, error) {
 		}
 		if normalized != value || strings.IndexFunc(normalized, func(r rune) bool { return r <= ' ' }) >= 0 {
 			return nil, fmt.Errorf("host_consumes[%d] %q must not contain whitespace", index, value)
+		}
+		if strings.Contains(normalized, "::") {
+			parts := strings.Split(normalized, "::")
+			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+				return nil, fmt.Errorf("host_consumes[%d] %q must be provider or application::provider", index, value)
+			}
 		}
 		if _, duplicate := seen[normalized]; duplicate {
 			return nil, fmt.Errorf("duplicate host_consumes provider %q", normalized)

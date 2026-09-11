@@ -30,6 +30,25 @@ func TestCrossApplicationCallAllowsExactDeclaredDependency(t *testing.T) {
 	}
 }
 
+func TestCrossApplicationQualifiedGrantAllowsOnlyNamedApplication(t *testing.T) {
+	registry := newCrossApplicationRegistry()
+	sessions := ApplicationIdentity{ApplicationID: "sessions", InstanceID: "primary"}
+	bananauth := ApplicationIdentity{ApplicationID: "bananauth", InstanceID: "primary"}
+	registerCrossApplicationFake(t, registry, sessions, func(_ context.Context, _, _ string, _ []byte) ([]byte, error) {
+		return []byte("sessions"), nil
+	})
+	registerCrossApplicationFake(t, registry, bananauth, func(_ context.Context, _, _ string, _ []byte) ([]byte, error) {
+		return []byte("bananauth"), nil
+	})
+	caller := testCrossApplicationCaller([]string{"sessions", "bananauth"}, "sessions::orchestrator.dispatch")
+	if response, err := registry.call(context.Background(), caller, sessions, "lua", "orchestrator.dispatch", nil); err != nil || string(response) != "sessions" {
+		t.Fatalf("qualified Sessions call = %q, %v", response, err)
+	}
+	if _, err := registry.call(context.Background(), caller, bananauth, "lua", "orchestrator.dispatch", nil); !errors.Is(err, errCrossApplicationDenied) {
+		t.Fatalf("same provider on ungranted application = %v, want denied", err)
+	}
+}
+
 func TestCrossApplicationCallDeniesUndeclaredDependencyAndDoesNotFallback(t *testing.T) {
 	registry := newCrossApplicationRegistry()
 	target := ApplicationIdentity{ApplicationID: "commerce", InstanceID: "primary"}

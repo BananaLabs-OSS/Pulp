@@ -147,6 +147,58 @@ provides = ["orders.apply.v1"]
 	})
 }
 
+func TestLoadHostQualifiedGrantDisambiguatesDirectDependencyProviders(t *testing.T) {
+	root := t.TempDir()
+	caller := `name = "adapter"
+version = "1"
+host_consumes = ["sessions::orchestrator.dispatch"]
+`
+	dispatcher := `name = "lua"
+version = "1"
+provides = ["orchestrator.dispatch"]
+`
+	writeHostContractApplication(t, root, "apps/evolution", "evolution", caller)
+	writeHostContractApplication(t, root, "apps/sessions", "sessions", dispatcher)
+	writeHostContractApplication(t, root, "apps/bananauth", "bananauth", dispatcher)
+	hostPath := writeAppFile(t, root, "pulp.host.toml", `name = "platform"
+[[applications]]
+id = "sessions"
+manifest = "apps/sessions/pulp.app.toml"
+storage_namespace = "sessions"
+event_namespace = "sessions"
+[[applications]]
+id = "bananauth"
+manifest = "apps/bananauth/pulp.app.toml"
+storage_namespace = "bananauth"
+event_namespace = "bananauth"
+[[applications]]
+id = "evolution"
+manifest = "apps/evolution/pulp.app.toml"
+storage_namespace = "evolution"
+event_namespace = "evolution"
+depends_on = ["sessions", "bananauth"]
+`)
+	if _, err := LoadHost(hostPath); err != nil {
+		t.Fatalf("qualified grant with overlapping providers: %v", err)
+	}
+}
+
+func TestLoadHostQualifiedGrantRejectsWrongTarget(t *testing.T) {
+	root := t.TempDir()
+	writeHostContractApplication(t, root, "apps/caller", "caller", `name = "adapter"
+version = "1"
+host_consumes = ["other::orders.apply.v1"]
+`)
+	writeHostContractApplication(t, root, "apps/provider", "provider", `name = "orders"
+version = "1"
+provides = ["orders.apply.v1"]
+`)
+	hostPath := writeAppFile(t, root, "pulp.host.toml", hostConsumeHostBody(true, false))
+	if _, err := LoadHost(hostPath); err == nil || !strings.Contains(err.Error(), "not a direct dependency") {
+		t.Fatalf("qualified wrong-target grant = %v", err)
+	}
+}
+
 func hostConsumeHostBody(callerDepends, providerDepends bool) string {
 	callerEdge := ""
 	if callerDepends {
