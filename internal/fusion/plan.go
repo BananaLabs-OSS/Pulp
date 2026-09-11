@@ -6,6 +6,7 @@ package fusion
 
 import (
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -75,12 +76,19 @@ func Build(cells []*manifest.CellSpec) Plan {
 
 func compatible(members []*manifest.CellSpec) string {
 	base := members[0]
+	v2 := base.Execution.ABI == MemberABIV2
 	if base.DedicatedThread {
 		return "dedicated_thread cells are not fusible"
+	}
+	if base.Snapshotable && !v2 {
+		return "snapshotable cells require per-member snapshot ABI support"
 	}
 	for _, cell := range members[1:] {
 		if cell.DedicatedThread {
 			return "dedicated_thread cells are not fusible"
+		}
+		if cell.Snapshotable && !v2 {
+			return "snapshotable cells require per-member snapshot ABI support"
 		}
 		if cell.Restart != base.Restart {
 			return "restart policy differs within fusion group"
@@ -93,6 +101,12 @@ func compatible(members []*manifest.CellSpec) string {
 		}
 		if !sameSet(cell.Capabilities, base.Capabilities) {
 			return "capability set differs within fusion group"
+		}
+		// Fusion ABI v1 passes one Init payload to every registered package.
+		// Requiring identical config prevents physical placement from silently
+		// changing a member's logical configuration.
+		if !v2 && !reflect.DeepEqual(cell.Config, base.Config) {
+			return "config differs within fusion group"
 		}
 	}
 	return ""

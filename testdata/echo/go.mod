@@ -1,6 +1,6 @@
 module echo
 
-go 1.25
+go 1.25.13
 
 require github.com/vmihailenco/msgpack/v5 v5.4.1
 

@@ -25,6 +25,7 @@ import (
 // repositories happen to be adjacent on disk. The integration test exercises
 // the loaded cells; this test owns the complementary build/staging contract.
 func TestSessionsCompositionStagesSelfContainedBundle(t *testing.T) {
+	t.Setenv("EVOLUTION_ROLE", "all")
 	if testing.Short() {
 		t.Skip("skipping Sessions composition WASM build in short mode")
 	}
@@ -255,9 +256,9 @@ func stageSessionsCompositionWASM(t *testing.T, spec *manifest.CellSpec, cache s
 	case "minecraft-resolver":
 		sourceDir = filepath.Join(sourceDir, "..", "..", "minecraft-resolver", "pulp-cell")
 	case "notification-outbox":
-		// The portable owner is a reusable library module; its WASI entrypoint
-		// intentionally lives under cmd rather than at module root.
-		sourceDir = filepath.Join(sourceDir, "cmd", "notification-outbox")
+		// The portable owner is a standalone WASI module whose package and
+		// entrypoint live at the module root.
+		sourceDir = filepath.Join(sourceDir, "..", "..", "Evolution", "notification-outbox")
 	}
 	goSources, err := filepath.Glob(filepath.Join(sourceDir, "*.go"))
 	if err != nil {

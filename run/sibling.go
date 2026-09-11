@@ -179,9 +179,10 @@ func siblingCallerAddress(reg *siblingRegistry, cell ext.Cell) string {
 }
 
 // allowedToCall accepts only an exact function/provider declared by both the
-// caller (`consumes`) and target (`provides`). A `depends_on` edge orders Init
-// and does not authorize calls. This deliberately rejects broad placeholders
-// such as a cell name unless that string is itself a declared function name.
+// caller and target. A host_consumes import remains valid when deployment
+// co-locates that exact provider (monolith or fusion); this preserves one
+// module contract across physical topologies without granting any unnamed
+// local API. A depends_on edge remains lifecycle-only authority.
 func allowedToCall(reg *siblingRegistry, caller, target, funcName string) bool {
 	callerRT, ok := reg.runtimes[caller]
 	if !ok {
@@ -195,7 +196,8 @@ func allowedToCall(reg *siblingRegistry, caller, target, funcName string) bool {
 	if logical := reg.logicalSpecs[target]; logical != nil {
 		targetSpec = logical
 	}
-	return containsExact(callerRT.spec.Consumes, funcName) && containsExact(targetSpec.Provides, funcName)
+	declared := containsExact(callerRT.spec.Consumes, funcName) || containsExact(callerRT.spec.HostConsumes, funcName)
+	return declared && containsExact(targetSpec.Provides, funcName)
 }
 
 func containsExact(values []string, want string) bool {
@@ -301,19 +303,26 @@ func validatePlacedSiblingLinks(logical map[string]*manifest.CellSpec) []string 
 	provided := map[string]map[string]struct{}{}
 	for name, spec := range logical {
 		for _, provider := range spec.Provides {
-			if provided[provider] == nil { provided[provider] = map[string]struct{}{} }
+			if provided[provider] == nil {
+				provided[provider] = map[string]struct{}{}
+			}
 			provided[provider][name] = struct{}{}
 		}
 	}
 	var missing []string
 	for name, spec := range logical {
 		for _, dependency := range spec.DependsOn {
-			if logical[dependency] == nil { missing = append(missing, fmt.Sprintf("%s depends_on %s (no such logical cell)", name, dependency)) }
+			if logical[dependency] == nil {
+				missing = append(missing, fmt.Sprintf("%s depends_on %s (no such logical cell)", name, dependency))
+			}
 		}
 		for _, consumed := range spec.Consumes {
 			owners := provided[consumed]
-			if len(owners) == 0 { missing = append(missing, fmt.Sprintf("%s consumes %s (no logical provider)", name, consumed))
-			} else if len(owners) > 1 { missing = append(missing, fmt.Sprintf("%s consumes %s (ambiguous logical providers)", name, consumed)) }
+			if len(owners) == 0 {
+				missing = append(missing, fmt.Sprintf("%s consumes %s (no logical provider)", name, consumed))
+			} else if len(owners) > 1 {
+				missing = append(missing, fmt.Sprintf("%s consumes %s (ambiguous logical providers)", name, consumed))
+			}
 		}
 	}
 	return missing

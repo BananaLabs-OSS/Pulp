@@ -54,7 +54,7 @@ language = "go"
 module_path = "example/render"
 import_path = "example/render/pulp"
 entrypoint = "Register"
-toolchain = "go1.25.6"
+toolchain = "go1.25.13"
 ```
 
 The artifact digest covers the source archive. The canonical manifest digest
@@ -69,7 +69,7 @@ private-network clients while requiring a separate credential for writes:
 ```sh
 pulp-registry serve \
   -registry /var/lib/pulp-registry \
-  -listen 10.0.40.105:8090 \
+  -listen 10.0.0.10:8090 \
   -publish-token-file /etc/pulp-registry/publish.token \
   -publish-namespace bananalabs
 ```

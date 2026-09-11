@@ -334,7 +334,7 @@ func (h *HostedEffectTestHost) Shutdown(ctx context.Context) error {
 
 func (h *hostedEffectTestApplication) close(ctx context.Context) error {
 	if h.providerAccess != nil {
-		deploymentOperatorCommands.unbind(h.application.Identity)
+		deploymentOperatorCommands.unbind(h.application.Identity, h.providerAccess)
 		h.providerAccess.revoke()
 	}
 	if h == nil {

@@ -108,6 +108,15 @@ type Cell struct {
 	initErrorLenFn api.Function
 	callErrorPtrFn api.Function
 	callErrorLenFn api.Function
+	// snapshotFn/restoreFn are the optional live-migration ABI. They must be
+	// exported as a complete, signature-valid pair; loaders reject partial or
+	// malformed implementations before the cell becomes visible.
+	snapshotFn         api.Function
+	restoreFn          api.Function
+	snapshotErrorPtrFn api.Function
+	snapshotErrorLenFn api.Function
+	restoreErrorPtrFn  api.Function
+	restoreErrorLenFn  api.Function
 
 	// onCallFn is the optional pulp_on_call export. Cells that
 	// declare `provides = [...]` in their manifest must export this;
@@ -352,6 +361,12 @@ func LoadScoped(ctx context.Context, spec *manifest.CellSpec, registry *Registry
 	p.initErrorLenFn = mod.ExportedFunction("pulp_init_error_len")
 	p.callErrorPtrFn = mod.ExportedFunction("pulp_on_call_error_ptr")
 	p.callErrorLenFn = mod.ExportedFunction("pulp_on_call_error_len")
+	p.snapshotFn = mod.ExportedFunction("pulp_snapshot")
+	p.restoreFn = mod.ExportedFunction("pulp_restore")
+	p.snapshotErrorPtrFn = mod.ExportedFunction("pulp_snapshot_error_ptr")
+	p.snapshotErrorLenFn = mod.ExportedFunction("pulp_snapshot_error_len")
+	p.restoreErrorPtrFn = mod.ExportedFunction("pulp_restore_error_ptr")
+	p.restoreErrorLenFn = mod.ExportedFunction("pulp_restore_error_len")
 	p.onCallFn = mod.ExportedFunction("pulp_on_call")
 	// Optional canonical-ABI tree-free export. Absent for every legacy msgpack
 	// cell, which therefore stays on the unchanged opaque Call path.
@@ -370,6 +385,10 @@ func LoadScoped(ctx context.Context, spec *manifest.CellSpec, registry *Registry
 	if len(missing) > 0 {
 		p.Close(ctx)
 		return nil, fmt.Errorf("missing required exports: %v", missing)
+	}
+	if err := p.validateSnapshotABI(); err != nil {
+		p.Close(ctx)
+		return nil, err
 	}
 
 	return p, nil

@@ -86,6 +86,25 @@ func TestRefreshApp(t *testing.T) {
 	}
 }
 
+func TestRefreshCell(t *testing.T) {
+	dir := t.TempDir()
+	wasm := filepath.Join(dir, "cell.wasm")
+	manifest := filepath.Join(dir, "pulp.cell.toml")
+	if err := os.WriteFile(wasm, []byte("current wasm"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifest, []byte("name = \"test\"\nversion = \"1\"\nwasm = \"cell.wasm\"\nwasm_sha256 = \"stale\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if err := Run(context.Background(), []string{"refresh-cell", "-manifest", manifest}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), manifest) {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
 func TestRollbackRequiresHistory(t *testing.T) {
 	err := Run(context.Background(), []string{"rollback"}, &bytes.Buffer{}, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "-history is required") {

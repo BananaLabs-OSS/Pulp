@@ -37,6 +37,10 @@ type Application struct {
 	// retain their logical package identities; the runtime may later dispatch
 	// those logical addresses to the one artifact without changing Lua.
 	ExecutionUnits []ExecutionUnit
+	// CompositionSHA256 is the path-independent identity of the complete,
+	// validated composition. It covers application semantics, orchestration,
+	// logical cells and their Wasm, placements, and selected fusion artifacts.
+	CompositionSHA256 string
 }
 
 // ExecutionUnit maps multiple logical packages to one deployment artifact.
@@ -116,9 +120,18 @@ func LoadApp(path string) (*Application, error) {
 	if undecoded := meta.Undecoded(); len(undecoded) > 0 {
 		names := make([]string, 0, len(undecoded))
 		for _, key := range undecoded {
-			names = append(names, key.String())
+			name := key.String()
+			// Placement config is intentionally free-form, including nested
+			// application values. BurntSushi/TOML reports map descendants as
+			// undecoded even though they were captured in rawCellPlacement.Config.
+			if name == "cell_placements.config" || strings.HasPrefix(name, "cell_placements.config.") {
+				continue
+			}
+			names = append(names, name)
 		}
-		return nil, fmt.Errorf("unknown app manifest fields: %s", strings.Join(names, ", "))
+		if len(names) > 0 {
+			return nil, fmt.Errorf("unknown app manifest fields: %s", strings.Join(names, ", "))
+		}
 	}
 
 	schemaVersion := raw.SchemaVersion
@@ -241,7 +254,7 @@ func LoadApp(path string) (*Application, error) {
 	if orchestratorPlacements != 1 {
 		return nil, fmt.Errorf("orchestrator cell %q must have exactly one placement (got %d)", orchestrator.Name, orchestratorPlacements)
 	}
-	return &Application{
+	application := &Application{
 		SchemaVersion:        schemaVersion,
 		Name:                 name,
 		Version:              version,
@@ -255,7 +268,13 @@ func LoadApp(path string) (*Application, error) {
 		Cells:                set,
 		Placements:           placements,
 		ExecutionUnits:       executionUnits,
-	}, nil
+	}
+	compositionDigest, err := canonicalApplicationDigest(application, script)
+	if err != nil {
+		return nil, fmt.Errorf("canonical application identity: %w", err)
+	}
+	application.CompositionSHA256 = compositionDigest
+	return application, nil
 }
 
 func buildExecutionUnits(baseDir string, set *Set, rawUnits []rawExecutionUnit, requireDigest bool) ([]ExecutionUnit, error) {

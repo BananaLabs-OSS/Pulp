@@ -25,6 +25,8 @@ import (
 // Evolution. The representative tiers request must cross Evolution Lua's
 // exact AppCall grant into the independently hosted Sessions application.
 func TestProductionSplitBundleStagesLoadsStartsAndRoutes(t *testing.T) {
+	t.Setenv("BANANAAUTH_OTP_KEY_CURRENT", "pulp-split-bundle-test-key-material-v1")
+	t.Setenv("EVOLUTION_ROLE", "all")
 	if testing.Short() {
 		t.Skip("skipping release-style split-bundle WASM build in short mode")
 	}

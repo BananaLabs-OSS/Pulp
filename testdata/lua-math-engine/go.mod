@@ -1,6 +1,6 @@
 module github.com/BananaLabs-OSS/Pulp/testdata/lua-math-engine
 
-go 1.25
+go 1.25.13
 
 require (
 	github.com/BananaLabs-OSS/Fiber v0.0.0

@@ -48,6 +48,8 @@ type pulpThreeAppRouteResponse20260725 struct {
 // route must reach Resolver through the scoped pulp_app_call_v1 registry; no
 // standalone Resolver host route, endpoint pump, or Resolver URL is available.
 func TestPulpThreeApplicationResolverAppCall20260725(t *testing.T) {
+	t.Setenv("BANANAAUTH_OTP_KEY_CURRENT", "pulp-four-app-resolver-test-key-material-v1")
+	t.Setenv("EVOLUTION_ROLE", "all")
 	if testing.Short() {
 		t.Skip("skipping real three-application Resolver AppCall E2E in short mode")
 	}
@@ -67,13 +69,14 @@ func TestPulpThreeApplicationResolverAppCall20260725(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load hosted applications: %v", err)
 	}
-	if len(applications) != 3 ||
-		applications[0].Identity != (ApplicationIdentity{ApplicationID: "sessions", InstanceID: "primary"}) ||
+	if len(applications) != 4 ||
+		applications[0].Identity != (ApplicationIdentity{ApplicationID: "bananauth", InstanceID: "primary"}) ||
 		applications[1].Identity != (ApplicationIdentity{ApplicationID: "minecraft-resolver", InstanceID: "primary"}) ||
-		applications[2].Identity != (ApplicationIdentity{ApplicationID: "evolution", InstanceID: "primary"}) ||
-		len(applications[2].DependsOn) != 2 ||
-		applications[2].DependsOn[0] != "minecraft-resolver" ||
-		applications[2].DependsOn[1] != "sessions" {
+		applications[2].Identity != (ApplicationIdentity{ApplicationID: "sessions", InstanceID: "primary"}) ||
+		applications[3].Identity != (ApplicationIdentity{ApplicationID: "evolution", InstanceID: "primary"}) ||
+		len(applications[3].DependsOn) != 2 ||
+		applications[3].DependsOn[0] != "minecraft-resolver" ||
+		applications[3].DependsOn[1] != "sessions" {
 		t.Fatalf("production hosted application order = %#v", applications)
 	}
 
@@ -135,7 +138,7 @@ func TestPulpThreeApplicationResolverAppCall20260725(t *testing.T) {
 		return originalInvoke(ctx, cell, provider, request)
 	}
 
-	evolution := started[2]
+	evolution := started[3]
 	baseAddress, ok := endpoints.ApplicationAddress(
 		"evolution", "primary", "transport.http.inbound", "public",
 	)
@@ -229,8 +232,8 @@ func TestPulpThreeApplicationResolverAppCall20260725(t *testing.T) {
 
 func assertPulpThreeAppResolverHostShape20260725(t *testing.T, hostManifest *manifest.Host) {
 	t.Helper()
-	if len(hostManifest.Applications) != 3 || len(hostManifest.Routes) != 1 {
-		t.Fatalf("production host = %d applications, %d routes; want 3 and 1",
+	if len(hostManifest.Applications) != 4 || len(hostManifest.Routes) != 1 {
+		t.Fatalf("production host = %d applications, %d routes; want 4 and 1",
 			len(hostManifest.Applications), len(hostManifest.Routes))
 	}
 	route := hostManifest.Routes[0]

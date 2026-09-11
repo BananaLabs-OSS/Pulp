@@ -34,6 +34,7 @@ import (
 // and a composed reporting read. The Stripe capability is deterministic and
 // in-process; no network, credentials, or privileged production effects exist.
 func TestPulpLuaOwnerSuccessfulParity20260725(t *testing.T) {
+	t.Setenv("EVOLUTION_ROLE", "all")
 	if testing.Short() {
 		t.Skip("skipping real Pulp -> Lua -> owner application E2E in short mode")
 	}
@@ -421,6 +422,22 @@ func seedPulpLuaOwnerFleetNode(t *testing.T, ctx context.Context, fleet *host.Ce
 	}
 	if _, err := fleet.Call(ctx, "fleet.v1.command.node.upsert", request); err != nil {
 		t.Fatalf("seed Fleet node: %v", err)
+	}
+	observed, err := msgpack.Marshal(map[string]any{
+		"id": "pulp-owner-parity-capacity-" + command,
+		"capacity": map[string]any{
+			"node_id": "pulp-owner-parity-node", "generation": uint64(time.Now().UnixNano()),
+			"cpu_capacity": capacity, "cpu_capacity_millis": capacity * 1000,
+			"memory_capacity": capacity * 2048,
+			"cpu_used":        used, "cpu_used_millis": used * 1000, "memory_used": used * 2048,
+			"healthy": true, "ready": true, "updated_at": time.Now().UTC().Format(time.RFC3339Nano),
+		},
+	})
+	if err != nil {
+		t.Fatalf("encode Fleet capacity observation: %v", err)
+	}
+	if _, err := fleet.Call(ctx, "fleet.v1.command.capacity.report", observed); err != nil {
+		t.Fatalf("seed Fleet capacity observation: %v", err)
 	}
 }
 

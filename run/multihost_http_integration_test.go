@@ -404,7 +404,7 @@ func multiHostHTTPBuildSharedCell(t *testing.T, root string) string {
 	source := `package main
 
 import (
-  "github.com/BananaLabs-OSS/Fiber/Pulp"
+  "github.com/BananaLabs-OSS/Fiber/pulp"
   "github.com/vmihailenco/msgpack/v5"
 )
 

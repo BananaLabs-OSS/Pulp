@@ -1,8 +1,10 @@
 module genetyped
 
-go 1.25
+go 1.25.13
 
 require github.com/BananaLabs-OSS/Fiber v0.0.0
+
+require github.com/MonkeyLabs-LLC/Marrow v0.0.0
 
 require (
 	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
@@ -10,3 +12,5 @@ require (
 )
 
 replace github.com/BananaLabs-OSS/Fiber => ../../../Fiber
+
+replace github.com/MonkeyLabs-LLC/Marrow => ../../../Marrow

@@ -31,7 +31,7 @@ func main() {
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: pulp-registry <publish|publish-cell|refresh|refresh-app|resolve|serve|sync|verify> [flags]")
+		return errors.New("usage: pulp-registry <publish|publish-cell|refresh|refresh-cell|refresh-app|resolve|serve|sync|verify> [flags]")
 	}
 	switch args[0] {
 	case "publish":
@@ -40,6 +40,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return publishCell(ctx, args[1:], stdout, stderr)
 	case "refresh":
 		return refresh(args[1:], stdout, stderr)
+	case "refresh-cell":
+		return refreshCell(args[1:], stdout, stderr)
 	case "refresh-app":
 		return refreshApp(args[1:], stdout, stderr)
 	case "resolve":
@@ -251,6 +253,20 @@ func refreshApp(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if err := appmanifest.RefreshAppDigests(*manifestPath); err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, *manifestPath)
+	return nil
+}
+
+func refreshCell(args []string, stdout, stderr io.Writer) error {
+	f := flag.NewFlagSet("refresh-cell", flag.ContinueOnError)
+	f.SetOutput(stderr)
+	manifestPath := f.String("manifest", "pulp.cell.toml", "pulp.cell.toml path")
+	if err := f.Parse(args); err != nil {
+		return err
+	}
+	if err := appmanifest.RefreshCellDigest(*manifestPath); err != nil {
 		return err
 	}
 	fmt.Fprintln(stdout, *manifestPath)

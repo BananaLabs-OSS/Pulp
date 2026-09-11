@@ -3,8 +3,12 @@ package run
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -30,11 +34,33 @@ type composedEmailVerificationOTP struct {
 	Email string `msgpack:"email"`
 	Code  string `msgpack:"code"`
 	Type  string `msgpack:"type"`
+	To    string `msgpack:"to"`
+	Text  string `msgpack:"text"`
 }
 
 type composedIdentitySnapshot struct {
-	OTPs map[string]composedEmailVerificationOTP `msgpack:"otps"`
+	OTPs    map[string]composedEmailVerificationOTP `msgpack:"otps"`
+	Effects map[string]composedOwnerEffect          `msgpack:"effects"`
 }
+
+type composedOwnerEffect struct {
+	Intent composedEffectIntent `msgpack:"intent"`
+}
+
+type composedEffectIntent struct {
+	ID      string             `msgpack:"id"`
+	Payload msgpack.RawMessage `msgpack:"payload"`
+}
+
+type composedOTPEnvelope struct {
+	KeyID      string `json:"KeyID"`
+	Recipient  string `json:"Recipient"`
+	ExpiresAt  int64  `json:"ExpiresAt"`
+	Nonce      []byte `json:"Nonce"`
+	Ciphertext []byte `json:"Ciphertext"`
+}
+
+const composedOTPKey = "pulp-bananauth-composed-email-test-key-material-v1"
 
 // TestBananauthComposedEmailHTTPRoute starts the real composed Bananauth
 // application with its test-only manifest and reaches the public passwordless
@@ -44,6 +70,7 @@ func TestBananauthComposedEmailHTTPRoute(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping composed Bananauth HTTP integration test in short mode")
 	}
+	t.Setenv("BANANAAUTH_OTP_KEY_CURRENT", composedOTPKey)
 	workspace, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
@@ -98,6 +125,7 @@ func TestSessionsUsesComposedBananauthEmailTransport(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping real Sessions-to-Bananauth HTTP integration test in short mode")
 	}
+	t.Setenv("BANANAAUTH_OTP_KEY_CURRENT", composedOTPKey)
 	workspace, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
@@ -137,11 +165,14 @@ func TestSessionsUsesComposedBananauthEmailTransport(t *testing.T) {
 		body, _ := io.ReadAll(issued.Body)
 		t.Fatalf("issue composed verification status = %d body=%s, want 200", issued.StatusCode, body)
 	}
-	code := composedVerificationCode(t, storageRoot, email)
+	code := composedVerificationCode(t, storageRoot, email, composedOTPKey)
 
-	vitest := filepath.Join(workspace, "Sessions", "node_modules", ".bin", "vitest.cmd")
+	vitest := filepath.Join(workspace, "Sessions", "node_modules", ".bin", "vitest")
 	if _, err := os.Stat(vitest); err != nil {
-		t.Fatalf("Sessions Vitest executable unavailable: %v", err)
+		vitest += ".cmd"
+		if _, err := os.Stat(vitest); err != nil {
+			t.Fatalf("Sessions Vitest executable unavailable: %v", err)
+		}
 	}
 	cmd := exec.CommandContext(ctx, vitest, "run", "src/pages/api/login.bananauth-real-http.integration.test.ts")
 	cmd.Dir = filepath.Join(workspace, "Sessions")
@@ -156,7 +187,7 @@ func TestSessionsUsesComposedBananauthEmailTransport(t *testing.T) {
 	}
 }
 
-func composedVerificationCode(t *testing.T, storageRoot, email string) string {
+func composedVerificationCode(t *testing.T, storageRoot, email, key string) string {
 	t.Helper()
 	path := filepath.Join(storageRoot, "apps", "bananauth-composed-email-smoke", "default", "cells", "auth-identity", "primary", "data.db")
 	if _, err := os.Stat(path); err != nil {
@@ -187,7 +218,48 @@ func composedVerificationCode(t *testing.T, storageRoot, email string) string {
 			return otp.Code
 		}
 	}
-	t.Fatalf("composed identity snapshot contains no issued verification code for %q", email)
+	diagnostic := fmt.Sprintf("effects=%d", len(snapshot.Effects))
+	for _, effect := range snapshot.Effects {
+		var encrypted []byte
+		if err := msgpack.Unmarshal(effect.Intent.Payload, &encrypted); err != nil {
+			diagnostic += "; payload=" + err.Error()
+			continue
+		}
+		var envelope composedOTPEnvelope
+		if err := json.Unmarshal(encrypted, &envelope); err != nil {
+			diagnostic += "; envelope=" + err.Error()
+			continue
+		}
+		if envelope.Recipient != email {
+			diagnostic += "; recipient-mismatch"
+			continue
+		}
+		blockKey := sha256.Sum256(append([]byte("bananauth:otp-encryption:v1\x00"), []byte(key)...))
+		block, err := aes.NewCipher(blockKey[:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		var aead cipher.AEAD
+		if aead, err = cipher.NewGCM(block); err != nil {
+			t.Fatal(err)
+		}
+		aad := []byte(fmt.Sprintf("bananauth:otp-delivery-aad:v1\x00%s\x00%s\x00%d", effect.Intent.ID, email, envelope.ExpiresAt))
+		plain, err := aead.Open(nil, envelope.Nonce, envelope.Ciphertext, aad)
+		if err != nil {
+			diagnostic += fmt.Sprintf("; decrypt=%s intent=%q key_id=%q", err, effect.Intent.ID, envelope.KeyID)
+			continue
+		}
+		var payload composedEmailVerificationOTP
+		if err := msgpack.Unmarshal(plain, &payload); err != nil {
+			diagnostic += "; plaintext=" + err.Error()
+			continue
+		}
+		const marker = "Your verification code: "
+		if payload.To == email && strings.HasPrefix(payload.Text, marker) {
+			return strings.Fields(strings.TrimPrefix(payload.Text, marker))[0]
+		}
+	}
+	t.Fatalf("composed identity snapshot contains no decryptable issued verification effect for %q (%s)", email, diagnostic)
 	return ""
 }
 
@@ -196,6 +268,7 @@ func composedVerificationCode(t *testing.T, storageRoot, email string) string {
 // secret, while the guest receives only a verified identity and persists it
 // through auth-identity before creating an auth-session.
 func TestBananauthComposedOAuthUsesHostProvider(t *testing.T) {
+	t.Setenv("BANANAAUTH_OTP_KEY_CURRENT", "pulp-bananauth-oauth-test-key-material-v1")
 	if testing.Short() {
 		t.Skip("skipping composed Bananauth OAuth integration test in short mode")
 	}

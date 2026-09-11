@@ -9,6 +9,55 @@ import (
 	"github.com/BananaLabs-OSS/Pulp/internal/manifest"
 )
 
+func TestSetupCapabilitiesReceivesHostPlacementGrantResolver(t *testing.T) {
+	blue, err := ext.NewScope("projx", "blue", "files", "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	green, err := ext.NewScope("projx", "green", "files", "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	grants, err := ext.NewStaticPlacementGrants([]ext.PlacementGrant{
+		{Scope: blue, Capability: "storage.fs", Resource: "source", Rights: []string{"read"}},
+		{Scope: green, Capability: "storage.fs", Resource: "source", Rights: []string{"stat"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var received ext.PlacementGrantResolver
+	runtime := &applicationRuntime{
+		application:   HostedApplication{Identity: ApplicationIdentity{ApplicationID: "projx", InstanceID: "blue"}},
+		config:        ScopedApplicationRuntimeFactoryConfig{Logger: slog.Default(), PlacementGrants: grants},
+		declaredUnion: map[string]bool{"storage.fs": true},
+		allCaps:       []ext.Capability{{Name: "storage.fs", Setup: func(env ext.SetupEnv) error { received = env.PlacementGrants; return nil }}},
+		setupCaps:     map[string]bool{}, capabilityConfigs: map[string]map[string]any{},
+	}
+	if err := runtime.setupCapabilities(); err != nil {
+		t.Fatal(err)
+	}
+	if received == nil {
+		t.Fatal("setup did not receive resolver")
+	}
+	if g, ok := received.ResolvePlacementGrant(blue, "storage.fs"); !ok || !g.Allows("read") {
+		t.Fatalf("blue grant = %#v, %v", g, ok)
+	}
+	if g, ok := received.ResolvePlacementGrant(green, "storage.fs"); !ok || !g.Allows("stat") || g.Allows("read") {
+		t.Fatalf("green grant = %#v, %v", g, ok)
+	}
+}
+
+func TestSetupCapabilitiesPreservesNilPlacementGrantCompatibility(t *testing.T) {
+	var received ext.PlacementGrantResolver
+	runtime := &applicationRuntime{application: HostedApplication{Identity: ApplicationIdentity{ApplicationID: "legacy", InstanceID: "default"}}, config: ScopedApplicationRuntimeFactoryConfig{Logger: slog.Default()}, declaredUnion: map[string]bool{"demo": true}, allCaps: []ext.Capability{{Name: "demo", Setup: func(env ext.SetupEnv) error { received = env.PlacementGrants; return nil }}}, setupCaps: map[string]bool{}, capabilityConfigs: map[string]map[string]any{}}
+	if err := runtime.setupCapabilities(); err != nil {
+		t.Fatal(err)
+	}
+	if received != nil {
+		t.Fatal("nil legacy resolver changed")
+	}
+}
+
 func TestApplicationRuntimeRejectsSetupWithoutScopedTeardownInMultiAppHost(t *testing.T) {
 	runtime := &applicationRuntime{
 		config:        ScopedApplicationRuntimeFactoryConfig{RequireScopedCapabilityLifecycle: true},

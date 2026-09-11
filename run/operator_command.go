@@ -23,10 +23,11 @@ type operatorCommandRegistry struct {
 	mu       sync.Mutex
 	commands map[string]OperatorCommandDescriptor
 	active   map[string]ApplicationProviderAccess
+	staged   map[ApplicationIdentity]ApplicationProviderAccess
 }
 
 func newOperatorCommandRegistry() *operatorCommandRegistry {
-	return &operatorCommandRegistry{commands: map[string]OperatorCommandDescriptor{}, active: map[string]ApplicationProviderAccess{}}
+	return &operatorCommandRegistry{commands: map[string]OperatorCommandDescriptor{}, active: map[string]ApplicationProviderAccess{}, staged: map[ApplicationIdentity]ApplicationProviderAccess{}}
 }
 
 func (r *operatorCommandRegistry) register(d OperatorCommandDescriptor) error {
@@ -45,15 +46,54 @@ func (r *operatorCommandRegistry) register(d OperatorCommandDescriptor) error {
 }
 
 func (r *operatorCommandRegistry) bind(identity ApplicationIdentity, caller ApplicationProviderAccess) error {
-	if caller == nil || caller.Identity() != identity { return errors.New("operator command: provider access identity mismatch") }
-	r.mu.Lock(); defer r.mu.Unlock()
-	for name, d := range r.commands { if d.Application == identity { r.active[name] = caller } }
+	if caller == nil || caller.Identity() != identity {
+		return errors.New("operator command: provider access identity mismatch")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	hasActive := false
+	for name, d := range r.commands {
+		if d.Application == identity {
+			if r.active[name] != nil {
+				hasActive = true
+			} else {
+				r.active[name] = caller
+			}
+		}
+	}
+	if hasActive {
+		r.staged[identity] = caller
+	}
 	return nil
 }
 
-func (r *operatorCommandRegistry) unbind(identity ApplicationIdentity) {
-	r.mu.Lock(); defer r.mu.Unlock()
-	for name, d := range r.commands { if d.Application == identity { delete(r.active, name) } }
+// activate atomically promotes a prepared provider generation for all commands.
+func (r *operatorCommandRegistry) activate(identity ApplicationIdentity, caller ApplicationProviderAccess) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for name, d := range r.commands {
+		if d.Application == identity {
+			r.active[name] = caller
+		}
+	}
+	delete(r.staged, identity)
+}
+
+func (r *operatorCommandRegistry) unbind(identity ApplicationIdentity, callers ...ApplicationProviderAccess) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var caller ApplicationProviderAccess
+	if len(callers) > 0 {
+		caller = callers[0]
+	}
+	for name, d := range r.commands {
+		if d.Application == identity && (caller == nil || r.active[name] == caller) {
+			delete(r.active, name)
+		}
+	}
+	if r.staged[identity] == caller {
+		delete(r.staged, identity)
+	}
 }
 
 func (r *operatorCommandRegistry) invoke(ctx context.Context, name string, request []byte) ([]byte, error) {
@@ -61,13 +101,23 @@ func (r *operatorCommandRegistry) invoke(ctx context.Context, name string, reque
 	d, exists := r.commands[name]
 	caller := r.active[name]
 	r.mu.Unlock()
-	if !exists { return nil, fmt.Errorf("operator command %q is not registered", name) }
-	if caller == nil { return nil, fmt.Errorf("operator command %q is not active", name) }
-	if len(request) > d.MaxRequestBytes { return nil, fmt.Errorf("operator command %q request exceeds limit", name) }
+	if !exists {
+		return nil, fmt.Errorf("operator command %q is not registered", name)
+	}
+	if caller == nil {
+		return nil, fmt.Errorf("operator command %q is not active", name)
+	}
+	if len(request) > d.MaxRequestBytes {
+		return nil, fmt.Errorf("operator command %q request exceeds limit", name)
+	}
 	return caller.CallProvider(ctx, d.Cell, d.Provider, append([]byte(nil), request...))
 }
 
 var deploymentOperatorCommands = newOperatorCommandRegistry()
 
-func RegisterOperatorCommand(d OperatorCommandDescriptor) error { return deploymentOperatorCommands.register(d) }
-func InvokeOperatorCommand(ctx context.Context, name string, request []byte) ([]byte, error) { return deploymentOperatorCommands.invoke(ctx, name, request) }
+func RegisterOperatorCommand(d OperatorCommandDescriptor) error {
+	return deploymentOperatorCommands.register(d)
+}
+func InvokeOperatorCommand(ctx context.Context, name string, request []byte) ([]byte, error) {
+	return deploymentOperatorCommands.invoke(ctx, name, request)
+}

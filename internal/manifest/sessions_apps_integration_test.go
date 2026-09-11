@@ -43,6 +43,7 @@ func TestSessionsSourceMonolithAndSplitCompositionsLoad(t *testing.T) {
 				}
 				if test.singleApp {
 					assertEvolutionSQLiteExecutionUnit(t, app)
+					assertPlacementConfigValue(t, app, "lua-orchestrator", "minecraft_resolver_scope", "local")
 				}
 			}
 		})
@@ -53,29 +54,49 @@ func TestSessionsSourceMonolithAndSplitCompositionsLoad(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadHost(%s): %v", hostPath, err)
 	}
-	if len(host.ApplicationOrder) != 3 ||
-		host.ApplicationOrder[0].ID != "sessions" ||
+	if len(host.ApplicationOrder) != 4 ||
+		host.ApplicationOrder[0].ID != "bananauth" ||
 		host.ApplicationOrder[1].ID != "minecraft-resolver" ||
-		host.ApplicationOrder[2].ID != "evolution" {
+		host.ApplicationOrder[2].ID != "sessions" ||
+		host.ApplicationOrder[3].ID != "evolution" {
 		t.Fatalf("host application order = %#v", host.ApplicationOrder)
 	}
-	if len(host.ApplicationOrder[1].DependsOn) != 1 ||
-		host.ApplicationOrder[1].DependsOn[0] != "sessions" {
-		t.Fatalf("resolver dependencies = %#v, want [sessions]", host.ApplicationOrder[1].DependsOn)
+	if len(host.ApplicationOrder[2].DependsOn) != 2 ||
+		host.ApplicationOrder[2].DependsOn[0] != "bananauth" ||
+		host.ApplicationOrder[2].DependsOn[1] != "minecraft-resolver" {
+		t.Fatalf("Sessions dependencies = %#v, want [bananauth minecraft-resolver]", host.ApplicationOrder[2].DependsOn)
 	}
+}
+
+func assertPlacementConfigValue(t *testing.T, app *Application, cell, key string, want any) {
+	t.Helper()
+	for _, placement := range app.Placements {
+		if placement.Spec.Name != cell {
+			continue
+		}
+		values, ok := placement.Spec.Config["values"].(map[string]any)
+		if !ok {
+			t.Fatalf("placement %q config values = %#v, want a table", cell, placement.Spec.Config["values"])
+		}
+		if got := values[key]; got != want {
+			t.Fatalf("placement %q config values[%q] = %#v, want %#v", cell, key, got, want)
+		}
+		return
+	}
+	t.Fatalf("application is missing placement %q", cell)
 }
 
 func assertEvolutionSQLiteExecutionUnit(t *testing.T, app *Application) {
 	t.Helper()
 	var unit *ExecutionUnit
 	for index := range app.ExecutionUnits {
-		if app.ExecutionUnits[index].Name == "evolution-sqlite-core" {
+		if app.ExecutionUnits[index].Name == "shared-sqlite-core" {
 			unit = &app.ExecutionUnits[index]
 			break
 		}
 	}
 	if unit == nil {
-		t.Fatal("Evolution application is missing the evolution-sqlite-core execution unit")
+		t.Fatal("Evolution application is missing the shared-sqlite-core execution unit")
 	}
 	if unit.Artifact == nil || unit.Artifact.Name != "evolution-state-engine" {
 		t.Fatalf("Evolution SQLite unit artifact = %#v, want evolution-state-engine", unit.Artifact)
@@ -128,6 +149,11 @@ func TestSessionsBananauthHumanAuthParityHarnessResolvesOnlyDeclaredProviders(t 
 		"auth.identity.v1.oauth.resolve",
 		"auth.identity.v1.email-verification.issue",
 		"auth.identity.v1.email-verification.consume",
+		"auth.identity.v1.retention-lease.create",
+		"auth.identity.v1.retention-lease.renew",
+		"auth.identity.v1.retention-lease.release",
+		"auth.identity.v1.retention-eligibility.get",
+		"auth.identity.v1.account.erase",
 		"auth.session.v1.create",
 		"auth.session.v1.get",
 		"auth.session.v1.revoke",
