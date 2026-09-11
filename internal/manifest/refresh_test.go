@@ -26,6 +26,30 @@ func TestRefreshCellDigestMakesChangedCellLoadable(t *testing.T) {
 	}
 }
 
+func TestReplaceTopLevelDigestPreservesPrefixWhenDigestStartsWithLetter(t *testing.T) {
+	manifest := []byte("name=\"cell\"\nwasm_sha256=\"old\"\n[config]\nprefix=\"ledger\"\n")
+	updated, err := replaceTopLevelValue(manifest, "wasm_sha256", "deadbeef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "name=\"cell\"\nwasm_sha256=\"deadbeef\"\n[config]\nprefix=\"ledger\"\n"
+	if string(updated) != want {
+		t.Fatalf("updated manifest = %q, want %q", updated, want)
+	}
+}
+
+func TestReplaceTopLevelDigestInsertionPreservesFollowingSection(t *testing.T) {
+	manifest := []byte("name=\"cell\"\n[config]\nprefix=\"ledger\"\n")
+	updated, err := replaceTopLevelValue(manifest, "wasm_sha256", "deadbeef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "name=\"cell\"\nwasm_sha256 = \"deadbeef\"\n[config]\nprefix=\"ledger\"\n"
+	if string(updated) != want {
+		t.Fatalf("updated manifest = %q, want %q", updated, want)
+	}
+}
+
 func TestRefreshAppDigestsMakesChangedAppLoadable(t *testing.T) {
 	root := t.TempDir()
 	write := func(name, value string) {

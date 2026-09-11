@@ -154,7 +154,9 @@ func replaceSectionValue(data []byte, section, key, value string) ([]byte, error
 	if keyPattern.Match(block) {
 		block = keyPattern.ReplaceAll(block, replacement)
 	} else {
-		block = append(block, []byte("\n"+key+" = \""+value+"\"\n")...)
+		// block aliases data. Allocate before appending so growth cannot overwrite
+		// the following section that is copied into the result below.
+		block = append(append([]byte(nil), block...), []byte("\n"+key+" = \""+value+"\"\n")...)
 	}
 	return append(append(append([]byte(nil), data[:location[1]]...), block...), data[end:]...), nil
 }
@@ -169,7 +171,9 @@ func replaceTopLevelValue(data []byte, key, value string) ([]byte, error) {
 	if pattern.Match(head) {
 		head = pattern.ReplaceAll(head, []byte(`${1}"`+value+`"${2}`))
 	} else {
-		head = append(head, []byte(key+" = \""+value+"\"\n")...)
+		// head aliases data. Allocate before appending so a manifest with a
+		// following [config] section cannot be overwritten through slice capacity.
+		head = append(append([]byte(nil), head...), []byte(key+" = \""+value+"\"\n")...)
 	}
 	return append(append([]byte(nil), head...), data[end:]...), nil
 }
