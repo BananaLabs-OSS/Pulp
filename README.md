@@ -6,9 +6,10 @@ fusion.
 
 ## Standalone products
 
-The native CLI assembles a product descriptor into a frozen, distributable
-application containing its exact Pulp composition, presentation surface, and
-focused host executable:
+The native CLI assembles a product descriptor into a single distributable
+executable containing its exact Pulp composition, presentation surface, and
+focused host. At launch, the executable verifies and materializes its internal
+runtime into a content-addressed private cache:
 
 ```sh
 pulp product plan
