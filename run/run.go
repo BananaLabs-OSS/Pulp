@@ -244,7 +244,7 @@ func startDirectApplicationWithLifecycle(ctx context.Context, app *manifest.Appl
 		ManifestPath: app.ManifestPath,
 	}, ScopedApplicationRuntimeFactoryConfig{
 		Registry:          host.NewRegistry(),
-		Limits:            &host.Limits{},
+		Limits:            &host.Limits{Interruptible: true},
 		Logger:            options.Logger,
 		StorageRoot:       options.StorageRoot,
 		StorageNamespaces: options.StorageNamespaces,
@@ -384,7 +384,7 @@ func startHostedApplications(ctx context.Context, hostPath string, options HostR
 	}
 	factory, err := NewScopedApplicationRuntimeFactory(ScopedApplicationRuntimeFactoryConfig{
 		Registry:                         host.NewRegistry(),
-		Limits:                           &host.Limits{},
+		Limits:                           &host.Limits{Interruptible: true},
 		Logger:                           options.Logger,
 		ModuleCacheScope:                 cacheScope,
 		StorageRoot:                      options.StorageRoot,
@@ -933,6 +933,7 @@ func MainWithOptions(options MainOptions) {
 			limits := &host.Limits{
 				MaxMemoryPages: spec.MaxMemoryPages,
 				CallTimeout:    time.Duration(spec.CallTimeoutMS) * time.Millisecond,
+				Interruptible:  true,
 			}
 			cell, err := host.LoadScoped(rt.ctx, spec, registry, limits, logger, rt.effectiveScope())
 			if err != nil {

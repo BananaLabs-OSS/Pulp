@@ -383,7 +383,14 @@ func (r *applicationRuntime) Start(parent context.Context) error {
 			close(rt.readyCh)
 			return err
 		}
-		limits := &host.Limits{MaxMemoryPages: spec.MaxMemoryPages, CallTimeout: time.Duration(spec.CallTimeoutMS) * time.Millisecond}
+		limits := &host.Limits{
+			MaxMemoryPages: spec.MaxMemoryPages,
+			CallTimeout:    time.Duration(spec.CallTimeoutMS) * time.Millisecond,
+			// Application cells are long-lived but supervised. Interrupt a guest
+			// that fails to return before its call budget so one placement cannot
+			// permanently retain its execution lock and a host CPU.
+			Interruptible: true,
+		}
 		cell, err := host.LoadScoped(rt.ctx, spec, r.registry, limits, r.config.Logger, rt.effectiveScope())
 		if err != nil {
 			rt.failed.Store(true)

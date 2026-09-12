@@ -314,6 +314,7 @@ func (o *runtimeOps) reloadCell(name string) error {
 	limits := &host.Limits{
 		MaxMemoryPages: spec.MaxMemoryPages,
 		CallTimeout:    time.Duration(spec.CallTimeoutMS) * time.Millisecond,
+		Interruptible:  true,
 	}
 	cell, err := host.LoadScoped(rt.ctx, spec, o.registry, limits, o.logger, rt.effectiveScope())
 	if err != nil {
