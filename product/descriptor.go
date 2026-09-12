@@ -80,6 +80,16 @@ type Plan struct {
 	Surfaces     []Surface              `json:"surfaces"`
 }
 
+// Assembly is the deterministic, runnable output produced from a product
+// plan. The generated host manifest delegates execution to Pulp's ordinary
+// multi-application supervisor; products do not introduce a second runtime.
+type Assembly struct {
+	Root         string  `json:"root"`
+	HostManifest string  `json:"host_manifest"`
+	PlanManifest string  `json:"plan_manifest"`
+	Surface      Surface `json:"surface"`
+}
+
 func Load(path string) (Descriptor, error) {
 	body, err := os.ReadFile(path)
 	if err != nil {
@@ -225,8 +235,120 @@ func Resolve(path string) (Plan, error) {
 	}
 	extensions := append([]string(nil), descriptor.Host.Extensions...)
 	sort.Strings(extensions)
+	available := make(map[string]bool, len(extensions))
+	for _, extension := range extensions {
+		available[extension] = true
+	}
+	for _, required := range descriptor.Capabilities.Required {
+		if !available[required] {
+			return Plan{}, fmt.Errorf("required capability %q has no host extension", required)
+		}
+	}
 	return Plan{Descriptor: abs, ID: descriptor.ID, Name: descriptor.Name, Version: descriptor.Version,
 		Applications: applications, Entrypoint: descriptor.Entrypoint, HostModule: hostModule, Extensions: extensions, Capabilities: descriptor.Capabilities, Surfaces: surfaces}, nil
+}
+
+// Assemble writes a portable host composition and resolved plan. Output is
+// replaced file-by-file so an interrupted assembly never leaves partial file
+// contents. Source application manifests remain the authority and are
+// referenced relatively, which keeps development builds inspectable.
+func Assemble(descriptorPath, outputRoot, surfaceID string) (Assembly, error) {
+	plan, err := Resolve(descriptorPath)
+	if err != nil {
+		return Assembly{}, err
+	}
+	var selected *Surface
+	for index := range plan.Surfaces {
+		if plan.Surfaces[index].ID == surfaceID {
+			selected = &plan.Surfaces[index]
+			break
+		}
+	}
+	if selected == nil {
+		return Assembly{}, fmt.Errorf("product surface %q is not declared", surfaceID)
+	}
+	root, err := filepath.Abs(outputRoot)
+	if err != nil {
+		return Assembly{}, fmt.Errorf("assembly root: %w", err)
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return Assembly{}, fmt.Errorf("create assembly root: %w", err)
+	}
+	hostPath := filepath.Join(root, "pulp.host.toml")
+	planPath := filepath.Join(root, "pulp.product.plan.json")
+	hostBody, err := renderHost(plan, root)
+	if err != nil {
+		return Assembly{}, err
+	}
+	planBody, err := json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		return Assembly{}, fmt.Errorf("encode product plan: %w", err)
+	}
+	planBody = append(planBody, '\n')
+	if err := atomicWrite(hostPath, hostBody, 0o644); err != nil {
+		return Assembly{}, err
+	}
+	if err := atomicWrite(planPath, planBody, 0o644); err != nil {
+		return Assembly{}, err
+	}
+	return Assembly{Root: root, HostManifest: hostPath, PlanManifest: planPath, Surface: *selected}, nil
+}
+
+func renderHost(plan Plan, outputRoot string) ([]byte, error) {
+	var body strings.Builder
+	fmt.Fprintf(&body, "schema_version = 1\nname = %q\nhealth_path = %q\n", plan.ID, "/_pulp/health")
+	for _, application := range plan.Applications {
+		relative, err := filepath.Rel(outputRoot, application.Manifest)
+		if err != nil {
+			return nil, fmt.Errorf("relativize application %q: %w", application.ID, err)
+		}
+		fmt.Fprintf(&body, "\n[[applications]]\nid = %q\nmanifest = %q\naliases = [%q]\nstorage_namespace = %q\nevent_namespace = %q\n",
+			application.ID, filepath.ToSlash(relative), application.Instance, application.ID, application.ID)
+		if len(application.Dependencies) != 0 {
+			fmt.Fprintf(&body, "depends_on = %s\n", quotedList(application.Dependencies))
+		}
+	}
+	entryInstance := "default"
+	for _, application := range plan.Applications {
+		if application.ID == plan.Entrypoint.Application {
+			entryInstance = application.Instance
+			break
+		}
+	}
+	fmt.Fprintf(&body, "\n[[routes]]\npath = %q\napplication = %q\ninstance = %q\n", "/", plan.Entrypoint.Application, entryInstance)
+	return []byte(body.String()), nil
+}
+
+func quotedList(values []string) string {
+	quoted := make([]string, len(values))
+	for index, value := range values {
+		quoted[index] = fmt.Sprintf("%q", value)
+	}
+	return "[" + strings.Join(quoted, ", ") + "]"
+}
+
+func atomicWrite(path string, body []byte, mode os.FileMode) error {
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".pulp-product-*")
+	if err != nil {
+		return fmt.Errorf("create temporary product file: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(mode); err != nil {
+		temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(body); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf("publish product file: %w", err)
+	}
+	return nil
 }
 
 func validateCapabilities(requirements CapabilityRequirements) error {
