@@ -416,6 +416,13 @@ func normalizeHostConsumes(values []string) ([]string, error) {
 		if normalized != value || strings.IndexFunc(normalized, func(r rune) bool { return r <= ' ' }) >= 0 {
 			return nil, fmt.Errorf("host_consumes[%d] %q must not contain whitespace", index, value)
 		}
+		if strings.Count(normalized, "::") > 1 {
+			return nil, fmt.Errorf("host_consumes[%d] %q has an invalid application qualifier", index, value)
+		}
+		if application, provider, qualified := strings.Cut(normalized, "::"); qualified &&
+			(!hostIdentifier.MatchString(application) || provider == "") {
+			return nil, fmt.Errorf("host_consumes[%d] %q has an invalid application qualifier", index, value)
+		}
 		if _, duplicate := seen[normalized]; duplicate {
 			return nil, fmt.Errorf("duplicate host_consumes provider %q", normalized)
 		}

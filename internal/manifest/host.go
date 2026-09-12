@@ -187,30 +187,38 @@ func LoadHost(hostPath string) (*Host, error) {
 func validateHostConsumes(applications []*HostedApplication, byID map[string]*HostedApplication) error {
 	for _, callerApp := range applications {
 		providers := make(map[string][]string)
+		providersByApplication := make(map[string]map[string][]string)
 		for _, dependencyID := range callerApp.DependsOn {
 			dependency := byID[dependencyID]
 			if dependency == nil || dependency.Application == nil || dependency.Application.Cells == nil {
 				continue
 			}
+			applicationProviders := make(map[string][]string)
 			for _, targetCell := range dependency.Application.Cells.Cells {
 				for _, provider := range targetCell.Provides {
 					providers[provider] = append(providers[provider], dependency.ID+"/"+targetCell.Name)
+					applicationProviders[provider] = append(applicationProviders[provider], dependency.ID+"/"+targetCell.Name)
 				}
 			}
+			providersByApplication[dependencyID] = applicationProviders
 		}
 		if callerApp.Application == nil || callerApp.Application.Cells == nil {
 			continue
 		}
 		for _, callerCell := range callerApp.Application.Cells.Cells {
-			for _, provider := range callerCell.HostConsumes {
-				owners := providers[provider]
+			for _, grant := range callerCell.HostConsumes {
+				applicationID, provider, qualified := strings.Cut(grant, "::")
+				owners := providers[grant]
+				if qualified {
+					owners = providersByApplication[applicationID][provider]
+				}
 				switch len(owners) {
 				case 0:
-					return fmt.Errorf("application %q cell %q host_consumes %q but no direct dependency application provides it", callerApp.ID, callerCell.Name, provider)
+					return fmt.Errorf("application %q cell %q host_consumes %q but no direct dependency application provides it", callerApp.ID, callerCell.Name, grant)
 				case 1:
 					// Exact and unique across direct dependencies.
 				default:
-					return fmt.Errorf("application %q cell %q host_consumes %q but direct dependencies provide it ambiguously: %s", callerApp.ID, callerCell.Name, provider, strings.Join(owners, ", "))
+					return fmt.Errorf("application %q cell %q host_consumes %q but direct dependencies provide it ambiguously: %s", callerApp.ID, callerCell.Name, grant, strings.Join(owners, ", "))
 				}
 			}
 		}
