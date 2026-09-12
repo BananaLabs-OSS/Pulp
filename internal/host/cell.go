@@ -245,6 +245,22 @@ func sharedWazeroCache() wazero.CompilationCache {
 	return wazeroCache
 }
 
+// NewRuntimeWithPersistentCompilationCache creates a runtime backed by the
+// same process-wide, on-disk compilation cache used by capability-bearing
+// cells. Multi-application hosts use this for their shared import-free-cell
+// runtime so fused engines do not pay the full machine-code compilation cost
+// on every container cold start. A missing or unwritable cache remains a
+// correctness-preserving fallback to an ordinary runtime.
+func NewRuntimeWithPersistentCompilationCache(ctx context.Context, config wazero.RuntimeConfig) wazero.Runtime {
+	if config == nil {
+		config = wazero.NewRuntimeConfig()
+	}
+	if cache := sharedWazeroCache(); cache != nil {
+		config = config.WithCompilationCache(cache)
+	}
+	return wazero.NewRuntimeWithConfig(ctx, config)
+}
+
 // Load constructs a legacy name-scoped cell. New application runtimes should
 // use LoadScoped so extensions can isolate mutable resources by application
 // and instance as well as cell name.
