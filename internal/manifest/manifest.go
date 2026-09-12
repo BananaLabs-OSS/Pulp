@@ -90,12 +90,10 @@ type CellSpec struct {
 	// CallTimeoutMS bounds a single pulp_init / pulp_step / pulp_on_call
 	// invocation, in milliseconds. 0 means "use the host default" (see
 	// host.DefaultCallTimeout). When the deadline elapses the host-side
-	// call context is cancelled, which propagates cancellation to any
-	// blocking host calls (I/O, sleep) the cell is waiting on. A runaway
-	// pure-wasm loop is NOT interrupted — the host deliberately does NOT
-	// set wazero's WithCloseOnContextDone (that would tear the whole module
-	// down on first timeout, killing a long-lived reactor). Bounding a
-	// runaway wasm loop requires an out-of-band supervisor.
+	// call context is cancelled. Application runtimes load supervised cells
+	// interruptibly, so a pure-Wasm loop is trapped at this deadline and only
+	// that placement is eligible for re-instantiation. Low-level embedders that
+	// call host.Load directly may explicitly choose non-interruptible behavior.
 	CallTimeoutMS uint32
 
 	// Restart is the post-exit policy: "on_crash" (default), "never", or
