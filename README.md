@@ -4,6 +4,24 @@ A modular application runtime: a small Go host, capability-bounded Wasm cells,
 Lua-owned composition, immutable module resolution, and optional verified
 fusion.
 
+## Standalone products
+
+The native CLI assembles a product descriptor into a frozen, distributable
+application containing its exact Pulp composition, presentation surface, and
+focused host executable:
+
+```sh
+pulp product plan
+pulp product package -surface web -output dist/web
+pulp product install -assembly dist/web -store .pulp/releases
+pulp product activate -store .pulp/releases -digest <digest>
+pulp product rollback -store .pulp/releases
+pulp product state -store .pulp/releases
+```
+
+`pulp-product` remains available as a compatibility alias. New tooling should
+use `pulp product`.
+
 ## Status
 
 Pulp is active pre-1.0 infrastructure. The current implementation includes

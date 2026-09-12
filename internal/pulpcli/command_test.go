@@ -23,6 +23,17 @@ func TestIsCommandDoesNotCaptureRuntimeFlags(t *testing.T) {
 	if !IsCommand([]string{"inspect-app"}) {
 		t.Fatal("inspect-app not recognized")
 	}
+	if !IsCommand([]string{"product", "plan"}) {
+		t.Fatal("product not recognized")
+	}
+}
+
+func TestProductCommandUsesUnifiedCLI(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := Run(context.Background(), []string{"product"}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "pulp product <plan|build|package") {
+		t.Fatalf("unexpected product usage error: %v", err)
+	}
 }
 
 func TestInspectAppEmitsRuntimeDependencyPlan(t *testing.T) {
