@@ -21,6 +21,7 @@ func main() {
 	descriptor := flags.String("descriptor", "pulp.product.json", "path to the product descriptor")
 	output := flags.String("output", ".pulp/product", "assembly output directory")
 	surface := flags.String("surface", "", "surface id to assemble")
+	mode := flags.String("mode", "linked", "assembly mode: linked or frozen")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		if err == nil {
 			fmt.Fprintln(os.Stderr, "pulp-product accepts no positional arguments")
@@ -38,7 +39,16 @@ func main() {
 		if selected == "" {
 			selected = plan.Entrypoint.Surface
 		}
-		assembly, buildErr := product.Assemble(*descriptor, *output, selected)
+		var assembly product.Assembly
+		var buildErr error
+		switch *mode {
+		case "linked":
+			assembly, buildErr = product.Assemble(*descriptor, *output, selected)
+		case "frozen":
+			assembly, buildErr = product.AssembleFrozen(*descriptor, *output, selected)
+		default:
+			buildErr = fmt.Errorf("unsupported assembly mode %q", *mode)
+		}
 		if buildErr != nil {
 			fmt.Fprintln(os.Stderr, "pulp-product:", buildErr)
 			os.Exit(1)

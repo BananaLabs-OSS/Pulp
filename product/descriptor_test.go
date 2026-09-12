@@ -55,6 +55,7 @@ func TestAssembleProducesRunnableMultiApplicationHost(t *testing.T) {
 		digest := sha256.Sum256([]byte(script))
 		writeProductFixture("apps/"+app+"/app.lua", script)
 		writeProductFixture("apps/"+app+"/cell.toml", fmt.Sprintf("name = %q\nversion = \"1\"\n", app+"-lua"))
+		writeProductFixture("apps/"+app+"/cell.wasm", "wasm fixture")
 		writeProductFixture("apps/"+app+"/pulp.app.toml", fmt.Sprintf("name = %q\nversion = \"1\"\ncells = [\"cell.toml\"]\n[orchestrator]\nmanifest = \"cell.toml\"\nscript = \"app.lua\"\nsha256 = %q\n", app, fmt.Sprintf("%x", digest)))
 	}
 	descriptor := `{"schema":"pulp.product/v1","id":"banana.multi","name":"Multi","version":"1","applications":[{"id":"state","manifest":"apps/state/pulp.app.toml"},{"id":"ui","manifest":"apps/ui/pulp.app.toml","instance":"root","dependencies":["state"]}],"entrypoint":{"application":"ui","surface":"web","path":"/"},"host":{"module":"host/go.mod","extensions":["storage.sqlite"]},"capabilities":{"required":["storage.sqlite"]},"surfaces":[{"id":"web","kind":"web","root":"public"}]}`
@@ -92,6 +93,56 @@ func TestAssembleProducesRunnableMultiApplicationHost(t *testing.T) {
 	}
 	if launch.Schema != LaunchSchemaV1 || launch.Host != "pulp.host.toml" || launch.Application != "ui" || launch.Surface.ID != "web" || launch.HealthPath != "/_pulp/health" {
 		t.Fatalf("launch contract = %#v", launch)
+	}
+}
+
+func TestAssembleFrozenContainsVerifiedCompositionInputs(t *testing.T) {
+	root := t.TempDir()
+	write := func(relative, body string) {
+		path := filepath.Join(root, relative)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	script := "return true -- frozen"
+	digest := sha256.Sum256([]byte(script))
+	write("host/go.mod", "module host")
+	write("public/index.html", "ok")
+	write("application/app.lua", script)
+	write("engine/cell.wasm", "verified wasm")
+	write("engine/pulp.cell.toml", "name = \"frozen-cell\"\nversion = \"1\"\nwasm = \"cell.wasm\"\n")
+	write("application/pulp.app.toml", fmt.Sprintf("name = \"frozen\"\nversion = \"1\"\ncells = [\"../engine/pulp.cell.toml\"]\n[orchestrator]\nmanifest = \"../engine/pulp.cell.toml\"\nscript = \"app.lua\"\nsha256 = %q\n", fmt.Sprintf("%x", digest)))
+	write("pulp.product.json", `{"schema":"pulp.product/v1","id":"banana.frozen","name":"Frozen","version":"1","applications":[{"id":"frozen","manifest":"application/pulp.app.toml"}],"entrypoint":{"application":"frozen","surface":"web","path":"/"},"host":{"module":"host/go.mod"},"capabilities":{},"surfaces":[{"id":"web","kind":"web","root":"public"}]}`)
+	output := filepath.Join(root, "dist")
+	assembly, err := AssembleFrozen(filepath.Join(root, "pulp.product.json"), output, "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, relative := range []string{"packages/application/pulp.app.toml", "packages/application/app.lua", "packages/engine/pulp.cell.toml", "packages/engine/cell.wasm"} {
+		if _, err := os.Stat(filepath.Join(output, relative)); err != nil {
+			t.Fatalf("missing %s: %v", relative, err)
+		}
+	}
+	body, err := os.ReadFile(assembly.LaunchManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var launch LaunchContract
+	if err := json.Unmarshal(body, &launch); err != nil {
+		t.Fatal(err)
+	}
+	if launch.Mode != "frozen" {
+		t.Fatalf("launch mode = %q", launch.Mode)
+	}
+	host, err := os.ReadFile(assembly.HostManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(host), root) || !strings.Contains(string(host), `manifest = "packages/application/pulp.app.toml"`) {
+		t.Fatalf("frozen host is not self-contained:\n%s", host)
 	}
 }
 
