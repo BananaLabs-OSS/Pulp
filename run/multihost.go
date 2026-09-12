@@ -169,6 +169,13 @@ type ApplicationRuntime interface {
 	Shutdown(context.Context) error
 }
 
+// ApplicationRuntimeActivator is implemented by runtimes whose autonomous
+// work must begin only after every application in the host has initialized.
+// Start publishes synchronous providers; Activate starts background stepping.
+type ApplicationRuntimeActivator interface {
+	Activate(context.Context) error
+}
+
 // MultiHostSupervisor loads applications and manages their lifecycles as one
 // fail-fast host unit. It starts in canonical (application ID, instance ID)
 // order and stops in reverse order. Methods are serialized, so callers may
@@ -260,6 +267,15 @@ func (s *MultiHostSupervisor) Start(ctx context.Context, hostPath string) error 
 		started = append(started, runtime)
 		if err := runtime.Start(ctx); err != nil {
 			return s.startFailure(fmt.Errorf("start application %s: %w", app.Identity, err), started)
+		}
+	}
+	for _, runtime := range started {
+		activator, ok := runtime.(ApplicationRuntimeActivator)
+		if !ok {
+			continue
+		}
+		if err := activator.Activate(ctx); err != nil {
+			return s.startFailure(fmt.Errorf("activate application %s: %w", runtime.Identity(), err), started)
 		}
 	}
 
