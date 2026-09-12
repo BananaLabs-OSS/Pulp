@@ -98,7 +98,19 @@ func Run(args []string, stdout, stderr io.Writer) error {
 		return emit(stdout, assembly)
 	}
 
-	assembly, err := product.AssembleFrozen(*descriptor, *output, selected)
+	outputRoot, err := filepath.Abs(*output)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(outputRoot), 0o755); err != nil {
+		return err
+	}
+	stage, err := os.MkdirTemp(filepath.Dir(outputRoot), ".pulp-product-stage-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(stage)
+	assembly, err := product.AssembleFrozen(*descriptor, stage, selected)
 	if err != nil {
 		return err
 	}
@@ -136,7 +148,46 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	if err := build.Run(); err != nil {
 		return fmt.Errorf("build focused product host: %w", err)
 	}
+	if err := activatePackage(stage, outputRoot); err != nil {
+		return err
+	}
+	assembly.Root = outputRoot
+	assembly.HostManifest = filepath.Join(outputRoot, "pulp.host.toml")
+	assembly.PlanManifest = filepath.Join(outputRoot, "pulp.product.plan.json")
+	assembly.LaunchManifest = filepath.Join(outputRoot, "pulp.product.launch.json")
+	host = filepath.Join(outputRoot, "bin", name)
 	return emit(stdout, map[string]any{"assembly": assembly, "host_executable": host})
+}
+
+func activatePackage(stage, output string) error {
+	var backup string
+	if _, err := os.Stat(output); err == nil {
+		placeholder, err := os.MkdirTemp(filepath.Dir(output), ".pulp-product-backup-")
+		if err != nil {
+			return err
+		}
+		if err := os.Remove(placeholder); err != nil {
+			return err
+		}
+		backup = placeholder
+		if err := os.Rename(output, backup); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Rename(stage, output); err != nil {
+		if backup != "" {
+			_ = os.Rename(backup, output)
+		}
+		return fmt.Errorf("activate packaged product: %w", err)
+	}
+	if backup != "" {
+		if err := os.RemoveAll(backup); err != nil {
+			return fmt.Errorf("remove prior packaged product: %w", err)
+		}
+	}
+	return nil
 }
 
 func emit(w io.Writer, value any) error {
