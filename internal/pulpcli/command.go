@@ -15,6 +15,7 @@ import (
 
 	"github.com/BananaLabs-OSS/Pulp/fusion"
 	appmanifest "github.com/BananaLabs-OSS/Pulp/internal/manifest"
+	"github.com/BananaLabs-OSS/Pulp/internal/productcli"
 	"github.com/BananaLabs-OSS/Pulp/registry"
 	"github.com/BananaLabs-OSS/Pulp/run"
 )
@@ -23,6 +24,7 @@ var commands = map[string]bool{
 	"sync": true, "update": true, "inspect": true, "publish": true,
 	"refresh": true, "refresh-cell": true, "refresh-app": true, "digest-gate": true, "verify": true, "rollback": true, "recovery": true,
 	"import-go": true, "inspect-app": true,
+	"product": true,
 }
 
 // IsCommand reports whether args select a unified package command.
@@ -60,6 +62,8 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return recovery(args[1:], stdout, stderr, true)
 	case "recovery":
 		return recovery(args[1:], stdout, stderr, false)
+	case "product":
+		return productcli.Run(args[1:], stdout, stderr)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
