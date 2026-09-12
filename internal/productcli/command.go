@@ -102,6 +102,25 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	bootstrap, err := embeddedBootstrapSource(assembly.Root, plan.ID, plan.Version)
+	if err != nil {
+		return fmt.Errorf("build embedded product: %w", err)
+	}
+	bootstrapPath := filepath.Join(filepath.Dir(plan.HostModule), "zz_pulp_product_embedded.go")
+	bootstrapFile, err := os.OpenFile(bootstrapPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("stage embedded product bootstrap: %w", err)
+	}
+	if _, err = bootstrapFile.Write(bootstrap); err != nil {
+		bootstrapFile.Close()
+		os.Remove(bootstrapPath)
+		return err
+	}
+	if err = bootstrapFile.Close(); err != nil {
+		os.Remove(bootstrapPath)
+		return err
+	}
+	defer os.Remove(bootstrapPath)
 	name := strings.ReplaceAll(plan.ID, ".", "-") + "-host"
 	if runtime.GOOS == "windows" {
 		name += ".exe"
