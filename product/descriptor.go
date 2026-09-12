@@ -12,6 +12,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/BananaLabs-OSS/Pulp/internal/manifest"
 )
 
 const SchemaV1 = "pulp.product/v1"
@@ -285,7 +287,10 @@ func Assemble(descriptorPath, outputRoot, surfaceID string) (Assembly, error) {
 		return Assembly{}, fmt.Errorf("encode product plan: %w", err)
 	}
 	planBody = append(planBody, '\n')
-	if err := atomicWrite(hostPath, hostBody, 0o644); err != nil {
+	if err := atomicWriteValidated(hostPath, hostBody, 0o644, func(candidate string) error {
+		_, err := manifest.LoadHost(candidate)
+		return err
+	}); err != nil {
 		return Assembly{}, err
 	}
 	if err := atomicWrite(planPath, planBody, 0o644); err != nil {
@@ -328,6 +333,10 @@ func quotedList(values []string) string {
 }
 
 func atomicWrite(path string, body []byte, mode os.FileMode) error {
+	return atomicWriteValidated(path, body, mode, nil)
+}
+
+func atomicWriteValidated(path string, body []byte, mode os.FileMode, validate func(string) error) error {
 	temporary, err := os.CreateTemp(filepath.Dir(path), ".pulp-product-*")
 	if err != nil {
 		return fmt.Errorf("create temporary product file: %w", err)
@@ -344,6 +353,11 @@ func atomicWrite(path string, body []byte, mode os.FileMode) error {
 	}
 	if err := temporary.Close(); err != nil {
 		return err
+	}
+	if validate != nil {
+		if err := validate(temporaryPath); err != nil {
+			return fmt.Errorf("validate assembled product: %w", err)
+		}
 	}
 	if err := os.Rename(temporaryPath, path); err != nil {
 		return fmt.Errorf("publish product file: %w", err)
