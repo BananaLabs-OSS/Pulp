@@ -136,6 +136,36 @@ provides = ["orders.apply.v1"]
 			t.Fatalf("LoadHost ambiguous host provider = %v", err)
 		}
 	})
+	t.Run("qualified provider resolves ambiguity without widening authority", func(t *testing.T) {
+		root := t.TempDir()
+		writeHostContractApplication(t, root, "apps/caller", "caller", `name = "lua-orchestrator"
+version = "1"
+host_consumes = ["provider::orders.apply.v1"]
+`)
+		writeHostContractApplication(t, root, "apps/provider", "provider", providerCell)
+		writeHostContractApplication(t, root, "apps/shadow", "shadow", providerCell)
+		hostPath := writeAppFile(t, root, "pulp.host.toml", `name = "platform"
+[[applications]]
+id = "caller"
+manifest = "apps/caller/pulp.app.toml"
+storage_namespace = "caller"
+event_namespace = "caller-events"
+depends_on = ["provider", "shadow"]
+[[applications]]
+id = "provider"
+manifest = "apps/provider/pulp.app.toml"
+storage_namespace = "provider"
+event_namespace = "provider-events"
+[[applications]]
+id = "shadow"
+manifest = "apps/shadow/pulp.app.toml"
+storage_namespace = "shadow"
+event_namespace = "shadow-events"
+`)
+		if _, err := LoadHost(hostPath); err != nil {
+			t.Fatalf("LoadHost qualified host_consumes: %v", err)
+		}
+	})
 	t.Run("reverse edge is not a grant", func(t *testing.T) {
 		root := t.TempDir()
 		writeHostContractApplication(t, root, "apps/caller", "caller", callerCell)

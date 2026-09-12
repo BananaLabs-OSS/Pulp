@@ -191,3 +191,13 @@ func testCrossApplicationCaller(dependsOn []string, hostConsumes ...string) cros
 		hostConsumes: append([]string(nil), hostConsumes...),
 	}
 }
+
+func TestQualifiedHostConsumeBindsOnlyNamedDependency(t *testing.T) {
+	caller := testCrossApplicationCaller([]string{"sessions", "bananauth"}, "sessions::orchestrator.dispatch")
+	if !allowsCrossApplicationCall(caller, ApplicationIdentity{ApplicationID: "sessions", InstanceID: "primary"}, "orchestrator.dispatch") {
+		t.Fatal("qualified Sessions grant did not authorize its exact target")
+	}
+	if allowsCrossApplicationCall(caller, ApplicationIdentity{ApplicationID: "bananauth", InstanceID: "primary"}, "orchestrator.dispatch") {
+		t.Fatal("qualified Sessions grant authorized BananaAuth")
+	}
+}

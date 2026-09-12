@@ -150,7 +150,8 @@ func validateCrossApplicationRoute(target ApplicationIdentity, cellName, provide
 // instance is still mandatory at call time, so there is no implicit default
 // instance or global provider fallback.
 func allowsCrossApplicationCall(caller crossApplicationCaller, target ApplicationIdentity, provider string) bool {
-	if caller.application.Identity == target || !containsExact(caller.hostConsumes, provider) {
+	if caller.application.Identity == target ||
+		(!containsExact(caller.hostConsumes, provider) && !containsExact(caller.hostConsumes, target.ApplicationID+"::"+provider)) {
 		return false
 	}
 	for _, dependency := range caller.application.DependsOn {
