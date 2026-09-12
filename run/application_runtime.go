@@ -37,7 +37,6 @@ type applicationRuntime struct {
 	registry          *host.Registry
 	ops               *runtimeOps
 	started           bool
-	activated         bool
 	providerAccess    *applicationProviderAccess
 }
 
@@ -436,6 +435,9 @@ func (r *applicationRuntime) Start(parent context.Context) error {
 		capByName[c.Name] = c
 	}
 	r.ops = &runtimeOps{runtimes: r.runtimes, allCaps: r.allCaps, declaredUnion: r.declaredUnion, logger: r.config.Logger, registry: r.registry, capByName: capByName, parentCtx: r.ctx}
+	for _, rt := range r.runtimes {
+		r.ops.launchStep(rt)
+	}
 	r.started = true
 	r.providerAccess = &applicationProviderAccess{identity: r.application.Identity, runtimes: r.runtimes, active: true}
 	if err := deploymentOperatorCommands.bind(r.application.Identity, r.providerAccess); err != nil {
@@ -457,31 +459,6 @@ func (r *applicationRuntime) Start(parent context.Context) error {
 			return r.startFailure(fmt.Errorf("application start observer: %w", err))
 		}
 	}
-	if !r.config.DeferBackgroundSteps {
-		return r.activateLocked()
-	}
-	return nil
-}
-
-// Activate starts autonomous cell stepping after the complete multi-app host
-// graph has initialized and published its synchronous provider boundaries.
-func (r *applicationRuntime) Activate(_ context.Context) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.activateLocked()
-}
-
-func (r *applicationRuntime) activateLocked() error {
-	if !r.started {
-		return fmt.Errorf("application %s is not started", r.application.Identity)
-	}
-	if r.activated {
-		return nil
-	}
-	for _, rt := range r.runtimes {
-		r.ops.launchStep(rt)
-	}
-	r.activated = true
 	return nil
 }
 
@@ -731,5 +708,4 @@ func (r *applicationRuntime) reset() {
 	r.capabilityConfigs = nil
 	r.setupCaps = nil
 	r.started = false
-	r.activated = false
 }
