@@ -137,6 +137,13 @@ func TestAssembleFrozenContainsVerifiedCompositionInputs(t *testing.T) {
 	if launch.Mode != "frozen" {
 		t.Fatalf("launch mode = %q", launch.Mode)
 	}
+	planBody, err := os.ReadFile(assembly.PlanManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(planBody), root) || strings.Contains(string(body), root) {
+		t.Fatal("frozen metadata leaked source paths")
+	}
 	host, err := os.ReadFile(assembly.HostManifest)
 	if err != nil {
 		t.Fatal(err)

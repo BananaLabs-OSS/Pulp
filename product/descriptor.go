@@ -324,7 +324,26 @@ func assemble(descriptorPath, outputRoot, surfaceID string, frozen bool) (Assemb
 	if err != nil {
 		return Assembly{}, err
 	}
-	planBody, err := json.MarshalIndent(plan, "", "  ")
+	recordedPlan := plan
+	recordedPlan.Applications = append([]PlannedApplication(nil), plan.Applications...)
+	recordedPlan.Surfaces = append([]Surface(nil), plan.Surfaces...)
+	launchSurface := *selected
+	if frozen {
+		recordedPlan.Descriptor = "pulp.product.json"
+		recordedPlan.HostModule = ""
+		for index := range recordedPlan.Applications {
+			relative, relErr := filepath.Rel(root, recordedPlan.Applications[index].Manifest)
+			if relErr != nil {
+				return Assembly{}, relErr
+			}
+			recordedPlan.Applications[index].Manifest = filepath.ToSlash(relative)
+		}
+		for index := range recordedPlan.Surfaces {
+			recordedPlan.Surfaces[index].Root = ""
+		}
+		launchSurface.Root = ""
+	}
+	planBody, err := json.MarshalIndent(recordedPlan, "", "  ")
 	if err != nil {
 		return Assembly{}, fmt.Errorf("encode product plan: %w", err)
 	}
@@ -335,7 +354,7 @@ func assemble(descriptorPath, outputRoot, surfaceID string, frozen bool) (Assemb
 	}
 	launch := LaunchContract{Schema: LaunchSchemaV1, Product: plan.ID, Name: plan.Name, Version: plan.Version, Mode: mode,
 		Host: filepath.Base(hostPath), HealthPath: "/_pulp/health", EntrypointPath: entrypointPath, Application: plan.Entrypoint.Application,
-		Surface: *selected, Capabilities: plan.Capabilities, Integrations: append([]string(nil), plan.Integrations...)}
+		Surface: launchSurface, Capabilities: plan.Capabilities, Integrations: append([]string(nil), plan.Integrations...)}
 	launchBody, err := json.MarshalIndent(launch, "", "  ")
 	if err != nil {
 		return Assembly{}, fmt.Errorf("encode launch contract: %w", err)
@@ -353,7 +372,7 @@ func assemble(descriptorPath, outputRoot, surfaceID string, frozen bool) (Assemb
 	if err := atomicWrite(launchPath, launchBody, 0o644); err != nil {
 		return Assembly{}, err
 	}
-	return Assembly{Root: root, HostManifest: hostPath, PlanManifest: planPath, LaunchManifest: launchPath, Surface: *selected}, nil
+	return Assembly{Root: root, HostManifest: hostPath, PlanManifest: planPath, LaunchManifest: launchPath, Surface: launchSurface}, nil
 }
 
 func freezeApplications(plan *Plan, outputRoot string) error {
