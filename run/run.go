@@ -395,6 +395,7 @@ func startHostedApplications(ctx context.Context, hostPath string, options HostR
 		Lifecycle:                        registeredApplicationLifecycleObserver(),
 		CrossApplications:                crossApplications,
 		Fusion:                           options.Fusion,
+		DeferBackgroundSteps:             true,
 	})
 	if err != nil {
 		_ = moduleCache.Close(context.Background())

@@ -101,6 +101,66 @@ func TestMultiHostSupervisorStartsApplicationDependenciesFirst(t *testing.T) {
 	}
 }
 
+func TestMultiHostSupervisorActivatesOnlyAfterEveryApplicationStarts(t *testing.T) {
+	var lifecycle []string
+	loader := HostManifestLoaderFunc(func(context.Context, string) ([]HostedApplication, error) {
+		return []HostedApplication{
+			testHostedApplication("sessions", "primary"),
+			testHostedApplication("evolution", "primary"),
+		}, nil
+	})
+	factory := ApplicationRuntimeFactoryFunc(func(_ context.Context, app HostedApplication) (ApplicationRuntime, error) {
+		return &phasedFakeApplicationRuntime{fakeApplicationRuntime: fakeApplicationRuntime{identity: app.Identity, lifecycle: &lifecycle}}, nil
+	})
+	supervisor := testMultiHostSupervisor(t, loader, factory)
+
+	if err := supervisor.Start(context.Background(), "pulp.host.toml"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := supervisor.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	want := []string{
+		"start:evolution/primary", "start:sessions/primary",
+		"activate:evolution/primary", "activate:sessions/primary",
+		"shutdown:sessions/primary", "shutdown:evolution/primary",
+	}
+	if diff := lifecycleDiff(want, lifecycle); diff != "" {
+		t.Fatal(diff)
+	}
+}
+
+func TestMultiHostSupervisorRollsBackActivationFailure(t *testing.T) {
+	var lifecycle []string
+	loader := HostManifestLoaderFunc(func(context.Context, string) ([]HostedApplication, error) {
+		return []HostedApplication{
+			testHostedApplication("alpha", "primary"),
+			testHostedApplication("bravo", "primary"),
+		}, nil
+	})
+	factory := ApplicationRuntimeFactoryFunc(func(_ context.Context, app HostedApplication) (ApplicationRuntime, error) {
+		runtime := &phasedFakeApplicationRuntime{fakeApplicationRuntime: fakeApplicationRuntime{identity: app.Identity, lifecycle: &lifecycle}}
+		if app.Identity.ApplicationID == "bravo" {
+			runtime.activateErr = errors.New("step activation failed")
+		}
+		return runtime, nil
+	})
+	supervisor := testMultiHostSupervisor(t, loader, factory)
+
+	err := supervisor.Start(context.Background(), "pulp.host.toml")
+	if err == nil || err.Error() != "activate application bravo/primary: step activation failed" {
+		t.Fatalf("Start error = %v", err)
+	}
+	want := []string{
+		"start:alpha/primary", "start:bravo/primary",
+		"activate:alpha/primary", "activate:bravo/primary",
+		"shutdown:bravo/primary", "shutdown:alpha/primary",
+	}
+	if diff := lifecycleDiff(want, lifecycle); diff != "" {
+		t.Fatal(diff)
+	}
+}
+
 func TestMultiHostSupervisorRejectsDuplicateIdentityBeforeCreatingRuntimes(t *testing.T) {
 	loader := HostManifestLoaderFunc(func(context.Context, string) ([]HostedApplication, error) {
 		return []HostedApplication{testHostedApplication("sessions", "primary"), testHostedApplication("sessions", "primary")}, nil
@@ -238,6 +298,16 @@ type fakeApplicationRuntime struct {
 	startHook func()
 
 	mu sync.Mutex
+}
+
+type phasedFakeApplicationRuntime struct {
+	fakeApplicationRuntime
+	activateErr error
+}
+
+func (r *phasedFakeApplicationRuntime) Activate(context.Context) error {
+	r.record("activate")
+	return r.activateErr
 }
 
 func (r *fakeApplicationRuntime) Identity() ApplicationIdentity { return r.identity }

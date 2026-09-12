@@ -41,6 +41,10 @@ type ScopedApplicationRuntimeFactoryConfig struct {
 	// group before any capability is set up or guest is loaded. A nil hook keeps
 	// the historical isolated/manual-execution-unit behavior.
 	Fusion FusionRuntimePreparer
+	// DeferBackgroundSteps splits initialization from autonomous execution.
+	// Multi-application hosts enable this so a dependency cannot begin polling
+	// while a dependent application is still inside pulp_init.
+	DeferBackgroundSteps bool
 }
 
 // FusionRuntimePreparer binds registry/lock/toolchain policy to the generic
