@@ -316,6 +316,16 @@ func assemble(descriptorPath, outputRoot, surfaceID string, frozen bool) (Assemb
 		if err := freezeApplications(&plan, root); err != nil {
 			return Assembly{}, err
 		}
+		if err := copyProductFile(filepath.Dir(plan.Descriptor), root, plan.Descriptor); err != nil {
+			return Assembly{}, fmt.Errorf("freeze product descriptor: %w", err)
+		}
+		if selected.Kind != "headless" {
+			relativeSurface := filepath.Join("surface", selected.ID)
+			if err := copyProductTree(selected.Root, filepath.Join(root, relativeSurface)); err != nil {
+				return Assembly{}, fmt.Errorf("freeze surface %q: %w", selected.ID, err)
+			}
+			selected.Root = filepath.ToSlash(relativeSurface)
+		}
 	}
 	hostPath := filepath.Join(root, "pulp.host.toml")
 	planPath := filepath.Join(root, "pulp.product.plan.json")
@@ -339,9 +349,13 @@ func assemble(descriptorPath, outputRoot, surfaceID string, frozen bool) (Assemb
 			recordedPlan.Applications[index].Manifest = filepath.ToSlash(relative)
 		}
 		for index := range recordedPlan.Surfaces {
-			recordedPlan.Surfaces[index].Root = ""
+			if recordedPlan.Surfaces[index].ID == selected.ID {
+				recordedPlan.Surfaces[index].Root = selected.Root
+			} else {
+				recordedPlan.Surfaces[index].Root = ""
+			}
 		}
-		launchSurface.Root = ""
+		launchSurface.Root = selected.Root
 	}
 	planBody, err := json.MarshalIndent(recordedPlan, "", "  ")
 	if err != nil {
@@ -373,6 +387,36 @@ func assemble(descriptorPath, outputRoot, surfaceID string, frozen bool) (Assemb
 		return Assembly{}, err
 	}
 	return Assembly{Root: root, HostManifest: hostPath, PlanManifest: planPath, LaunchManifest: launchPath, Surface: launchSurface}, nil
+}
+
+func copyProductTree(sourceRoot, destinationRoot string) error {
+	return filepath.WalkDir(sourceRoot, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(sourceRoot, path)
+		if err != nil {
+			return err
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("surface contains symlink %q", relative)
+		}
+		if entry.IsDir() {
+			return os.MkdirAll(filepath.Join(destinationRoot, relative), 0o755)
+		}
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("surface contains non-regular file %q", relative)
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		return atomicWrite(filepath.Join(destinationRoot, relative), body, info.Mode().Perm())
+	})
 }
 
 func freezeApplications(plan *Plan, outputRoot string) error {
