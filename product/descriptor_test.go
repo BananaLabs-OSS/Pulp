@@ -1,6 +1,8 @@
 package product
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,8 +50,11 @@ func TestAssembleProducesRunnableMultiApplicationHost(t *testing.T) {
 	writeProductFixture("host/go.mod", "module host")
 	writeProductFixture("public/index.html", "ok")
 	for _, app := range []string{"state", "ui"} {
-		writeProductFixture("apps/"+app+"/app.lua", "return true")
-		writeProductFixture("apps/"+app+"/pulp.app.toml", "name = \""+app+"\"\nversion = \"1\"\ncells = []\norchestrator = \"none\"\nscript = \"app.lua\"\nsha256 = \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"\n")
+		script := "return true -- " + app
+		digest := sha256.Sum256([]byte(script))
+		writeProductFixture("apps/"+app+"/app.lua", script)
+		writeProductFixture("apps/"+app+"/cell.toml", fmt.Sprintf("name = %q\nversion = \"1\"\n", app+"-lua"))
+		writeProductFixture("apps/"+app+"/pulp.app.toml", fmt.Sprintf("name = %q\nversion = \"1\"\ncells = [\"cell.toml\"]\n[orchestrator]\nmanifest = \"cell.toml\"\nscript = \"app.lua\"\nsha256 = %q\n", app, fmt.Sprintf("%x", digest)))
 	}
 	descriptor := `{"schema":"pulp.product/v1","id":"banana.multi","name":"Multi","version":"1","applications":[{"id":"state","manifest":"apps/state/pulp.app.toml"},{"id":"ui","manifest":"apps/ui/pulp.app.toml","instance":"root","dependencies":["state"]}],"entrypoint":{"application":"ui","surface":"web","path":"/"},"host":{"module":"host/go.mod","extensions":["storage.sqlite"]},"capabilities":{"required":["storage.sqlite"]},"surfaces":[{"id":"web","kind":"web","root":"public"}]}`
 	writeProductFixture("pulp.product.json", descriptor)
