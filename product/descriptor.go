@@ -80,16 +80,38 @@ type Plan struct {
 	Extensions   []string               `json:"extensions"`
 	Capabilities CapabilityRequirements `json:"capabilities"`
 	Surfaces     []Surface              `json:"surfaces"`
+	Integrations []string               `json:"optional_integrations,omitempty"`
+}
+
+const LaunchSchemaV1 = "pulp.product-launch/v1"
+
+// LaunchContract is consumed by focused web, desktop, mobile, and headless
+// shells. It contains no shell-specific behavior: the shell starts Host,
+// waits for HealthPath, and opens EntrypointPath when it has a visual surface.
+type LaunchContract struct {
+	Schema         string                 `json:"schema"`
+	Product        string                 `json:"product"`
+	Name           string                 `json:"name"`
+	Version        string                 `json:"version"`
+	Mode           string                 `json:"mode"`
+	Host           string                 `json:"host"`
+	HealthPath     string                 `json:"health_path"`
+	EntrypointPath string                 `json:"entrypoint_path"`
+	Application    string                 `json:"application"`
+	Surface        Surface                `json:"surface"`
+	Capabilities   CapabilityRequirements `json:"capabilities"`
+	Integrations   []string               `json:"optional_integrations,omitempty"`
 }
 
 // Assembly is the deterministic, runnable output produced from a product
 // plan. The generated host manifest delegates execution to Pulp's ordinary
 // multi-application supervisor; products do not introduce a second runtime.
 type Assembly struct {
-	Root         string  `json:"root"`
-	HostManifest string  `json:"host_manifest"`
-	PlanManifest string  `json:"plan_manifest"`
-	Surface      Surface `json:"surface"`
+	Root           string  `json:"root"`
+	HostManifest   string  `json:"host_manifest"`
+	PlanManifest   string  `json:"plan_manifest"`
+	LaunchManifest string  `json:"launch_manifest"`
+	Surface        Surface `json:"surface"`
 }
 
 func Load(path string) (Descriptor, error) {
@@ -247,7 +269,8 @@ func Resolve(path string) (Plan, error) {
 		}
 	}
 	return Plan{Descriptor: abs, ID: descriptor.ID, Name: descriptor.Name, Version: descriptor.Version,
-		Applications: applications, Entrypoint: descriptor.Entrypoint, HostModule: hostModule, Extensions: extensions, Capabilities: descriptor.Capabilities, Surfaces: surfaces}, nil
+		Applications: applications, Entrypoint: descriptor.Entrypoint, HostModule: hostModule, Extensions: extensions, Capabilities: descriptor.Capabilities, Surfaces: surfaces,
+		Integrations: append([]string(nil), descriptor.Integrations...)}, nil
 }
 
 // Assemble writes a portable host composition and resolved plan. Output is
@@ -278,6 +301,7 @@ func Assemble(descriptorPath, outputRoot, surfaceID string) (Assembly, error) {
 	}
 	hostPath := filepath.Join(root, "pulp.host.toml")
 	planPath := filepath.Join(root, "pulp.product.plan.json")
+	launchPath := filepath.Join(root, "pulp.product.launch.json")
 	hostBody, err := renderHost(plan, root)
 	if err != nil {
 		return Assembly{}, err
@@ -287,6 +311,18 @@ func Assemble(descriptorPath, outputRoot, surfaceID string) (Assembly, error) {
 		return Assembly{}, fmt.Errorf("encode product plan: %w", err)
 	}
 	planBody = append(planBody, '\n')
+	entrypointPath := plan.Entrypoint.Path
+	if entrypointPath == "" {
+		entrypointPath = "/"
+	}
+	launch := LaunchContract{Schema: LaunchSchemaV1, Product: plan.ID, Name: plan.Name, Version: plan.Version, Mode: "linked",
+		Host: filepath.Base(hostPath), HealthPath: "/_pulp/health", EntrypointPath: entrypointPath, Application: plan.Entrypoint.Application,
+		Surface: *selected, Capabilities: plan.Capabilities, Integrations: append([]string(nil), plan.Integrations...)}
+	launchBody, err := json.MarshalIndent(launch, "", "  ")
+	if err != nil {
+		return Assembly{}, fmt.Errorf("encode launch contract: %w", err)
+	}
+	launchBody = append(launchBody, '\n')
 	if err := atomicWriteValidated(hostPath, hostBody, 0o644, func(candidate string) error {
 		_, err := manifest.LoadHost(candidate)
 		return err
@@ -296,7 +332,10 @@ func Assemble(descriptorPath, outputRoot, surfaceID string) (Assembly, error) {
 	if err := atomicWrite(planPath, planBody, 0o644); err != nil {
 		return Assembly{}, err
 	}
-	return Assembly{Root: root, HostManifest: hostPath, PlanManifest: planPath, Surface: *selected}, nil
+	if err := atomicWrite(launchPath, launchBody, 0o644); err != nil {
+		return Assembly{}, err
+	}
+	return Assembly{Root: root, HostManifest: hostPath, PlanManifest: planPath, LaunchManifest: launchPath, Surface: *selected}, nil
 }
 
 func renderHost(plan Plan, outputRoot string) ([]byte, error) {
