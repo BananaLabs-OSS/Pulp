@@ -278,6 +278,17 @@ func Resolve(path string) (Plan, error) {
 // contents. Source application manifests remain the authority and are
 // referenced relatively, which keeps development builds inspectable.
 func Assemble(descriptorPath, outputRoot, surfaceID string) (Assembly, error) {
+	return assemble(descriptorPath, outputRoot, surfaceID, false)
+}
+
+// AssembleFrozen copies the exact verified composition inputs into the output
+// tree. The resulting host manifest has no references back to the source
+// checkout and starts without a registry or network connection.
+func AssembleFrozen(descriptorPath, outputRoot, surfaceID string) (Assembly, error) {
+	return assemble(descriptorPath, outputRoot, surfaceID, true)
+}
+
+func assemble(descriptorPath, outputRoot, surfaceID string, frozen bool) (Assembly, error) {
 	plan, err := Resolve(descriptorPath)
 	if err != nil {
 		return Assembly{}, err
@@ -299,6 +310,13 @@ func Assemble(descriptorPath, outputRoot, surfaceID string) (Assembly, error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return Assembly{}, fmt.Errorf("create assembly root: %w", err)
 	}
+	mode := "linked"
+	if frozen {
+		mode = "frozen"
+		if err := freezeApplications(&plan, root); err != nil {
+			return Assembly{}, err
+		}
+	}
 	hostPath := filepath.Join(root, "pulp.host.toml")
 	planPath := filepath.Join(root, "pulp.product.plan.json")
 	launchPath := filepath.Join(root, "pulp.product.launch.json")
@@ -315,7 +333,7 @@ func Assemble(descriptorPath, outputRoot, surfaceID string) (Assembly, error) {
 	if entrypointPath == "" {
 		entrypointPath = "/"
 	}
-	launch := LaunchContract{Schema: LaunchSchemaV1, Product: plan.ID, Name: plan.Name, Version: plan.Version, Mode: "linked",
+	launch := LaunchContract{Schema: LaunchSchemaV1, Product: plan.ID, Name: plan.Name, Version: plan.Version, Mode: mode,
 		Host: filepath.Base(hostPath), HealthPath: "/_pulp/health", EntrypointPath: entrypointPath, Application: plan.Entrypoint.Application,
 		Surface: *selected, Capabilities: plan.Capabilities, Integrations: append([]string(nil), plan.Integrations...)}
 	launchBody, err := json.MarshalIndent(launch, "", "  ")
@@ -336,6 +354,104 @@ func Assemble(descriptorPath, outputRoot, surfaceID string) (Assembly, error) {
 		return Assembly{}, err
 	}
 	return Assembly{Root: root, HostManifest: hostPath, PlanManifest: planPath, LaunchManifest: launchPath, Surface: *selected}, nil
+}
+
+func freezeApplications(plan *Plan, outputRoot string) error {
+	type frozenApplication struct {
+		manifest string
+		paths    []string
+	}
+	frozen := make([]frozenApplication, len(plan.Applications))
+	allPaths := []string{filepath.Dir(plan.Descriptor)}
+	for index := range plan.Applications {
+		application, err := manifest.LoadApp(plan.Applications[index].Manifest)
+		if err != nil {
+			return fmt.Errorf("freeze application %q: %w", plan.Applications[index].ID, err)
+		}
+		paths := []string{application.ManifestPath, application.OrchestrationScript}
+		for _, cell := range application.Cells.Cells {
+			paths = append(paths, cell.ManifestPath, cell.WASMPath)
+		}
+		for _, unit := range application.ExecutionUnits {
+			if unit.Artifact != nil {
+				paths = append(paths, unit.Artifact.ManifestPath, unit.Artifact.WASMPath)
+			}
+		}
+		frozen[index] = frozenApplication{manifest: application.ManifestPath, paths: paths}
+		allPaths = append(allPaths, paths...)
+	}
+	sourceRoot, err := commonDirectory(allPaths)
+	if err != nil {
+		return err
+	}
+	packageRoot := filepath.Join(outputRoot, "packages")
+	for index, application := range frozen {
+		for _, source := range application.paths {
+			if err := copyProductFile(sourceRoot, packageRoot, source); err != nil {
+				return fmt.Errorf("freeze application %q: %w", plan.Applications[index].ID, err)
+			}
+		}
+		relative, err := filepath.Rel(sourceRoot, application.manifest)
+		if err != nil {
+			return err
+		}
+		plan.Applications[index].Manifest = filepath.Join(packageRoot, relative)
+	}
+	return nil
+}
+
+func commonDirectory(paths []string) (string, error) {
+	if len(paths) == 0 {
+		return "", errors.New("composition contains no source paths")
+	}
+	root, err := filepath.Abs(paths[0])
+	if err != nil {
+		return "", err
+	}
+	if info, statErr := os.Stat(root); statErr == nil && !info.IsDir() {
+		root = filepath.Dir(root)
+	}
+	for _, candidate := range paths[1:] {
+		candidate, err = filepath.Abs(candidate)
+		if err != nil {
+			return "", err
+		}
+		for {
+			relative, relErr := filepath.Rel(root, candidate)
+			if relErr == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+				break
+			}
+			parent := filepath.Dir(root)
+			if parent == root {
+				return "", errors.New("composition paths do not share a filesystem root")
+			}
+			root = parent
+		}
+	}
+	return root, nil
+}
+
+func copyProductFile(sourceRoot, outputRoot, source string) error {
+	relative, err := filepath.Rel(sourceRoot, source)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("composition file %q escapes product root", source)
+	}
+	info, err := os.Lstat(source)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("composition file %q is not a regular file", source)
+	}
+	body, err := os.ReadFile(source)
+	if err != nil {
+		return err
+	}
+	destination := filepath.Join(outputRoot, relative)
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+		return err
+	}
+	return atomicWrite(destination, body, info.Mode().Perm())
 }
 
 func renderHost(plan Plan, outputRoot string) ([]byte, error) {
