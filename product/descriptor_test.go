@@ -2,6 +2,7 @@ package product
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -80,6 +81,17 @@ func TestAssembleProducesRunnableMultiApplicationHost(t *testing.T) {
 	}
 	if len(generated.Applications) != 2 || generated.Applications[1].ID != "ui" || len(generated.Applications[1].DependsOn) != 1 {
 		t.Fatalf("generated applications = %#v", generated.Applications)
+	}
+	launchBody, err := os.ReadFile(assembly.LaunchManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var launch LaunchContract
+	if err := json.Unmarshal(launchBody, &launch); err != nil {
+		t.Fatal(err)
+	}
+	if launch.Schema != LaunchSchemaV1 || launch.Host != "pulp.host.toml" || launch.Application != "ui" || launch.Surface.ID != "web" || launch.HealthPath != "/_pulp/health" {
+		t.Fatalf("launch contract = %#v", launch)
 	}
 }
 
