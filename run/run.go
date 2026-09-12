@@ -366,7 +366,7 @@ func startHostedApplications(ctx context.Context, hostPath string, options HostR
 	if err != nil {
 		return nil, err
 	}
-	moduleRuntime := wazero.NewRuntime(ctx)
+	moduleRuntime := host.NewRuntimeWithPersistentCompilationCache(ctx, wazero.NewRuntimeConfig())
 	moduleCache := host.NewModuleCache()
 	endpoints := NewEndpointRegistry()
 	crossApplications := newCrossApplicationRegistry()
