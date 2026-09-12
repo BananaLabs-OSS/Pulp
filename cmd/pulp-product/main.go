@@ -7,6 +7,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
 
 	"github.com/BananaLabs-OSS/Pulp/product"
 )
@@ -14,7 +18,7 @@ import (
 func main() {
 	command := "plan"
 	args := os.Args[1:]
-	if len(args) != 0 && (args[0] == "plan" || args[0] == "build" || args[0] == "install" || args[0] == "activate" || args[0] == "rollback" || args[0] == "state") {
+	if len(args) != 0 && (args[0] == "plan" || args[0] == "build" || args[0] == "package" || args[0] == "install" || args[0] == "activate" || args[0] == "rollback" || args[0] == "state") {
 		command, args = args[0], args[1:]
 	}
 	flags := flag.NewFlagSet("pulp-product "+command, flag.ContinueOnError)
@@ -25,6 +29,7 @@ func main() {
 	assemblyRoot := flags.String("assembly", ".pulp/product", "frozen assembly directory")
 	store := flags.String("store", ".pulp/releases", "product release store")
 	digest := flags.String("digest", "", "installed release digest")
+	goCommand := flags.String("go", "go", "Go command used to build a focused product host")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		if err == nil {
 			fmt.Fprintln(os.Stderr, "pulp-product accepts no positional arguments")
@@ -69,6 +74,32 @@ func main() {
 		os.Exit(1)
 	}
 	value := any(plan)
+	if command == "package" {
+		selected := *surface
+		if selected == "" {
+			selected = plan.Entrypoint.Surface
+		}
+		assembly, buildErr := product.AssembleFrozen(*descriptor, *output, selected)
+		if buildErr != nil {
+			fail(buildErr)
+		}
+		name := strings.ReplaceAll(plan.ID, ".", "-") + "-host"
+		if runtime.GOOS == "windows" {
+			name += ".exe"
+		}
+		host := filepath.Join(assembly.Root, "bin", name)
+		if err := os.MkdirAll(filepath.Dir(host), 0o755); err != nil {
+			fail(err)
+		}
+		build := exec.Command(*goCommand, "build", "-trimpath", "-buildvcs=false", "-o", host, ".")
+		build.Dir = filepath.Dir(plan.HostModule)
+		build.Env = append(os.Environ(), "GOWORK=off")
+		build.Stdout, build.Stderr = os.Stderr, os.Stderr
+		if err := build.Run(); err != nil {
+			fail(fmt.Errorf("build focused product host: %w", err))
+		}
+		value = map[string]any{"assembly": assembly, "host_executable": host}
+	}
 	if command == "build" {
 		selected := *surface
 		if selected == "" {

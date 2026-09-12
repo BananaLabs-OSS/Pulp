@@ -121,7 +121,7 @@ func TestAssembleFrozenContainsVerifiedCompositionInputs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, relative := range []string{"packages/application/pulp.app.toml", "packages/application/app.lua", "packages/engine/pulp.cell.toml", "packages/engine/cell.wasm"} {
+	for _, relative := range []string{"pulp.product.json", "surface/web/index.html", "packages/application/pulp.app.toml", "packages/application/app.lua", "packages/engine/pulp.cell.toml", "packages/engine/cell.wasm"} {
 		if _, err := os.Stat(filepath.Join(output, relative)); err != nil {
 			t.Fatalf("missing %s: %v", relative, err)
 		}
@@ -136,6 +136,9 @@ func TestAssembleFrozenContainsVerifiedCompositionInputs(t *testing.T) {
 	}
 	if launch.Mode != "frozen" {
 		t.Fatalf("launch mode = %q", launch.Mode)
+	}
+	if launch.Surface.Root != "surface/web" {
+		t.Fatalf("frozen surface root = %q", launch.Surface.Root)
 	}
 	planBody, err := os.ReadFile(assembly.PlanManifest)
 	if err != nil {
