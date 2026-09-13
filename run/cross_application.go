@@ -32,8 +32,10 @@ var (
 // joins every in-flight inbound call before the application's cells close.
 // It contains no package data or application state.
 type crossApplicationRegistry struct {
-	mu      sync.RWMutex
-	entries map[ApplicationIdentity]*crossApplicationEntry
+	mu         sync.RWMutex
+	entries    map[ApplicationIdentity]*crossApplicationEntry
+	activation chan struct{}
+	activate   sync.Once
 }
 
 type crossApplicationEntry struct {
@@ -56,7 +58,21 @@ type crossApplicationCaller struct {
 }
 
 func newCrossApplicationRegistry() *crossApplicationRegistry {
-	return &crossApplicationRegistry{entries: make(map[ApplicationIdentity]*crossApplicationEntry)}
+	return &crossApplicationRegistry{
+		entries:    make(map[ApplicationIdentity]*crossApplicationEntry),
+		activation: make(chan struct{}),
+	}
+}
+
+// activateSteps releases autonomous application schedulers only after every
+// application in the host has initialized and published its providers. This
+// prevents an early HTTP scheduler tick from entering a partially booted
+// dependency graph and holding a WASM call until its context deadline.
+func (r *crossApplicationRegistry) activateSteps() {
+	if r == nil {
+		return
+	}
+	r.activate.Do(func() { close(r.activation) })
 }
 
 func (r *crossApplicationRegistry) markReady(application HostedApplication, runtime *applicationRuntime) error {
