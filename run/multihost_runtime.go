@@ -36,6 +36,9 @@ type ScopedApplicationRuntimeFactoryConfig struct {
 	// cross-application provider import. It is nil outside `pulp -host`, so
 	// ordinary single-application runs do not receive that import at all.
 	CrossApplications *crossApplicationRegistry
+	// StepActivation is closed once the complete host dependency graph is
+	// initialized. Nil starts autonomous cell steps immediately (direct apps).
+	StepActivation <-chan struct{}
 	// Fusion is an optional deployment-owned preparation hook. When present,
 	// application startup asks it to prepare every eligible source-level fusion
 	// group before any capability is set up or guest is loaded. A nil hook keeps

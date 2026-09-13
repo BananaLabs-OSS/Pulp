@@ -29,8 +29,11 @@ type runtimeOps struct {
 	registry  *host.Registry
 	capByName map[string]ext.Capability
 	parentCtx context.Context
-	stepWG    sync.WaitGroup // joins every step goroutine (initial + reloaded)
-	reloadMu  sync.Mutex     // serializes reloads so two never race one cell
+	// stepActivation gates autonomous steps until a composed host is complete.
+	// It is nil for direct and legacy runtimes.
+	stepActivation <-chan struct{}
+	stepWG         sync.WaitGroup // joins every step goroutine (initial + reloaded)
+	reloadMu       sync.Mutex     // serializes reloads so two never race one cell
 
 	mu      sync.Mutex
 	stopped map[string]bool // cell names that have already been shut down
@@ -225,6 +228,13 @@ func (o *runtimeOps) launchStep(rt *cellRuntime) {
 	go func() {
 		defer o.stepWG.Done()
 		defer close(rt.stepDone)
+		if o.stepActivation != nil {
+			select {
+			case <-o.stepActivation:
+			case <-rt.stepCtx.Done():
+				return
+			}
+		}
 		stepLoop(rt, o.capByName, o.logger)
 	}()
 }

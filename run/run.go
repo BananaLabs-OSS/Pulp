@@ -394,6 +394,7 @@ func startHostedApplications(ctx context.Context, hostPath string, options HostR
 		RequireScopedCapabilityLifecycle: applicationInstances > 1,
 		Lifecycle:                        registeredApplicationLifecycleObserver(),
 		CrossApplications:                crossApplications,
+		StepActivation:                   crossApplications.activation,
 		Fusion:                           options.Fusion,
 	})
 	if err != nil {
@@ -407,6 +408,9 @@ func startHostedApplications(ctx context.Context, hostPath string, options HostR
 		_ = moduleRuntime.Close(context.Background())
 		return nil, err
 	}
+	// All application providers now exist. Release autonomous HTTP scheduler
+	// ticks before pollsters and the public gateway begin accepting work.
+	crossApplications.activateSteps()
 	hosted := &hostedApplicationHost{supervisor: supervisor, moduleCache: moduleCache, moduleRuntime: moduleRuntime, endpoints: endpoints}
 	if err := hosted.startPollsters(options.Logger); err != nil {
 		_ = hosted.Shutdown(context.Background())

@@ -192,6 +192,25 @@ func testCrossApplicationCaller(dependsOn []string, hostConsumes ...string) cros
 	}
 }
 
+func TestCrossApplicationStepActivationIsHostWideAndIdempotent(t *testing.T) {
+	registry := newCrossApplicationRegistry()
+	select {
+	case <-registry.activation:
+		t.Fatal("autonomous steps activated before the host graph was ready")
+	default:
+	}
+
+	registry.activateSteps()
+	select {
+	case <-registry.activation:
+	default:
+		t.Fatal("autonomous steps did not activate with the completed host graph")
+	}
+
+	// Reload and shutdown paths may observe the completed barrier repeatedly.
+	registry.activateSteps()
+}
+
 func TestQualifiedHostConsumeBindsOnlyNamedDependency(t *testing.T) {
 	caller := testCrossApplicationCaller([]string{"sessions", "bananauth"}, "sessions::orchestrator.dispatch")
 	if !allowsCrossApplicationCall(caller, ApplicationIdentity{ApplicationID: "sessions", InstanceID: "primary"}, "orchestrator.dispatch") {

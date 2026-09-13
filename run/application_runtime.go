@@ -434,7 +434,7 @@ func (r *applicationRuntime) Start(parent context.Context) error {
 	for _, c := range r.allCaps {
 		capByName[c.Name] = c
 	}
-	r.ops = &runtimeOps{runtimes: r.runtimes, allCaps: r.allCaps, declaredUnion: r.declaredUnion, logger: r.config.Logger, registry: r.registry, capByName: capByName, parentCtx: r.ctx}
+	r.ops = &runtimeOps{runtimes: r.runtimes, allCaps: r.allCaps, declaredUnion: r.declaredUnion, logger: r.config.Logger, registry: r.registry, capByName: capByName, parentCtx: r.ctx, stepActivation: r.config.StepActivation}
 	for _, rt := range r.runtimes {
 		r.ops.launchStep(rt)
 	}
