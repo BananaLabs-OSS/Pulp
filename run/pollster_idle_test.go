@@ -21,21 +21,22 @@ func TestExtensionPollersDoNotMicrosecondBusyWait(t *testing.T) {
 	}
 }
 
-func TestFusedEventOnlyCellsUseLowFrequencyLivenessTicks(t *testing.T) {
+func TestFusedEventOnlyCellsDoNotReceiveSyntheticIdleSteps(t *testing.T) {
 	source, err := os.ReadFile("run.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	text := string(source)
 	for _, required := range []string{
-		"idleMax := 30 * time.Second",
 		`isInbound := rt.declared["transport.http.inbound"]`,
-		"idleMax = time.Second",
 		"if !isInbound",
-		"idleSleep = idleMax",
+		"Event-only cells are driven exclusively by declared extension events",
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("fused idle pacing contract missing %q", required)
 		}
+	}
+	if strings.Contains(text, "idleMax := 30 * time.Second") {
+		t.Fatal("event-only synthetic liveness tick remains enabled")
 	}
 }

@@ -1273,16 +1273,12 @@ func stepLoop(rt *cellRuntime, capByName map[string]ext.Capability, logger *slog
 		// without exhausting every long-lived cell in a few days.
 		idleRampAge = time.Second
 	)
-	// Event-only cells wake immediately through rt.events and do not need to
-	// cross the WASM boundary every second. In a fused application that idle
-	// fan-out is expensive enough to consume a full core. The inbound cell owns
-	// autonomous application scheduling, so retain its one-second tick cadence;
-	// keep the remaining cells on a low-frequency liveness tick.
-	idleMax := 30 * time.Second
+	// Event-only cells wake immediately through rt.events. The inbound cell owns
+	// autonomous application scheduling and retains its one-second tick cadence.
+	// A synthetic idle call is not a liveness probe: it mutates guest execution
+	// state and can collide with legitimate cross-cell work.
+	idleMax := time.Second
 	isInbound := rt.declared["transport.http.inbound"]
-	if isInbound {
-		idleMax = time.Second
-	}
 	idleSleep := idleMin
 	idleSince := time.Time{}
 	idleTimer := time.NewTimer(idleMin)
@@ -1290,38 +1286,6 @@ func stepLoop(rt *cellRuntime, capByName map[string]ext.Capability, logger *slog
 		<-idleTimer.C
 	}
 	defer idleTimer.Stop()
-
-	// Event-only cells have no reason to cross the WASM boundary hundreds of
-	// times immediately after initialization. Besides wasting CPU, the old
-	// microsecond ramp let autonomous owner work collide with application
-	// bootstrap and cross-cell calls before the host was ready. Begin those
-	// cells at their liveness cadence; their buffered event channel still wakes
-	// them immediately. The inbound cell retains the prompt first tick required
-	// by application schedulers.
-	if !isInbound {
-		idleSleep = idleMax
-		idleSince = time.Now()
-		idleTimer.Reset(idleSleep)
-		select {
-		case <-rt.stepCtx.Done():
-			return
-		case re := <-rt.events:
-			if !idleTimer.Stop() {
-				select {
-				case <-idleTimer.C:
-				default:
-				}
-			}
-			select {
-			case rt.events <- re:
-			default:
-				for _, c := range re.caps {
-					safe.CallFinalize(c, re.ev.ID, logger)
-				}
-			}
-		case <-idleTimer.C:
-		}
-	}
 
 	// Crash supervisor: re-instantiate the cell after a wasm trap when
 	// restart=on_crash/always (the previously-unimplemented manifest policy), with
@@ -1357,6 +1321,38 @@ func stepLoop(rt *cellRuntime, capByName map[string]ext.Capability, logger *slog
 	}
 
 	for {
+		// Event-only cells are driven exclusively by declared extension events.
+		// Blocking here preserves immediate delivery without inventing guest work.
+		if !isInbound {
+			select {
+			case <-rt.stepCtx.Done():
+				return
+			case re := <-rt.events:
+				stepEv, err := abi.EncodeStepEvent(re.ev.Kind, re.ev.Payload)
+				if err != nil {
+					logger.Error("encode step event", "cell", rt.spec.Name, "kind", re.ev.Kind, "err", err)
+					for _, c := range re.caps {
+						safe.CallFinalize(c, re.ev.ID, logger)
+					}
+					continue
+				}
+				n := rt.callNumber.Load()
+				env := abi.StepEnvelope{CallNumber: n, WallTime: uint64(time.Now().UnixNano()), Payload: stepEv}
+				rt.execution.RLock()
+				_, stepErr := rt.cell.Step(rt.ctx, env)
+				rt.execution.RUnlock()
+				if stepErr != nil {
+					logger.Error("step failed", "cell", rt.spec.Name, "call_number", n, "err", stepErr)
+					superviseTrap(n)
+				}
+				for _, c := range re.caps {
+					safe.CallFinalize(c, re.ev.ID, logger)
+				}
+				rt.callNumber.Add(1)
+			}
+			continue
+		}
+
 		select {
 		case <-rt.stepCtx.Done():
 			return
