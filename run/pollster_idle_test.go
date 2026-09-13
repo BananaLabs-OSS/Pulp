@@ -29,8 +29,10 @@ func TestFusedEventOnlyCellsUseLowFrequencyLivenessTicks(t *testing.T) {
 	text := string(source)
 	for _, required := range []string{
 		"idleMax := 30 * time.Second",
-		`if rt.declared["transport.http.inbound"]`,
+		`isInbound := rt.declared["transport.http.inbound"]`,
 		"idleMax = time.Second",
+		"if !isInbound",
+		"idleSleep = idleMax",
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("fused idle pacing contract missing %q", required)

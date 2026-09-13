@@ -1279,7 +1279,8 @@ func stepLoop(rt *cellRuntime, capByName map[string]ext.Capability, logger *slog
 	// autonomous application scheduling, so retain its one-second tick cadence;
 	// keep the remaining cells on a low-frequency liveness tick.
 	idleMax := 30 * time.Second
-	if rt.declared["transport.http.inbound"] {
+	isInbound := rt.declared["transport.http.inbound"]
+	if isInbound {
 		idleMax = time.Second
 	}
 	idleSleep := idleMin
@@ -1289,6 +1290,38 @@ func stepLoop(rt *cellRuntime, capByName map[string]ext.Capability, logger *slog
 		<-idleTimer.C
 	}
 	defer idleTimer.Stop()
+
+	// Event-only cells have no reason to cross the WASM boundary hundreds of
+	// times immediately after initialization. Besides wasting CPU, the old
+	// microsecond ramp let autonomous owner work collide with application
+	// bootstrap and cross-cell calls before the host was ready. Begin those
+	// cells at their liveness cadence; their buffered event channel still wakes
+	// them immediately. The inbound cell retains the prompt first tick required
+	// by application schedulers.
+	if !isInbound {
+		idleSleep = idleMax
+		idleSince = time.Now()
+		idleTimer.Reset(idleSleep)
+		select {
+		case <-rt.stepCtx.Done():
+			return
+		case re := <-rt.events:
+			if !idleTimer.Stop() {
+				select {
+				case <-idleTimer.C:
+				default:
+				}
+			}
+			select {
+			case rt.events <- re:
+			default:
+				for _, c := range re.caps {
+					safe.CallFinalize(c, re.ev.ID, logger)
+				}
+			}
+		case <-idleTimer.C:
+		}
+	}
 
 	// Crash supervisor: re-instantiate the cell after a wasm trap when
 	// restart=on_crash/always (the previously-unimplemented manifest policy), with
