@@ -105,9 +105,7 @@ func (a *applicationProviderAccess) CallProvider(ctx context.Context, cellName, 
 	if !allowed {
 		return nil, fmt.Errorf("application %s cell %q does not provide %q", a.identity, cellName, provider)
 	}
-	runtime.execution.RLock()
-	defer runtime.execution.RUnlock()
-	return runtime.cell.Call(ctx, provider, args)
+	return callRuntimeProvider(ctx, runtime, provider, args, slog.Default())
 }
 
 func (a *applicationProviderAccess) revoke() {

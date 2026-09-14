@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"strings"
 
 	"github.com/BananaLabs-OSS/Pulp/ext"
 	"github.com/BananaLabs-OSS/Pulp/internal/manifest"
@@ -222,7 +223,47 @@ func (r *siblingRegistry) callDirect(ctx context.Context, caller, target, funcNa
 		return nil, fmt.Errorf("target cell %q is not running", target)
 	}
 	_ = caller
-	return targetRT.cell.Call(ctx, funcName, args)
+	return callRuntimeProvider(ctx, targetRT, funcName, args, slog.Default())
+}
+
+// callRuntimeProvider contains synchronous-call crash recovery. Interruptible
+// WASM must be closed to unwind a deadline, but that must not poison every
+// later request. Reinstantiate the placement after a closed-module failure and
+// return the original error without replaying the call: callers may retry a
+// read, while mutations retain their own explicit idempotency contract.
+func callRuntimeProvider(ctx context.Context, rt *cellRuntime, provider string, args []byte, logger *slog.Logger) ([]byte, error) {
+	rt.execution.RLock()
+	cell := rt.cell
+	if cell == nil {
+		rt.execution.RUnlock()
+		return nil, fmt.Errorf("target cell %q is not running", rt.spec.Name)
+	}
+	response, err := cell.Call(ctx, provider, args)
+	rt.execution.RUnlock()
+	if err == nil || !closedModuleCallError(err) || rt.ctx.Err() != nil {
+		return response, err
+	}
+
+	rt.execution.Lock()
+	defer rt.execution.Unlock()
+	// Another failed caller may already have replaced this exact instance.
+	if rt.cell == cell {
+		if reinstantiateCell(rt, logger) {
+			logger.Warn("cell RE-INSTANTIATED after synchronous call trap", "cell", rt.spec.Name, "provider", provider)
+		} else {
+			rt.failed.Store(true)
+		}
+	}
+	return nil, err
+}
+
+func closedModuleCallError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "module closed") ||
+		strings.Contains(text, "module has already been closed")
 }
 
 // writeSiblingResponse allocates a buffer in caller-module memory via
