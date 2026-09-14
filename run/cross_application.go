@@ -188,7 +188,7 @@ func callDeclaredProvider(runtime *applicationRuntime, ctx context.Context, cell
 	}
 	for _, declared := range target.spec.Provides {
 		if declared == provider {
-			return target.cell.Call(ctx, provider, args)
+			return callRuntimeProvider(ctx, target, provider, args, runtime.config.Logger)
 		}
 	}
 	return nil, fmt.Errorf("%w: cell %q does not provide %q", errCrossApplicationUnavailable, cellName, provider)
